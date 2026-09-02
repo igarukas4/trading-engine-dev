@@ -1,6 +1,6 @@
 # Trading Engine V0 — Backend Specification
 
-**Status:** Proposed for final approval  
+**Status:** Accepted
 **Decision ticket:** [Spec: Backend V0 — data model, Strategy interface, pipeline, API/WS](https://github.com/igarukas4/trading-engine-dev/issues/5)  
 **Domain language:** [`CONTEXT.md`](../../CONTEXT.md)
 
