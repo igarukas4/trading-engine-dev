@@ -12,10 +12,13 @@ _Avoid_: Instrument, Asset, Symbol (Symbol = identifier native broker, e.g. MT5)
 Identifier pair di broker tertentu (e.g. MT5: `EURUSD`, Binance: `BTCUSDT`). Tidak dipakai sebagai istilah domain kanonik.
 
 **BrokerAccount**:
-Identitas akun trading pada broker yang menjadi pemilik Order, Fill, Position, RiskLimits, dan State. Berbeda dari akun pengguna dashboard.
+Identitas immutable dan batas kepemilikan satu akun trading pada satu broker server. Berbeda dari akun pengguna dashboard; setiap BrokerAccount memiliki Environment (`DEMO` atau `LIVE`) dan lifecycle sendiri, dan beberapa BrokerAccount dapat aktif bersamaan tanpa berbagi keputusan, risiko, atau data broker.
+
+**Account Scope**:
+Batas domain yang memastikan data, keputusan, risiko, perintah, external broker identity, dan failure hanya berlaku pada satu BrokerAccount. Relasi yang berasal dari broker harus tetap berada dalam account scope yang sama. News dan kalender ekonomi dapat menjadi sumber bersama, tetapi dampak kebijakannya diproyeksikan hanya ke BrokerAccount yang terpengaruh.
 
 **MarketState**:
-Snapshot multi-timeframe pasar saat ini — OHLCV bars (M5/M15/H1/H4/D1) + indikator terkomputasi (EMA/ATR/RSI/dll). INPUT yang di-feed ke `Strategy.evaluate()`. Selalu punya timestamp dan `pair`.
+Snapshot multi-timeframe pasar untuk satu BrokerAccount — OHLCV bars (M5/M15/H1/H4/D1) + indikator terkomputasi (EMA/ATR/RSI/dll). INPUT yang di-feed ke `Strategy.evaluate()`. Selalu punya timestamp dan `pair`; data broker dari account lain tidak boleh dicampur.
 _Avoid_: MarketContext (itu broader intelligence).
 
 **MarketStateSnapshot**:
@@ -36,7 +39,7 @@ Kondisi pasar luas di luar data teknikal: news sentiment, macro bias, correlatio
 Interface/algoritma evaluasi pasar: `EMATrendStrategy`, `BreakoutStrategy`, `MeanReversionStrategy`. Plug-and-play — semua strategi mengikuti `Strategy.evaluate(state: MarketState, config: StrategyConfig) → Opportunity | None`. Evaluasi bersifat deterministic: input dan config yang sama menghasilkan output yang sama. Jika setup LONG dan SHORT konflik, Strategy mengembalikan `None` dan mencatat alasan `CONFLICTING_SETUPS` di evaluation log.
 
 **StrategyConfig**:
-Versi immutable dari instance Strategy terparameterisasi yang dapat dipilih sebagai versi aktif. Satu identitas config logis memiliki urutan versi immutable; Opportunity selalu menunjuk versi persis yang dievaluasi. Contoh: "EMA Trend, pair BTCUSDT+ETHUSDT, EMA 20/50, risk 0.75%, min score 72, timeframe H4/H1/M15". Bisa banyak StrategyConfig aktif bersamaan. Setiap StrategyConfig memiliki EnrichmentPolicy sendiri; plugin Strategy tetap tidak bergantung pada news/AI.
+Instance Strategy terparameterisasi yang dimiliki satu BrokerAccount. Versinya immutable; Opportunity selalu menunjuk versi persis yang dievaluasi. Banyak StrategyConfig dapat aktif bersamaan pada account yang sama. Salinan lintas account menjadi config logis baru yang independen, dan plugin Strategy tetap tidak bergantung pada news/AI.
 
 **EnrichmentPolicy**:
 Aturan versioned per StrategyConfig yang menentukan sumber konteks `REQUIRED`, `ADVISORY`, atau `DISABLED`, freshness TTL, fallback yang eksplisit, dan event-risk rule. Versi yang dipakai dicatat pada Signal/AuditEvent agar keputusan lama dapat direproduksi setelah policy berubah.
@@ -51,7 +54,7 @@ Opportunity yang sudah di-enrich oleh pipeline menjadi proposal trade: `{pair, d
 Hasil immutable dari RiskEngine untuk sebuah Signal pada snapshot akun/pasar tertentu: approved/rejected, reason codes, calculated PositionSize, limits dan versi state/context yang dipakai, serta masa valid. Assessment awal dibuat saat Signal lahir dan wajib dihitung ulang tepat sebelum Order dikirim.
 
 **RiskReservation**:
-Alokasi risiko sementara yang mencegah beberapa Signal memakai kapasitas exposure yang sama secara bersamaan. Dikonsumsi oleh Fill atau dilepas saat Order ditolak, dibatalkan, expired, atau selesai direkonsiliasi.
+Alokasi risiko sementara dalam satu BrokerAccount yang mencegah beberapa Signal memakai kapasitas exposure account yang sama secara bersamaan. Dikonsumsi oleh Fill atau dilepas saat Order ditolak, dibatalkan, expired, atau selesai direkonsiliasi. Kapasitas risiko tidak digabungkan lintas BrokerAccount.
 
 ### Order & Position
 
@@ -108,7 +111,7 @@ Ukuran lot/volume per posisi, dihitung oleh RiskEngine berdasarkan risk/trade.
 Artikel/input mentah dari news feed (Google News RSS, Investing.com RSS).
 
 **NewsAnalysis**:
-Structured output AI dari NewsEvent: `{pair[], directional_bias, sentiment, severity, confidence, trade_impact, reason, expires_at}`.
+Structured output AI account-neutral dari NewsEvent: `{canonical_pair_codes[], currencies[], directional_bias, sentiment, severity, confidence, trade_impact, reason, expires_at}`. Analisis bersama tidak mereferensikan Pair milik account; dampaknya diproyeksikan melalui Pair mapping masing-masing BrokerAccount sebelum dipakai Signal.
 
 **EconomicEvent**:
 Jadwal event ekonomi terstruktur dari calendar resmi first-party untuk currency yang dipakai StrategyConfig aktif. Revision disimpan immutable; event menentukan blackout melalui EnrichmentPolicy, bukan melalui scraping Forex Factory.
@@ -122,10 +125,13 @@ Pandangan analitis tentang arah pasar: `bullish`, `bearish`, `neutral`. Dipakai 
 ### Bot Lifecycle
 
 **Mode**:
-Siapa yang mengizinkan pembuatan Order dari Signal: `MANUAL` (approve lalu execute melalui dua command user yang terpisah), `SEMI_AUTO` (approval user menjadwalkan Order), `FULL_AUTO` (Signal eligible dapat dijadwalkan tanpa approval). Perubahan Mode tidak mengeksekusi Signal lama secara otomatis.
+Siapa yang mengizinkan pembuatan Order dari Signal pada satu BrokerAccount: `MANUAL` (approve lalu execute melalui dua tindakan user yang terpisah), `SEMI_AUTO` (approval user menjadwalkan tepat satu Order), `FULL_AUTO` (Signal eligible dapat dijadwalkan tanpa approval). Mode account lain tidak terpengaruh; perubahan Mode tidak mengeksekusi Signal lama secara otomatis.
 
 **State**:
-Status hidup engine per BrokerAccount: `RUNNING`, `STOPPED`, `EMERGENCY_STOP`. `STOPPED` menolak entry baru tetapi monitoring dan exit posisi terbuka tetap aktif. `EMERGENCY_STOP` selalu menolak entry baru; close-all hanya dijalankan bila diminta secara eksplisit.
+Status hidup engine khusus satu BrokerAccount: `RUNNING`, `STOPPED`, `EMERGENCY_STOP`. `STOPPED` menolak entry baru tetapi monitoring dan exit posisi terbuka tetap aktif. `EMERGENCY_STOP` selalu menolak entry baru; close-all hanya dijalankan bila diminta secara eksplisit. `RECOVERING` adalah status kesiapan saat memulihkan account, bukan nilai State.
+
+**GlobalEmergencyOperation**:
+Operasi darurat induk yang menerapkan satu kebijakan ke himpunan BrokerAccount yang ditetapkan saat diterima. Stop-only mencakup semua account `ENABLED`; close-all juga mencakup setiap account non-`ARCHIVED` yang masih memiliki exposure atau efek broker/darurat yang belum terselesaikan. Operasi selesai hanya setelah setiap target mencapai hasil yang diminta; account offline atau hasil ambigu tetap belum selesai.
 
 **Command**:
 Permintaan idempotent dan auditable untuk mengubah state domain atau broker. Command memiliki identitas, target, payload canonical, status, dan hasil; hasil ambigu tetap `UNKNOWN` sampai reconciliation.
