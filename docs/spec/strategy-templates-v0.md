@@ -22,14 +22,16 @@ Broker-history calibration is deferred until the application is operating smooth
 
 ## 2. V0 template set
 
-V0 ships two Strategy plugins and four disabled StrategyConfig templates:
+V0 ships three Strategy plugins and four disabled StrategyConfig templates:
 
 | Template key | Pair | Strategy plugin | Trigger timeframe | Required timeframes | Default state |
 |---|---|---|---|---|---|
 | `xauusd-trend-pullback-v0` | `XAUUSD` | `TrendPullbackContinuationStrategy@0.1.0` | M15 | H4, H1, M15 | disabled |
-| `eurusd-trend-pullback-v0` | `EURUSD` | `TrendPullbackContinuationStrategy@0.1.0` | M15 | H4, H1, M15 | disabled |
 | `usdjpy-trend-pullback-v0` | `USDJPY` | `TrendPullbackContinuationStrategy@0.1.0` | M15 | H4, H1, M15 | disabled |
+| `eurusd-snd-ao-qm-bidirectional-v0` | `EURUSD` | `SupplyDemandAOQMStrategy@0.1.0` | M30 | H4, M30 | disabled |
 | `wti-trend-breakout-v0` | `WTI` | `TrendFilteredBreakoutStrategy@0.1.0` | M15 | H4, H1, M15 | disabled |
+
+> **EURUSD override (decision B):** EURUSD is served by the supply/demand + AO + Quasimodo plugin (`SupplyDemandAOQMStrategy`), specified in [`strategy-eurusd-snd-ao-qm-v0.md`](strategy-eurusd-snd-ao-qm-v0.md). The former `eurusd-trend-pullback-v0` TrendPullback template is **superseded** for EURUSD; this document's TrendPullback plugin now covers XAUUSD and USDJPY only. Sections below that reference EURUSD as a TrendPullback target are retained only where they describe the superseded design or a shared contract exercised on a EURUSD example; they do not define an active EURUSD V0 entry. See §9.4 of the EURUSD QM/AO spec for whether the superseded design remains a challenger.
 
 `MeanReversionStrategy` is not an initial V0 template. It remains a future challenger for an explicitly ranging regime.
 
@@ -117,7 +119,7 @@ Pending Stop entry is not part of these V0 templates.
 
 ### 4.1 H4 directional filter
 
-The common seed for XAUUSD, EURUSD, and USDJPY is:
+The common seed for XAUUSD and USDJPY (the pairs still served by this plugin after the EURUSD override) is:
 
 ```yaml
 ema_fast:
@@ -188,22 +190,21 @@ Common mechanics:
 
 Pair-specific exact seeds:
 
-| Parameter | XAUUSD | EURUSD | USDJPY |
-|---|---:|---:|---:|
-| `channel_bars` | 12 | 12 | 12 |
-| `atr_m15_period` | 14 | 14 | 14 |
-| `buffer_atr` | 0.10 | 0.10 | 0.05 |
-| `buffer_spread_multiple` | 1.50 | 1.50 | 1.50 |
-| `min_body_fraction` | 0.55 | 0.55 | 0.55 |
-| `max_extension_atr` | 1.00 | 1.00 | 1.00 |
-| `signal_ttl_m15_bars` | 4 | 2 | 4 |
+| Parameter | XAUUSD | USDJPY |
+|---|---:|---:|
+| `channel_bars` | 12 | 12 |
+| `atr_m15_period` | 14 | 14 |
+| `buffer_atr` | 0.10 | 0.05 |
+| `buffer_spread_multiple` | 1.50 | 1.50 |
+| `min_body_fraction` | 0.55 | 0.55 |
+| `max_extension_atr` | 1.00 | 1.00 |
+| `signal_ttl_m15_bars` | 4 | 4 |
 
 `trigger_buffer = max(buffer_atr × ATR14(M15), buffer_spread_multiple × spread_at_evaluation)`.
 
 Signal TTLs are therefore:
 
 - XAUUSD: 60 minutes;
-- EURUSD: 30 minutes;
 - USDJPY: 60 minutes.
 
 A Signal is valid only while `execution_time < expires_at`. Equality is expired.
@@ -374,9 +375,10 @@ A MarketStateSnapshot is COMPLETE only when it has at least:
 | Template | H4 closed bars | H1 closed bars | M15 closed bars |
 |---|---:|---:|---:|
 | XAUUSD trend-pullback | 450 | 150 | 60 |
-| EURUSD trend-pullback | 450 | 150 | 60 |
 | USDJPY trend-pullback | 450 | 150 | 60 |
 | WTI trend-breakout | 450 | 300 | 500 |
+
+> EURUSD is served by `SupplyDemandAOQMStrategy` (see `strategy-eurusd-snd-ao-qm-v0.md`), whose minimum lookback is defined in that document (H4 + M30), not by this TrendPullback lookback table.
 
 The H4 requirement is three times EMA150. Trend H1/M15 requirements cover indicator warm-up plus setup/channel input. WTI provisions longer H1/M15 series for compression, discontinuity, session, and roll-aware baselines.
 
@@ -411,7 +413,7 @@ The normative seed data and expected outputs are in [`fixtures/strategy-v0-cases
 
 ### 10.2 Trend-pullback fixtures for each Pair
 
-For each of XAUUSD, EURUSD, and USDJPY, fixtures provide a concrete valid LONG, a fully materialized mirrored SHORT, and assertions for that Pair's exact channel, buffer, extension, and TTL parameters. Because H4/H1 mechanics are one shared plugin contract, their failure and equality boundaries are exercised once on the canonical EURUSD fixture rather than duplicated at unrelated price scales; the deterministic mirror contract separately proves comparison inversion for every Pair:
+For each of XAUUSD and USDJPY (the pairs served by this plugin after the EURUSD override), fixtures provide a concrete valid LONG, a fully materialized mirrored SHORT, and assertions for that Pair's exact channel, buffer, extension, and TTL parameters. Because H4/H1 mechanics are one shared plugin contract, their failure and equality boundaries are exercised once on the canonical XAUUSD fixture rather than duplicated at unrelated price scales; the deterministic mirror contract separately proves comparison inversion for every Pair. (The EURUSD QM/AO plugin has its own deterministic fixtures, defined alongside `strategy-eurusd-snd-ao-qm-v0.md` and following the same Backend V0 expansion contracts as this section.):
 
 1. Valid LONG produces one Opportunity with confidence 0.70 and the three success reason codes.
 2. Mirrored valid SHORT produces one Opportunity with identical confidence.
