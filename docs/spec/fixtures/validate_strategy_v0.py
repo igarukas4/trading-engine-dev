@@ -221,6 +221,11 @@ def verify_spec(contract: dict[str, Any], spec: str) -> None:
         "signal_ttl_m15_bars": [str(item["m15"]["signal_ttl_m15_bars"]) for item in trend_templates],
     }
     require(parameter_rows == expected_trend_m15, f"strategy-templates-v0.md: trend M15 seed drift: {parameter_rows!r}")
+    for item in trend_templates:
+        require(
+            f"- {item['pair']}: {item['m15']['ttl_minutes']} minutes" in trend_section,
+            f"strategy-templates-v0.md: {item['pair']} Signal TTL drift",
+        )
 
     wti_section = section(spec, "5", "TrendFilteredBreakoutStrategy for WTI")
     for key, value in contract["templates"][-1]["wti"].items():
