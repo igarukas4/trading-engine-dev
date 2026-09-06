@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SPEC = ROOT / "docs/spec/strategy-templates-v0.md"
 BACKEND = ROOT / "docs/spec/backend-v0.md"
 FIXTURE = Path(__file__).with_name("strategy-v0-cases.json")
+QM_AO_FIXTURE = Path(__file__).with_name("strategy-eurusd-snd-ao-qm-cases.json")
 SCALE_18 = Decimal("0.000000000000000001")
 
 
@@ -147,8 +148,8 @@ def verify_fixture_shape(contract: dict[str, Any]) -> None:
     templates = contract["templates"]
     expected = [
         ("xauusd-trend-pullback-v0", "XAUUSD", "TrendPullbackContinuationStrategy@0.1.0"),
-        ("eurusd-trend-pullback-v0", "EURUSD", "TrendPullbackContinuationStrategy@0.1.0"),
         ("usdjpy-trend-pullback-v0", "USDJPY", "TrendPullbackContinuationStrategy@0.1.0"),
+        ("eurusd-snd-ao-qm-bidirectional-v0", "EURUSD", "SupplyDemandAOQMStrategy@0.1.0"),
         ("wti-trend-breakout-v0", "WTI", "TrendFilteredBreakoutStrategy@0.1.0"),
     ]
     require([(item["key"], item["pair"], item["strategy"]) for item in templates] == expected, "fixture: exact V0 template-to-Pair/plugin mapping changed")
@@ -168,11 +169,16 @@ def verify_fixture_shape(contract: dict[str, Any]) -> None:
 def verify_spec(contract: dict[str, Any], spec: str) -> None:
     templates = table_rows(section(spec, "2", "V0 template set"))
     actual = [(row[0].strip("`"), row[1].strip("`"), row[2].strip("`"), row[3], row[4], row[5]) for row in templates[1:]]
-    expected = [(item["key"], item["pair"], item["strategy"], contract["trigger_timeframe"], ", ".join(contract["required_timeframes"]), "disabled") for item in contract["templates"]]
+    expected = []
+    for item in contract["templates"]:
+        if item["pair"] == "EURUSD":
+            expected.append((item["key"], item["pair"], item["strategy"], "M30", "H4, M30", "disabled"))
+        else:
+            expected.append((item["key"], item["pair"], item["strategy"], contract["trigger_timeframe"], ", ".join(contract["required_timeframes"]), "disabled"))
     require(actual == expected, f"strategy-templates-v0.md: template table differs from fixture: {actual!r}")
 
     trend_section = section(spec, "4", "TrendPullbackContinuationStrategy")
-    h4_block = re.search(r"The common seed for XAUUSD, EURUSD, and USDJPY is:\n\n```yaml\n(.*?)```", trend_section, re.S)
+    h4_block = re.search(r"The common seed for XAUUSD and USDJPY \(the pairs still served by this plugin after the EURUSD override\) is:\n\n```yaml\n(.*?)```", trend_section, re.S)
     require(h4_block is not None, "strategy-templates-v0.md: missing H4 seed block")
     h4_contract = contract["h4_trend"]
     expected_h4 = {
@@ -210,16 +216,16 @@ def verify_spec(contract: dict[str, Any], spec: str) -> None:
         require(re.search(rf"^{name}:\s*{re.escape(value)}$", h1_block.group(1), re.M) is not None, f"strategy-templates-v0.md: H1 {name} drift")
 
     trend_table = table_rows(section(spec, "4", "TrendPullbackContinuationStrategy"))
-    parameter_rows = {row[0].strip("`"): row[1:] for row in trend_table if len(row) == 4 and row[0] != "Parameter"}
+    parameter_rows = {row[0].strip("`"): row[1:] for row in trend_table if len(row) == 3 and row[0] != "Parameter"}
     trend_contract = contract["trend_m15"]
-    trend_templates = contract["templates"][:3]
+    trend_templates = [item for item in contract["templates"] if item["strategy"] == "TrendPullbackContinuationStrategy@0.1.0"]
     expected_trend_m15 = {
-        "channel_bars": [str(trend_contract["channel_bars"])] * 3,
-        "atr_m15_period": [str(trend_contract["atr_period"])] * 3,
+        "channel_bars": [str(trend_contract["channel_bars"])] * 2,
+        "atr_m15_period": [str(trend_contract["atr_period"])] * 2,
         "buffer_atr": [item["m15"]["buffer_atr"] for item in trend_templates],
-        "buffer_spread_multiple": [trend_contract["buffer_spread_multiple"]] * 3,
-        "min_body_fraction": [trend_contract["min_body_fraction"]] * 3,
-        "max_extension_atr": [trend_contract["max_extension_atr"]] * 3,
+        "buffer_spread_multiple": [trend_contract["buffer_spread_multiple"]] * 2,
+        "min_body_fraction": [trend_contract["min_body_fraction"]] * 2,
+        "max_extension_atr": [trend_contract["max_extension_atr"]] * 2,
         "signal_ttl_m15_bars": [str(item["m15"]["signal_ttl_m15_bars"]) for item in trend_templates],
     }
     require(parameter_rows == expected_trend_m15, f"strategy-templates-v0.md: trend M15 seed drift: {parameter_rows!r}")
@@ -243,7 +249,7 @@ def verify_spec(contract: dict[str, Any], spec: str) -> None:
         require(phrase in exit_section, f"strategy-templates-v0.md: staged exit contract drift: {phrase!r}")
     lookback_rows = table_rows(section(spec, "8", "Minimum lookback"))
     actual_lookbacks = {row[0]: [int(value) for value in row[1:]] for row in lookback_rows[1:]}
-    expected_lookbacks = {"XAUUSD trend-pullback": [450, 150, 60], "EURUSD trend-pullback": [450, 150, 60], "USDJPY trend-pullback": [450, 150, 60], "WTI trend-breakout": [450, 300, 500]}
+    expected_lookbacks = {"XAUUSD trend-pullback": [450, 150, 60], "USDJPY trend-pullback": [450, 150, 60], "WTI trend-breakout": [450, 300, 500]}
     require(actual_lookbacks == expected_lookbacks, "strategy-templates-v0.md: exact minimum lookbacks drift")
     require("All persisted parameters and calculations use Decimal semantics." in spec and "Decimal precision 38 with `ROUND_HALF_EVEN`" in spec, "strategy-templates-v0.md: Decimal semantics drift")
 
@@ -642,7 +648,7 @@ def assert_expected(actual: dict[str, Any], expected: dict[str, Any], case_id: s
 
 def run_trend_cases(data: dict[str, Any]) -> None:
     contract, scenarios = data["template_contract"], data["scenario_contract"]
-    templates = {item["pair"]: item for item in contract["templates"][:3]}
+    templates = {item["pair"]: item for item in contract["templates"] if item["strategy"] == "TrendPullbackContinuationStrategy@0.1.0"}
     cases = scenarios["trend_cases"]
     generated_ids: set[str] = set()
     for pair in cases["pairs"]:
@@ -674,16 +680,16 @@ def run_trend_cases(data: dict[str, Any]) -> None:
     require({item["id"] for item in cases["execution_gates"]} == {"ttl-one-quantum-before", "ttl-equality", "new-key-no-active-owner", "new-key-active-owner"}, "trend execution gate coverage drift")
     # Config version and replay are evaluated from real structured keys.
     state = deepcopy(scenarios["trend_profiles"]["long"])
-    first = build_graph(templates["EURUSD"], "broker-account-a", state, "trend"); first["_contract"] = contract
-    second = deepcopy(first); second["strategy_config_version"]["id"] = "config-version-broker-account-a-eurusd-v2"; second["market_state_snapshot"]["strategy_config_version_id"] = second["strategy_config_version"]["id"]
-    first_result, second_result = evaluate_trend(first, templates["EURUSD"], "LONG"), evaluate_trend(second, templates["EURUSD"], "LONG")
+    first = build_graph(templates["XAUUSD"], "broker-account-a", state, "trend"); first["_contract"] = contract
+    second = deepcopy(first); second["strategy_config_version"]["id"] = "config-version-broker-account-a-xauusd-v2"; second["market_state_snapshot"]["strategy_config_version_id"] = second["strategy_config_version"]["id"]
+    first_result, second_result = evaluate_trend(first, templates["XAUUSD"], "LONG"), evaluate_trend(second, templates["XAUUSD"], "LONG")
     require(first_result["evaluation_key"] != second_result["evaluation_key"], "config-version isolation: evaluation keys collide")
-    require(evaluate_trend(first, templates["EURUSD"], "LONG")["evaluation_key"] == first_result["evaluation_key"], "replay deduplication: same structured key changed")
+    require(evaluate_trend(first, templates["XAUUSD"], "LONG")["evaluation_key"] == first_result["evaluation_key"], "replay deduplication: same structured key changed")
 
 
 def run_completeness_cases(data: dict[str, Any]) -> None:
     contract, scenarios = data["template_contract"], data["scenario_contract"]
-    template = next(item for item in contract["templates"] if item["pair"] == "EURUSD")
+    template = next(item for item in contract["templates"] if item["pair"] == "XAUUSD")
     for mutation in scenarios["completeness_mutations"]:
         graph = build_graph(template, "broker-account-a", deepcopy(scenarios["trend_profiles"]["long"]), "trend")
         graph["_contract"] = contract
@@ -811,7 +817,7 @@ def verify_scenario_contract(data: dict[str, Any]) -> None:
     scenarios = data["scenario_contract"]
     require(scenarios["entity_revision"] == "canonical-r1", "scenario fixture: entity revision drift")
     require(scenarios["account_ids"] == ["broker-account-a", "broker-account-b"], "scenario fixture: account clone contract drift")
-    require(scenarios["trend_cases"]["pairs"] == ["XAUUSD", "EURUSD", "USDJPY"], "scenario fixture: trend Pair matrix drift")
+    require(scenarios["trend_cases"]["pairs"] == ["XAUUSD", "USDJPY"], "scenario fixture: trend Pair matrix drift")
     require(scenarios["trend_cases"]["directions"] == ["LONG", "SHORT"], "scenario fixture: mirror direction matrix drift")
     wti_cases = scenarios["wti_cases"]
     require(wti_cases["directions"] == ["LONG", "SHORT"], "scenario fixture: WTI mirror direction matrix drift")
@@ -837,7 +843,7 @@ def verify_scenario_contract(data: dict[str, Any]) -> None:
 def negative_mutation_probe(data: dict[str, Any]) -> None:
     """Ensure mutation checks are independent and can actually detect drift."""
     contract = data["template_contract"]
-    template = next(item for item in contract["templates"] if item["pair"] == "EURUSD")
+    template = next(item for item in contract["templates"] if item["pair"] == "XAUUSD")
     graph = build_graph(template, "broker-account-a", deepcopy(data["scenario_contract"]["trend_profiles"]["long"]), "trend")
     graph["_contract"] = contract
     graph["market_state_snapshot"]["candle_ids"]["H4"].pop()
@@ -851,6 +857,82 @@ def negative_mutation_probe(data: dict[str, Any]) -> None:
     wti_graph = build_graph(wti_template, "broker-account-a", wti_state, "wti")
     wti_graph["_contract"] = contract
     require(evaluate_wti(wti_graph, wti_template, "SHORT") == directional_body["expected"], "negative mutation probe: WTI SHORT directional body drift was not detected")
+
+
+def verify_qm_ao_contract() -> tuple[int, int, int]:
+    """Validate the independent H4/M30 EURUSD SND/AO/QM fixture contract."""
+    q = json.loads(QM_AO_FIXTURE.read_text(encoding="utf-8"))
+    require(q["fixture_schema_version"] == "1.0.0", "QM/AO: unsupported schema version")
+    require((q["plugin"], q["template"], q["pair"], q["trigger_timeframe"], q["entry_order_type"]) == ("SupplyDemandAOQMStrategy@0.1.0", "eurusd-snd-ao-qm-bidirectional-v0", "EURUSD", "M30", "LIMIT"), "QM/AO: strategy identity drift")
+    require(q["required_timeframes"] == {"H4": 200, "M30": 60} and q["confidence"] == "0.72", "QM/AO: timeframe/confidence drift")
+    reasons = ["H4_REGIME_CONFIRMED", "H4_ZONE_VALID", "M30_AO_DIVERGENCE", "M30_QM_CONFIRMED", "RETEST_LIMIT_ARMED"]
+    require(q["reason_codes"] == reasons, "QM/AO: reason-code contract drift")
+    p = q["parameters"]
+    require(p["ao"] == {"fast_period": 5, "slow_period": 34, "price_source": "MEDIAN_HIGH_LOW"}, "QM/AO: AO parameters drift")
+    require(p["signal_ttl_minutes"] == 30 and p["pending_order_expiry_minutes"] == 120 and p["minimum_net_reward_risk"] == "2.00", "QM/AO: expiry/R:R parameters drift")
+    cases = {case["id"]: case for case in q["valid_cases"]}
+    require(set(cases) == {"eurusd-snd-ao-qm-short-001", "eurusd-snd-ao-qm-long-001"}, "QM/AO: valid-case matrix drift")
+    for case in cases.values():
+        require(case["available_closed_bars"] == q["required_timeframes"], f"QM/AO {case['id']}: lookback drift")
+        h4, m30, expected = case["h4"], case["m30"], case["expected"]
+        require(h4["all_closed"] and m30["all_closed"] and not h4["gap_detected"] and not m30["gap_detected"], f"QM/AO {case['id']}: passing state must be closed/gap-free")
+        require(parse_time(h4["latest_closed_time"]) <= parse_time(case["trigger_close_time"]) == parse_time(m30["latest_closed_time"]), f"QM/AO {case['id']}: candle alignment drift")
+        require(h4["source_revision"] == m30["source_revision"] == h4["opposing_zone"]["source_revision"], f"QM/AO {case['id']}: source revision drift")
+        zone, opposing = h4["zone"], h4["opposing_zone"]
+        require(zone["status"] == opposing["status"] == "VALID" and zone["visit_count"] == 0, f"QM/AO {case['id']}: zone validity/freshness drift")
+        a, b, head, br = m30["a"], m30["b"], m30["c"], m30["break"]
+        require(parse_time(a["confirmed_at"]) < parse_time(b["confirmed_at"]) < parse_time(head["confirmed_at"]) < parse_time(br["close_time"]) == parse_time(case["trigger_close_time"]), f"QM/AO {case['id']}: A-B-C chronology drift")
+        signal = expected["signal"]
+        require(expected["result"] == "OPPORTUNITY" and expected["confidence"] == q["confidence"] and expected["reason_codes"] == reasons, f"QM/AO {case['id']}: opportunity output drift")
+        require(expected["evaluation_key"] == {"strategy_config_version_id": case["strategy_config_version_id"], "pair_id": case["pair_id"], "trigger_time": case["trigger_close_time"]}, f"QM/AO {case['id']}: evaluation key drift")
+        entry, stop, target, cost = (parse_decimal(signal[key]) for key in ("entry_price", "stop_loss", "take_profit", "estimated_round_trip_cost"))
+        atr = parse_decimal(m30["atr14"])
+        require(signal["native_protection_required"] is True and parse_time(signal["signal_expires_at"]) - parse_time(case["trigger_close_time"]) == timedelta(minutes=30) and parse_time(signal["pending_order_expires_at"]) - parse_time(case["trigger_close_time"]) == timedelta(minutes=120), f"QM/AO {case['id']}: protection/expiry drift")
+        if expected["direction"] == "SHORT":
+            require((h4["regime"], zone["kind"], opposing["kind"], signal["entry_order_type"]) == ("BEARISH_PULLBACK", "SUPPLY", "DEMAND", "SELL_LIMIT"), f"QM/AO {case['id']}: SHORT context drift")
+            require(entry == min(parse_decimal(a["open"]), parse_decimal(a["close"])) and parse_decimal(head["pivot_price"]) > parse_decimal(a["pivot_price"]) and parse_decimal(m30["ao"]["second_pivot_value"]) < parse_decimal(m30["ao"]["first_pivot_value"]), f"QM/AO {case['id']}: SHORT entry/divergence drift")
+            require(parse_decimal(br["close"]) < parse_decimal(b["pivot_price"]) - atr * Decimal("0.10") and stop > parse_decimal(head["pivot_price"]) and target == parse_decimal(opposing["high"]) - atr * Decimal("0.10"), f"QM/AO {case['id']}: SHORT QM/SL/TP drift")
+            planned_loss, planned_reward = stop - entry + cost, entry - target - cost
+        else:
+            require(expected["direction"] == "LONG" and (h4["regime"], zone["kind"], opposing["kind"], signal["entry_order_type"]) == ("BULLISH_PULLBACK", "DEMAND", "SUPPLY", "BUY_LIMIT"), f"QM/AO {case['id']}: LONG context drift")
+            require(entry == min(parse_decimal(a["open"]), parse_decimal(a["close"])) and parse_decimal(head["pivot_price"]) < parse_decimal(a["pivot_price"]) and parse_decimal(m30["ao"]["second_pivot_value"]) > parse_decimal(m30["ao"]["first_pivot_value"]), f"QM/AO {case['id']}: LONG entry/divergence drift")
+            require(parse_decimal(br["close"]) > parse_decimal(b["pivot_price"]) + atr * Decimal("0.10") and stop < parse_decimal(head["pivot_price"]) and target == parse_decimal(opposing["low"]) - atr * Decimal("0.10"), f"QM/AO {case['id']}: LONG QM/SL/TP drift")
+            planned_loss, planned_reward = entry - stop + cost, target - entry - cost
+        require(planned_loss > 0 and planned_reward / planned_loss >= Decimal(signal["minimum_net_reward_risk"]), f"QM/AO {case['id']}: net R:R drift")
+
+    required_mutations = {item["id"] for item in q["mutations"]}
+    require(required_mutations == set(q["coverage_contract"]["required_mutation_ids"]), "QM/AO: mutation coverage drift")
+    expected_reasons = {"qm-h4-transition-blocks-entry": "H4_REGIME_INELIGIBLE", "qm-zone-invalid-blocks-entry": "H4_ZONE_INVALID", "qm-zone-visited-blocks-entry": "H4_ZONE_NOT_FRESH", "qm-ao-price-difference-below": "M30_AO_PRICE_DIFFERENCE_TOO_SMALL", "qm-ao-difference-below": "M30_AO_DIFFERENCE_TOO_SMALL", "qm-head-outside-zone": "QM_HEAD_OUTSIDE_H4_ZONE", "qm-wick-below": "QM_HEAD_WICK_TOO_SMALL", "qm-break-at-boundary": "QM_STRUCTURE_BREAK_NOT_CONFIRMED", "qm-break-beyond-buffer": None, "qm-target-too-close": "REWARD_RISK_BELOW_MINIMUM", "qm-h4-open-candle": "OPEN_CANDLE_INPUT", "qm-m30-open-candle": "OPEN_CANDLE_INPUT", "qm-h4-future-candle": "FUTURE_CANDLE_INPUT", "qm-m30-gap-detected": "GAP_DETECTED", "qm-source-revision-mismatch": "REVISION_MISMATCH", "qm-m30-short-lookback": "INSUFFICIENT_LOOKBACK", "qm-h4-short-lookback": "INSUFFICIENT_LOOKBACK", "qm-context-invalidates-pending": "PENDING_CONTEXT_INVALIDATED", "qm-event-blackout-cancels-pending": "EVENT_BLACKOUT_ACTIVE", "qm-signal-expired": "SIGNAL_EXPIRED", "qm-pending-expired": "PENDING_ORDER_EXPIRED"}
+    require(required_mutations == set(expected_reasons), "QM/AO: required mutation set drift")
+    def set_path(root: dict[str, Any], path: str, value: Any) -> None:
+        node: Any = root
+        parts = path.split(".")
+        for key in parts[:-1]:
+            require(key in node, f"QM/AO: unknown mutation path {path}")
+            node = node[key]
+        require(parts[-1] in node, f"QM/AO: unknown mutation path {path}")
+        node[parts[-1]] = deepcopy(value)
+    for mutation in q["mutations"]:
+        require(mutation["base"] in cases, f"QM/AO {mutation['id']}: unknown base")
+        changed = deepcopy(cases[mutation["base"]])
+        for path, value in mutation.get("set", {}).items(): set_path(changed, path, value)
+        reason = expected_reasons[mutation["id"]]
+        require(mutation["expected"].get("audit_reason") == reason, f"QM/AO {mutation['id']}: expected reason drift")
+        if mutation["id"] == "qm-break-at-boundary": require(parse_decimal(changed["m30"]["break"]["close"]) == parse_decimal(changed["m30"]["b"]["pivot_price"]) - parse_decimal(changed["m30"]["atr14"]) * Decimal("0.10"), "QM/AO: break boundary must be strict")
+        if mutation["id"] == "qm-break-beyond-buffer": require(parse_decimal(changed["m30"]["break"]["close"]) < parse_decimal(changed["m30"]["b"]["pivot_price"]) - parse_decimal(changed["m30"]["atr14"]) * Decimal("0.10"), "QM/AO: break pass must exceed strict buffer")
+        if mutation["id"] == "qm-target-too-close":
+            s = changed["expected"]["signal"]; ratio = (parse_decimal(s["entry_price"]) - parse_decimal(s["take_profit"]) - parse_decimal(s["estimated_round_trip_cost"])) / (parse_decimal(s["stop_loss"]) - parse_decimal(s["entry_price"]) + parse_decimal(s["estimated_round_trip_cost"]))
+            require(ratio < Decimal(s["minimum_net_reward_risk"]), "QM/AO: too-close target must fail net R:R")
+        if mutation["id"] == "qm-h4-future-candle": require(parse_time(changed["h4"]["latest_closed_time"]) > parse_time(changed["trigger_close_time"]), "QM/AO: future-candle mutation inert")
+        if mutation["id"] == "qm-source-revision-mismatch": require(changed["h4"]["source_revision"] != changed["m30"]["source_revision"], "QM/AO: revision mutation inert")
+    lifecycle = {item["id"]: item for item in q["execution_lifecycle_cases"]}
+    require(set(lifecycle) == set(q["coverage_contract"]["required_execution_ids"]), "QM/AO: lifecycle coverage drift")
+    require(lifecycle["qm-pending-created-with-native-protection"]["input"] == {"order_type": "SELL_LIMIT", "native_stop_loss_present": True, "native_take_profit_present": True, "risk_reservation_status": "RESERVED"}, "QM/AO: pending protection create contract drift")
+    require(lifecycle["qm-pending-fill-consumes-reservation"]["expected"] == {"risk_reservation_status": "CONSUMED", "position_protection_status": "CONFIRMED"}, "QM/AO: pending fill contract drift")
+    require(lifecycle["qm-pending-cancel-releases-reservation"]["expected"] == {"risk_reservation_status": "RELEASED"} and lifecycle["qm-pending-expiry-releases-reservation"]["expected"] == {"risk_reservation_status": "RELEASED"}, "QM/AO: release contract drift")
+    require(lifecycle["qm-fill-races-cancel-reconciles"]["expected"] == {"reconciliation_action": "RECORD_FILL_AND_CONSUME_RESERVATION", "retry_policy": "NO_BLIND_RETRY"}, "QM/AO: race reconciliation contract drift")
+    require(lifecycle["qm-disconnect-keeps-broker-protection"]["expected"] == {"position_action": "RETAIN_BROKER_NATIVE_PROTECTION", "new_entry_action": "BLOCK"}, "QM/AO: disconnect contract drift")
+    return len(cases), len(required_mutations), len(lifecycle)
 
 
 def main() -> None:
@@ -867,7 +949,8 @@ def main() -> None:
     run_wti_cases(data)
     run_execution_exit_cases(data)
     negative_mutation_probe(data)
-    print("strategy-v0 template and expanded scenario contract validation: PASS")
+    qm_cases, qm_mutations, qm_lifecycle = verify_qm_ao_contract()
+    print(f"strategy-v0 template and expanded scenario contract validation: PASS; EURUSD QM/AO {qm_cases} valid + {qm_mutations} mutations + {qm_lifecycle} lifecycle cases")
 
 
 if __name__ == "__main__":

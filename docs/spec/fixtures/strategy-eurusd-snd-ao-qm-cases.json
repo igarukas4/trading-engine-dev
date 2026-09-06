@@ -1,0 +1,139 @@
+{
+  "fixture_schema_version": "1.0.0",
+  "purpose": "Normative deterministic acceptance cases for the EURUSD SupplyDemandAOQMStrategy V0 override. Values are proposed calibration seeds, not profitability claims.",
+  "plugin": "SupplyDemandAOQMStrategy@0.1.0",
+  "template": "eurusd-snd-ao-qm-bidirectional-v0",
+  "pair": "EURUSD",
+  "trigger_timeframe": "M30",
+  "required_timeframes": {"H4": 200, "M30": 60},
+  "entry_order_type": "LIMIT",
+  "confidence": "0.72",
+  "reason_codes": [
+    "H4_REGIME_CONFIRMED",
+    "H4_ZONE_VALID",
+    "M30_AO_DIVERGENCE",
+    "M30_QM_CONFIRMED",
+    "RETEST_LIMIT_ARMED"
+  ],
+  "parameters": {
+    "ao": {"fast_period": 5, "slow_period": 34, "price_source": "MEDIAN_HIGH_LOW"},
+    "atr": {"h4_period": 14, "m30_period": 14},
+    "h4_swing_reversal_atr": "1.00",
+    "h4_break_buffer_atr": "0.25",
+    "zone": {"compression_ratio_max": "0.65", "base_min_closed_bars": 3, "departure_buffer_atr": "0.25"},
+    "m30_ao_min_price_diff_atr": "0.30",
+    "m30_ao_min_ao_diff_atr": "0.30",
+    "m30_qm_break_buffer_atr": "0.10",
+    "m30_qm_min_wick_atr": "0.30",
+    "stop_buffer_atr": "0.25",
+    "target_buffer_atr": "0.10",
+    "minimum_net_reward_risk": "2.00",
+    "signal_ttl_minutes": 30,
+    "pending_order_expiry_minutes": 120
+  },
+  "valid_cases": [
+    {
+      "id": "eurusd-snd-ao-qm-short-001",
+      "broker_account_id": "acct-demo-a",
+      "pair_id": "pair-eurusd",
+      "strategy_config_version_id": "cfg-eurusd-snd-ao-qm-v1",
+      "market_state_snapshot_id": "snapshot-eurusd-snd-ao-qm-short-001",
+      "trigger_close_time": "2026-02-10T12:00:00Z",
+      "available_closed_bars": {"H4": 200, "M30": 60},
+      "h4": {
+        "all_closed": true,
+        "regime": "BEARISH_PULLBACK",
+        "atr14": "0.00400",
+        "trend_invalidation": "1.11800",
+        "latest_closed_time": "2026-02-10T12:00:00Z", "source_revision": "mt5-demo-r1", "gap_detected": false, "zone": {"kind": "SUPPLY", "status": "VALID", "base_start": "2026-02-05T00:00:00Z", "base_end": "2026-02-05T12:00:00Z", "confirmed_at": "2026-02-05T16:00:00Z", "low": "1.10800", "high": "1.11200", "visit_count": 0, "penetration_depth": "0.00000"}, "opposing_zone": {"kind": "DEMAND", "status": "VALID", "low": "1.10300", "high": "1.10400", "source_revision": "mt5-demo-r1"}
+      },
+      "m30": {
+        "all_closed": true,
+        "latest_closed_time": "2026-02-10T12:00:00Z", "source_revision": "mt5-demo-r1", "gap_detected": false,
+        "atr14": "0.00100",
+        "ao": {"fast_period": 5, "slow_period": 34, "price_source": "MEDIAN_HIGH_LOW", "first_pivot_value": "0.00120", "second_pivot_value": "0.00080"},
+        "a": {"candle_id": "eur-qm-s-a-r1", "confirmed_at": "2026-02-10T09:30:00Z", "open": "1.10900", "high": "1.11000", "low": "1.10850", "close": "1.10940", "pivot_price": "1.11000"},
+        "b": {"candle_id": "eur-qm-s-b-r1", "confirmed_at": "2026-02-10T10:00:00Z", "pivot_price": "1.10750"},
+        "c": {"candle_id": "eur-qm-s-c-r1", "confirmed_at": "2026-02-10T10:30:00Z", "pivot_price": "1.11100", "high": "1.11100", "low": "1.10900", "close": "1.10950"},
+        "break": {"candle_id": "eur-qm-s-break-r1", "close_time": "2026-02-10T12:00:00Z", "close": "1.10730"}
+      },
+      "expected": {
+        "result": "OPPORTUNITY",
+        "direction": "SHORT",
+        "evaluation_key": {"strategy_config_version_id": "cfg-eurusd-snd-ao-qm-v1", "pair_id": "pair-eurusd", "trigger_time": "2026-02-10T12:00:00Z"},
+        "confidence": "0.72",
+        "reason_codes": ["H4_REGIME_CONFIRMED", "H4_ZONE_VALID", "M30_AO_DIVERGENCE", "M30_QM_CONFIRMED", "RETEST_LIMIT_ARMED"],
+        "signal": {"entry_order_type": "SELL_LIMIT", "entry_price": "1.10900", "stop_loss": "1.11125", "take_profit": "1.10390", "estimated_round_trip_cost": "0.00010", "minimum_net_reward_risk": "2.00", "signal_expires_at": "2026-02-10T12:30:00Z", "pending_order_expires_at": "2026-02-10T14:00:00Z", "native_protection_required": true}
+      }
+    },
+    {
+      "id": "eurusd-snd-ao-qm-long-001",
+      "broker_account_id": "acct-demo-a",
+      "pair_id": "pair-eurusd",
+      "strategy_config_version_id": "cfg-eurusd-snd-ao-qm-v1",
+      "market_state_snapshot_id": "snapshot-eurusd-snd-ao-qm-long-001",
+      "trigger_close_time": "2026-02-11T12:00:00Z",
+      "available_closed_bars": {"H4": 200, "M30": 60},
+      "h4": {
+        "all_closed": true,
+        "regime": "BULLISH_PULLBACK",
+        "atr14": "0.00400",
+        "trend_invalidation": "1.09200",
+        "latest_closed_time": "2026-02-11T12:00:00Z", "source_revision": "mt5-demo-r1", "gap_detected": false, "zone": {"kind": "DEMAND", "status": "VALID", "base_start": "2026-02-06T00:00:00Z", "base_end": "2026-02-06T12:00:00Z", "confirmed_at": "2026-02-06T16:00:00Z", "low": "1.09800", "high": "1.10200", "visit_count": 0, "penetration_depth": "0.00000"}, "opposing_zone": {"kind": "SUPPLY", "status": "VALID", "low": "1.10620", "high": "1.11000", "source_revision": "mt5-demo-r1"}
+      },
+      "m30": {
+        "all_closed": true,
+        "latest_closed_time": "2026-02-11T12:00:00Z", "source_revision": "mt5-demo-r1", "gap_detected": false,
+        "atr14": "0.00100",
+        "ao": {"fast_period": 5, "slow_period": 34, "price_source": "MEDIAN_HIGH_LOW", "first_pivot_value": "-0.00120", "second_pivot_value": "-0.00080"},
+        "a": {"candle_id": "eur-qm-l-a-r1", "confirmed_at": "2026-02-11T09:30:00Z", "open": "1.10100", "high": "1.10150", "low": "1.10000", "close": "1.10060", "pivot_price": "1.10000"},
+        "b": {"candle_id": "eur-qm-l-b-r1", "confirmed_at": "2026-02-11T10:00:00Z", "pivot_price": "1.10250"},
+        "c": {"candle_id": "eur-qm-l-c-r1", "confirmed_at": "2026-02-11T10:30:00Z", "pivot_price": "1.09900", "high": "1.10100", "low": "1.09900", "close": "1.10050"},
+        "break": {"candle_id": "eur-qm-l-break-r1", "close_time": "2026-02-11T12:00:00Z", "close": "1.10270"}
+      },
+      "expected": {
+        "result": "OPPORTUNITY",
+        "direction": "LONG",
+        "evaluation_key": {"strategy_config_version_id": "cfg-eurusd-snd-ao-qm-v1", "pair_id": "pair-eurusd", "trigger_time": "2026-02-11T12:00:00Z"},
+        "confidence": "0.72",
+        "reason_codes": ["H4_REGIME_CONFIRMED", "H4_ZONE_VALID", "M30_AO_DIVERGENCE", "M30_QM_CONFIRMED", "RETEST_LIMIT_ARMED"],
+        "signal": {"entry_order_type": "BUY_LIMIT", "entry_price": "1.10060", "stop_loss": "1.09875", "take_profit": "1.10610", "estimated_round_trip_cost": "0.00010", "minimum_net_reward_risk": "2.00", "signal_expires_at": "2026-02-11T12:30:00Z", "pending_order_expires_at": "2026-02-11T14:00:00Z", "native_protection_required": true}
+      }
+    }
+  ],
+  "mutations": [
+    {"id": "qm-h4-transition-blocks-entry", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.regime": "TRANSITION"}, "expected": {"result": "NONE", "audit_reason": "H4_REGIME_INELIGIBLE"}},
+    {"id": "qm-zone-invalid-blocks-entry", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.zone.status": "INVALID"}, "expected": {"result": "NONE", "audit_reason": "H4_ZONE_INVALID"}},
+    {"id": "qm-zone-visited-blocks-entry", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.zone.visit_count": 1}, "expected": {"result": "NONE", "audit_reason": "H4_ZONE_NOT_FRESH"}},
+    {"id": "qm-ao-price-difference-below", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.c.pivot_price": "1.110299999999999999"}, "expected": {"result": "NONE", "audit_reason": "M30_AO_PRICE_DIFFERENCE_TOO_SMALL"}},
+    {"id": "qm-ao-difference-below", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.ao.second_pivot_value": "0.00091"}, "expected": {"result": "NONE", "audit_reason": "M30_AO_DIFFERENCE_TOO_SMALL"}},
+    {"id": "qm-head-outside-zone", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.c.pivot_price": "1.11201"}, "expected": {"result": "NONE", "audit_reason": "QM_HEAD_OUTSIDE_H4_ZONE"}},
+    {"id": "qm-wick-below", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.c.close": "1.11071"}, "expected": {"result": "NONE", "audit_reason": "QM_HEAD_WICK_TOO_SMALL"}},
+    {"id": "qm-break-at-boundary", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.break.close": "1.10740"}, "expected": {"result": "NONE", "audit_reason": "QM_STRUCTURE_BREAK_NOT_CONFIRMED"}},
+    {"id": "qm-break-beyond-buffer", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.break.close": "1.10739"}, "expected": {"result": "OPPORTUNITY", "direction": "SHORT"}},
+    {"id": "qm-target-too-close", "base": "eurusd-snd-ao-qm-short-001", "set": {"expected.signal.take_profit": "1.10600"}, "expected": {"result": "NONE", "audit_reason": "REWARD_RISK_BELOW_MINIMUM"}},
+    {"id": "qm-h4-open-candle", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.all_closed": false}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "OPEN_CANDLE_INPUT"}},
+    {"id": "qm-m30-open-candle", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.all_closed": false}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "OPEN_CANDLE_INPUT"}},
+    {"id": "qm-h4-future-candle", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.latest_closed_time": "2026-02-10T12:30:00Z"}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "FUTURE_CANDLE_INPUT"}},
+    {"id": "qm-m30-gap-detected", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.gap_detected": true}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "GAP_DETECTED"}},
+    {"id": "qm-source-revision-mismatch", "base": "eurusd-snd-ao-qm-short-001", "set": {"m30.source_revision": "mt5-demo-r2"}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "REVISION_MISMATCH"}},
+    {"id": "qm-m30-short-lookback", "base": "eurusd-snd-ao-qm-short-001", "set": {"available_closed_bars.M30": 59}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "INSUFFICIENT_LOOKBACK"}},
+    {"id": "qm-h4-short-lookback", "base": "eurusd-snd-ao-qm-short-001", "set": {"available_closed_bars.H4": 199}, "expected": {"pipeline_action": "SKIP_EVALUATION", "audit_reason": "INSUFFICIENT_LOOKBACK"}},
+    {"id": "qm-context-invalidates-pending", "base": "eurusd-snd-ao-qm-short-001", "set": {"h4.regime": "BULLISH_IMPULSIVE"}, "expected": {"order_action": "CANCEL_PENDING", "audit_reason": "PENDING_CONTEXT_INVALIDATED"}},
+    {"id": "qm-event-blackout-cancels-pending", "base": "eurusd-snd-ao-qm-short-001", "event": {"type": "HIGH_IMPACT_EUR_OR_US_BLACKOUT", "time": "2026-02-10T12:15:00Z"}, "expected": {"order_action": "CANCEL_PENDING", "audit_reason": "EVENT_BLACKOUT_ACTIVE"}},
+    {"id": "qm-signal-expired", "base": "eurusd-snd-ao-qm-short-001", "evaluate_at": "2026-02-10T12:30:00Z", "expected": {"order_action": "REJECT", "audit_reason": "SIGNAL_EXPIRED"}},
+    {"id": "qm-pending-expired", "base": "eurusd-snd-ao-qm-short-001", "evaluate_at": "2026-02-10T14:00:00Z", "expected": {"order_action": "EXPIRE_PENDING", "audit_reason": "PENDING_ORDER_EXPIRED"}}
+  ],
+  "execution_lifecycle_cases": [
+    {"id": "qm-pending-created-with-native-protection", "input": {"order_type": "SELL_LIMIT", "native_stop_loss_present": true, "native_take_profit_present": true, "risk_reservation_status": "RESERVED"}, "expected": {"order_status": "SUBMITTED", "risk_reservation_status": "RESERVED"}},
+    {"id": "qm-pending-fill-consumes-reservation", "input": {"order_status": "FILLED", "native_stop_loss_confirmed": true, "native_take_profit_confirmed": true}, "expected": {"risk_reservation_status": "CONSUMED", "position_protection_status": "CONFIRMED"}},
+    {"id": "qm-pending-cancel-releases-reservation", "input": {"order_status": "CANCELLED"}, "expected": {"risk_reservation_status": "RELEASED"}},
+    {"id": "qm-pending-expiry-releases-reservation", "input": {"order_status": "EXPIRED"}, "expected": {"risk_reservation_status": "RELEASED"}},
+    {"id": "qm-fill-races-cancel-reconciles", "input": {"cancel_request_status": "SUBMITTED", "broker_order_status": "FILLED"}, "expected": {"reconciliation_action": "RECORD_FILL_AND_CONSUME_RESERVATION", "retry_policy": "NO_BLIND_RETRY"}},
+    {"id": "qm-disconnect-keeps-broker-protection", "input": {"connector_status": "DISCONNECTED", "confirmed_native_stop_loss": true, "confirmed_native_take_profit": true}, "expected": {"position_action": "RETAIN_BROKER_NATIVE_PROTECTION", "new_entry_action": "BLOCK"}}
+  ],
+  "coverage_contract": {
+    "required_mutation_ids": ["qm-h4-transition-blocks-entry", "qm-zone-invalid-blocks-entry", "qm-zone-visited-blocks-entry", "qm-ao-price-difference-below", "qm-ao-difference-below", "qm-head-outside-zone", "qm-wick-below", "qm-break-at-boundary", "qm-break-beyond-buffer", "qm-target-too-close", "qm-h4-open-candle", "qm-m30-open-candle", "qm-h4-future-candle", "qm-m30-gap-detected", "qm-source-revision-mismatch", "qm-m30-short-lookback", "qm-h4-short-lookback", "qm-context-invalidates-pending", "qm-event-blackout-cancels-pending", "qm-signal-expired", "qm-pending-expired"],
+    "required_execution_ids": ["qm-pending-created-with-native-protection", "qm-pending-fill-consumes-reservation", "qm-pending-cancel-releases-reservation", "qm-pending-expiry-releases-reservation", "qm-fill-races-cancel-reconciles", "qm-disconnect-keeps-broker-protection"]
+  }
+}

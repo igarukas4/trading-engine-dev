@@ -38,18 +38,18 @@
         "m15": {"buffer_atr": "0.10", "signal_ttl_m15_bars": 4, "ttl_minutes": 60}
       },
       {
-        "key": "eurusd-trend-pullback-v0",
-        "pair": "EURUSD",
-        "strategy": "TrendPullbackContinuationStrategy@0.1.0",
-        "lookback": {"H4": 450, "H1": 150, "M15": 60},
-        "m15": {"buffer_atr": "0.10", "signal_ttl_m15_bars": 2, "ttl_minutes": 30}
-      },
-      {
         "key": "usdjpy-trend-pullback-v0",
         "pair": "USDJPY",
         "strategy": "TrendPullbackContinuationStrategy@0.1.0",
         "lookback": {"H4": 450, "H1": 150, "M15": 60},
         "m15": {"buffer_atr": "0.05", "signal_ttl_m15_bars": 4, "ttl_minutes": 60}
+      },
+      {
+        "key": "eurusd-snd-ao-qm-bidirectional-v0",
+        "pair": "EURUSD",
+        "strategy": "SupplyDemandAOQMStrategy@0.1.0",
+        "lookback": {"H4": 200, "M30": 60},
+        "qm_ao": {"entry_order_type": "LIMIT", "confidence": "0.72", "signal_ttl_minutes": 30, "pending_order_expiry_minutes": 120}
       },
       {
         "key": "wti-trend-breakout-v0",
@@ -115,10 +115,10 @@
       }
     },
     "trend_cases": {
-      "pairs": ["XAUUSD", "EURUSD", "USDJPY"],
+      "pairs": ["XAUUSD", "USDJPY"],
       "directions": ["LONG", "SHORT"],
       "expected_success": {"outcome": "OPPORTUNITY", "confidence": "0.70", "reason_codes": ["H4_TREND_CONFIRMED", "H1_PULLBACK_RECLAIMED", "M15_CONTINUATION_CONFIRMED"]},
-      "canonical_pair": "EURUSD",
+      "canonical_pair": "XAUUSD",
       "mutations": [
         {"id": "trend-separation-equality", "set": {"h4.ema34": "101"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.70", "reason_codes": ["H4_TREND_CONFIRMED", "H1_PULLBACK_RECLAIMED", "M15_CONTINUATION_CONFIRMED"]}},
         {"id": "trend-price-filter", "set": {"h4.close": "100"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["TREND_PRICE_FILTER_FAILED"]}},
