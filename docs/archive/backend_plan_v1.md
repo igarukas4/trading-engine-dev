@@ -1,4 +1,8 @@
-* AI Generated Output. For Reference but can be Used as Plan
+> **SUPERSEDED — jangan gunakan sebagai rencana atau spesifikasi implementasi.**
+>
+> Dokumen AI-generated ini diarsipkan sebagai konteks historis. Sumber normatif V0 adalah [`docs/spec/backend-v0.md`](../spec/backend-v0.md), [`docs/spec/frontend-v0.md`](../spec/frontend-v0.md), [`docs/spec/strategy-templates-v0.md`](../spec/strategy-templates-v0.md), dan [`CONTEXT.md`](../../CONTEXT.md). Istilah, scope, dan usulan di bawah dapat bertentangan dengan kontrak V0 saat ini.
+
+* AI Generated Output. Historical reference only.
 
 Ya. Gambaranmu sebenarnya sudah menuju **arsitektur trading platform**, bukan sekadar “script buy/sell”. Dan untuk versi awal, saya akan sengaja membuat AI **bukan pihak yang langsung punya kuasa absolut melakukan trade**. AI membaca konteks dan memberi skor/validasi; rule engine dan risk engine tetap menjadi gatekeeper.
 

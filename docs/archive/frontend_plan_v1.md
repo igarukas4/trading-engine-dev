@@ -1,4 +1,8 @@
-* AI Generated Output. For Reference but can be Used as Plan
+> **SUPERSEDED — jangan gunakan sebagai rencana atau spesifikasi implementasi.**
+>
+> Dokumen AI-generated ini diarsipkan sebagai konteks historis. Sumber normatif V0 adalah [`docs/spec/backend-v0.md`](../spec/backend-v0.md), [`docs/spec/frontend-v0.md`](../spec/frontend-v0.md), [`docs/spec/strategy-templates-v0.md`](../spec/strategy-templates-v0.md), dan [`CONTEXT.md`](../../CONTEXT.md). Istilah, scope, dan usulan di bawah dapat bertentangan dengan kontrak V0 saat ini.
+
+* AI Generated Output. Historical reference only.
 
 Untuk V1, saya sarankan **buat dashboard sendiri sebagai command center**, lalu TradingView/MT5/Binance tetap dipakai sebagai alat bantu eksternal.
 
