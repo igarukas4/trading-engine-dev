@@ -193,7 +193,8 @@ Seeds deliberately reuse conventions in `strategy-templates-v0.md` (0.25 ATR buf
 - **NEW** (this): `docs/spec/strategy-eurusd-snd-ao-qm-v0.md`.
 - **EDIT** `docs/spec/strategy-templates-v0.md`: remove EURUSD from TrendPullback matrix; keep XAUUSD + USDJPY; note EURUSD served by QM/AO.
 - **EDIT** `docs/research/eurusd-strategy-v0.md`: record that the QM/AO creator framework was evaluated and selected over trend-pullback for EURUSD V0.
-- **NEW** fixtures + validator updates for EURUSD QM/AO deterministic cases (Backend V0 contract).
+- **NEW** [`fixtures/strategy-eurusd-snd-ao-qm-cases.json`](fixtures/strategy-eurusd-snd-ao-qm-cases.json): two mirrored passing cases (LONG + SHORT), 21 explicit negative/boundary/lifecycle mutations, and six pending-order reconciliation cases.
+- **EDIT** [`fixtures/validate_strategy_v0.py`](fixtures/validate_strategy_v0.py): validates the separate QM/AO contract in addition to existing TrendPullback/WTI fixtures; run `python3 docs/spec/fixtures/validate_strategy_v0.py`.
 - **NO change** to `backend-v0.md` core (Limit already supported). Templates-branch backend additions (`PairEntryGateSnapshot`, `algorithm_spec`, session/roll records) still need a separate merge decision.
 
 **Status:** ACCEPTED as design; not activated. Awaiting resolution of §9 open items and validation before activation gate.
