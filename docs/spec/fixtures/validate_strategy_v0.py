@@ -593,7 +593,7 @@ def evaluate_trend(graph: dict[str, Any], template: dict[str, Any], direction: s
     return result("OPPORTUNITY", SUCCESS_TREND, direction=direction, confidence="0.70", evaluation_key={"strategy_config_version_id": graph["strategy_config_version"]["id"], "pair_id": graph["pair"]["id"], "trigger_time": graph["market_state_snapshot"]["trigger_time"]})
 
 
-def evaluate_wti(graph: dict[str, Any], template: dict[str, Any], gate: str = "OPEN") -> dict[str, Any]:
+def evaluate_wti(graph: dict[str, Any], template: dict[str, Any], direction: str, gate: str = "OPEN") -> dict[str, Any]:
     if gate != "OPEN":
         return result("SKIP_EVALUATION", [{"ROLL_GUARD": "WTI_ROLL_GUARD_ACTIVE", "REOPEN_COOLDOWN": "WTI_REOPEN_COOLDOWN_ACTIVE", "FALSE_BREAKOUT_COOLDOWN": "WTI_COOLDOWN_ACTIVE"}[gate]])
     validity = validate_graph(graph, template)
@@ -602,7 +602,8 @@ def evaluate_wti(graph: dict[str, Any], template: dict[str, Any], gate: str = "O
     h4, h1, m15 = terminal(graph, "H4"), terminal(graph, "H1"), terminal(graph, "M15")
     h4_id, h1_id, m15_id = h4["id"], h1["id"], m15["id"]
     close, fast, slow = parse_decimal(h4["close"]), indicator_value(graph, h4_id, "ema34"), indicator_value(graph, h4_id, "ema150")
-    if not (close > slow and fast > slow and fast - slow >= Decimal("0.10") * indicator_value(graph, h4_id, "atr") and slow > indicator_value(graph, graph["market_state_snapshot"]["candle_ids"]["H4"][-6], "ema150") and indicator_value(graph, h4_id, "adx") >= Decimal("22")):
+    sign = Decimal(1) if direction == "LONG" else Decimal(-1)
+    if not (sign * (close - slow) > 0 and sign * (fast - slow) > 0 and sign * (fast - slow) >= Decimal("0.10") * indicator_value(graph, h4_id, "atr") and sign * (slow - indicator_value(graph, graph["market_state_snapshot"]["candle_ids"]["H4"][-6], "ema150")) > 0 and indicator_value(graph, h4_id, "adx") >= Decimal("22")):
         return result("NO_OPPORTUNITY", ["H4_TREND_FILTER_FAILED"])
     range_candles = [next(item for item in graph["candles"] if item["id"] == item_id) for item_id in graph["market_state_snapshot"]["candle_ids"]["H1"][-13:-1]]
     high, low = max(parse_decimal(item["high"]) for item in range_candles), min(parse_decimal(item["low"]) for item in range_candles)
@@ -613,13 +614,14 @@ def evaluate_wti(graph: dict[str, Any], template: dict[str, Any], gate: str = "O
         return result("NO_OPPORTUNITY", ["WTI_COMPRESSION_FAILED"])
     m_open, m_close = parse_decimal(m15["open"]), parse_decimal(m15["close"])
     m_atr = indicator_value(graph, m15_id, "atr")
-    if not m_close > high + Decimal("0.10") * m_atr:
+    boundary = high if direction == "LONG" else low
+    if not sign * (m_close - boundary) > Decimal("0.10") * m_atr:
         return result("NO_OPPORTUNITY", ["WTI_BREAKOUT_NOT_CLOSED"])
-    if abs(m_close - m_open) < Decimal("0.50") * m_atr:
+    if not sign * (m_close - m_open) >= Decimal("0.50") * m_atr:
         return result("NO_OPPORTUNITY", ["WTI_BODY_FILTER_FAILED"])
-    if m_close - high > Decimal("1.25") * m_atr:
+    if sign * (m_close - boundary) > Decimal("1.25") * m_atr:
         return result("NO_OPPORTUNITY", ["TRIGGER_OVEREXTENDED"])
-    return result("OPPORTUNITY", SUCCESS_WTI, direction="LONG", confidence="0.68")
+    return result("OPPORTUNITY", SUCCESS_WTI, direction=direction, confidence="0.68")
 
 
 def apply_set(state: dict[str, Any], values: dict[str, str]) -> bool:
@@ -706,19 +708,21 @@ def run_wti_cases(data: dict[str, Any]) -> None:
     for activation in cases["activation_cases"]:
         actual = result("ACTIVATION_ALLOWED", []) if activation["mapping"] == "WTI_US_CRUDE" and activation["roll_semantics"] == "KNOWN" else result("ACTIVATION_BLOCKED", ["WTI_MAPPING_AMBIGUOUS"] if activation["mapping"] != "WTI_US_CRUDE" else ["WTI_ROLL_SEMANTICS_UNKNOWN"])
         assert_expected(actual, activation["expected"], activation["id"])
-    base = build_graph(template, "broker-account-a", deepcopy(cases["profile"]), "wti"); base["_contract"] = contract
-    assert_expected(evaluate_wti(base, template), cases["expected_success"], "wti-valid")
-    for mutation in cases["mutations"]:
-        state = deepcopy(cases["profile"])
-        if "set" in mutation:
-            apply_set(state, mutation["set"])
-        graph = build_graph(template, "broker-account-a", state, "wti"); graph["_contract"] = contract
-        if mutation.get("data_mutation") == "gap":
-            candle = next(item for item in graph["candles"] if item["id"] == graph["market_state_snapshot"]["candle_ids"]["H1"][20])
-            candle["close_time"] = iso(parse_time(candle["close_time"]) + timedelta(minutes=1))
-        if "new_range_final_candle_id" in mutation:
-            require(mutation["new_range_final_candle_id"] != graph["market_state_snapshot"]["candle_ids"]["H1"][-2], f"{mutation['id']}: new range reuses cooldown range final candle")
-        assert_expected(evaluate_wti(graph, template, mutation.get("gate", "OPEN")), mutation["expected"], mutation["id"])
+    for direction in cases["directions"]:
+        profile = direction.lower()
+        base = build_graph(template, "broker-account-a", deepcopy(cases["profiles"][profile]), "wti"); base["_contract"] = contract
+        assert_expected(evaluate_wti(base, template, direction), cases["expected_success"][profile], f"wti-{profile}-valid")
+        for mutation in cases["mutations"][profile]:
+            state = deepcopy(cases["profiles"][profile])
+            if "set" in mutation:
+                apply_set(state, mutation["set"])
+            graph = build_graph(template, "broker-account-a", state, "wti"); graph["_contract"] = contract
+            if mutation.get("data_mutation") == "gap":
+                candle = next(item for item in graph["candles"] if item["id"] == graph["market_state_snapshot"]["candle_ids"]["H1"][20])
+                candle["close_time"] = iso(parse_time(candle["close_time"]) + timedelta(minutes=1))
+            if "new_range_final_candle_id" in mutation:
+                require(mutation["new_range_final_candle_id"] != graph["market_state_snapshot"]["candle_ids"]["H1"][-2], f"{mutation['id']}: new range reuses cooldown range final candle")
+            assert_expected(evaluate_wti(graph, template, direction, mutation.get("gate", "OPEN")), mutation["expected"], mutation["id"])
     expires = cases["expiry_gate"]
     actual = result("SIGNAL_BLOCKED", ["SIGNAL_EXPIRED"]) if parse_time(expires["execution_time"]) >= parse_time(expires["expires_at"]) else result("EXECUTABLE", [])
     assert_expected(actual, expires["expected"], "wti-expiry")
@@ -809,11 +813,22 @@ def verify_scenario_contract(data: dict[str, Any]) -> None:
     require(scenarios["account_ids"] == ["broker-account-a", "broker-account-b"], "scenario fixture: account clone contract drift")
     require(scenarios["trend_cases"]["pairs"] == ["XAUUSD", "EURUSD", "USDJPY"], "scenario fixture: trend Pair matrix drift")
     require(scenarios["trend_cases"]["directions"] == ["LONG", "SHORT"], "scenario fixture: mirror direction matrix drift")
+    wti_cases = scenarios["wti_cases"]
+    require(wti_cases["directions"] == ["LONG", "SHORT"], "scenario fixture: WTI mirror direction matrix drift")
+    require(set(wti_cases["profiles"]) == {"long", "short"} and set(wti_cases["expected_success"]) == {"long", "short"} and set(wti_cases["mutations"]) == {"long", "short"}, "scenario fixture: WTI directional case matrix drift")
+    for direction in wti_cases["directions"]:
+        profile = direction.lower()
+        require(wti_cases["expected_success"][profile].get("direction") == direction, f"scenario fixture: WTI {direction} expected output direction drift")
+        for mutation in wti_cases["mutations"][profile]:
+            if mutation["expected"].get("outcome") == "OPPORTUNITY":
+                require(mutation["expected"].get("direction") == direction, f"scenario fixture: {mutation['id']} output direction drift")
+    require(any(item["id"] == "short-directional-body-negative" for item in wti_cases["mutations"]["short"]), "scenario fixture: missing WTI SHORT directional-body negative mutation")
     required_completeness = {"open-candle", "lookback-h4-short", "lookback-h1-short", "lookback-m15-short", "gap", "revision-mismatch", "foreign-account"}
     require({item["id"] for item in scenarios["completeness_mutations"]} == required_completeness, "scenario fixture: completeness mutation matrix drift")
     # Cases are data-bearing executable inputs. Every expected result includes
     # a concrete outcome/state and a complete ordered reason-code list.
-    for collection in (scenarios["trend_cases"]["mutations"], scenarios["completeness_mutations"], scenarios["wti_cases"]["mutations"], scenarios["execution_exit_cases"]):
+    wti_mutations = [item for direction in wti_cases["directions"] for item in wti_cases["mutations"][direction.lower()]]
+    for collection in (scenarios["trend_cases"]["mutations"], scenarios["completeness_mutations"], wti_mutations, scenarios["execution_exit_cases"]):
         for case in collection:
             expected = case.get("expected", {})
             require("reason_codes" in expected and ("outcome" in expected or "order_status" in expected or "stage" in expected or "position" in expected), f"scenario fixture: {case['id']} lacks executable expected result")
@@ -828,6 +843,14 @@ def negative_mutation_probe(data: dict[str, Any]) -> None:
     graph["market_state_snapshot"]["candle_ids"]["H4"].pop()
     actual = validate_graph(graph, template)
     require(actual == {"outcome": "SKIP_EVALUATION", "reason_codes": ["INSUFFICIENT_LOOKBACK"]}, "negative mutation probe: independent short-lookback rejection failed")
+    wti_template = next(item for item in contract["templates"] if item["pair"] == "WTI")
+    wti_cases = data["scenario_contract"]["wti_cases"]
+    directional_body = next(item for item in wti_cases["mutations"]["short"] if item["id"] == "short-directional-body-negative")
+    wti_state = deepcopy(wti_cases["profiles"]["short"])
+    apply_set(wti_state, directional_body["set"])
+    wti_graph = build_graph(wti_template, "broker-account-a", wti_state, "wti")
+    wti_graph["_contract"] = contract
+    require(evaluate_wti(wti_graph, wti_template, "SHORT") == directional_body["expected"], "negative mutation probe: WTI SHORT directional body drift was not detected")
 
 
 def main() -> None:

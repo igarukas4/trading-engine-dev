@@ -156,31 +156,59 @@
       {"id": "foreign-account", "kind": "foreign_account", "expected": {"outcome": "REJECT_GRAPH", "reason_codes": ["ACCOUNT_CONTEXT_MISMATCH"]}}
     ],
     "wti_cases": {
-      "profile": {"h4": {"close": "110", "ema34": "105", "ema150": "100", "ema150_previous": "99", "atr": "10", "adx": "22"}, "h1": {"range_low": "90", "range_high": "110", "atr14": "10", "atr6": "6.5", "atr30": "10", "forming_high": "999", "forming_low": "1"}, "m15": {"open": "110", "close": "116", "atr": "10"}},
-      "expected_success": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]},
+      "directions": ["LONG", "SHORT"],
+      "profiles": {
+        "long": {"h4": {"close": "110", "ema34": "105", "ema150": "100", "ema150_previous": "99", "atr": "10", "adx": "22"}, "h1": {"range_low": "90", "range_high": "110", "atr14": "10", "atr6": "6.5", "atr30": "10", "forming_high": "999", "forming_low": "1"}, "m15": {"open": "110", "close": "116", "atr": "10"}},
+        "short": {"h4": {"close": "90", "ema34": "95", "ema150": "100", "ema150_previous": "101", "atr": "10", "adx": "22"}, "h1": {"range_low": "90", "range_high": "110", "atr14": "10", "atr6": "6.5", "atr30": "10", "forming_high": "999", "forming_low": "1"}, "m15": {"open": "90", "close": "84", "atr": "10"}}
+      },
+      "expected_success": {
+        "long": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]},
+        "short": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}
+      },
       "activation_cases": [
         {"id": "ambiguous-mapping", "mapping": "AMBIGUOUS", "roll_semantics": "KNOWN", "expected": {"outcome": "ACTIVATION_BLOCKED", "reason_codes": ["WTI_MAPPING_AMBIGUOUS"]}},
         {"id": "unknown-roll", "mapping": "WTI_US_CRUDE", "roll_semantics": "UNKNOWN", "expected": {"outcome": "ACTIVATION_BLOCKED", "reason_codes": ["WTI_ROLL_SEMANTICS_UNKNOWN"]}},
         {"id": "valid", "mapping": "WTI_US_CRUDE", "roll_semantics": "KNOWN", "expected": {"outcome": "ACTIVATION_ALLOWED", "reason_codes": []}}
       ],
-      "mutations": [
-        {"id": "range-min-equality", "set": {"h1.range_high": "100", "m15.open": "106.5", "m15.close": "112"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
-        {"id": "range-max-equality", "set": {"h1.range_high": "120", "m15.close": "126"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
-        {"id": "range-too-narrow", "set": {"h1.range_high": "99.999999999999999999"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
-        {"id": "range-too-wide", "set": {"h1.range_high": "120.000000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
-        {"id": "compression-quantum-above", "set": {"h1.atr6": "6.500000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_COMPRESSION_FAILED"]}},
-        {"id": "forming-h1-excluded", "set": {"h1.forming_high": "1000", "h1.forming_low": "1"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
-        {"id": "buffer-equality", "set": {"m15.close": "111"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BREAKOUT_NOT_CLOSED"]}},
-        {"id": "body-quantum-below", "set": {"m15.open": "111.000000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BODY_FILTER_FAILED"]}},
-        {"id": "body-equality", "set": {"m15.open": "111"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
-        {"id": "overextended", "set": {"m15.close": "122.500000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["TRIGGER_OVEREXTENDED"]}},
-        {"id": "extension-equality", "set": {"m15.close": "122.5"}, "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
-        {"id": "roll-gate", "gate": "ROLL_GUARD", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_ROLL_GUARD_ACTIVE"]}},
-        {"id": "reopen-gate", "gate": "REOPEN_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_REOPEN_COOLDOWN_ACTIVE"]}},
-        {"id": "scheduler-cooldown", "gate": "FALSE_BREAKOUT_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_COOLDOWN_ACTIVE"]}},
-        {"id": "data-discontinuity", "data_mutation": "gap", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["GAP_DETECTED"]}},
-        {"id": "new-range-after-cooldown", "gate": "OPEN", "new_range_final_candle_id": "new-h1-final", "expected": {"outcome": "OPPORTUNITY", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}}
-      ],
+      "mutations": {
+        "long": [
+          {"id": "long-range-min-equality", "set": {"h1.range_high": "100", "m15.open": "106.5", "m15.close": "112"}, "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "long-range-max-equality", "set": {"h1.range_high": "120", "m15.close": "126"}, "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "long-range-too-narrow", "set": {"h1.range_high": "99.999999999999999999"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
+          {"id": "long-range-too-wide", "set": {"h1.range_high": "120.000000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
+          {"id": "long-compression-quantum-above", "set": {"h1.atr6": "6.500000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_COMPRESSION_FAILED"]}},
+          {"id": "long-forming-h1-excluded", "set": {"h1.forming_high": "1000", "h1.forming_low": "1"}, "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "long-buffer-equality", "set": {"m15.close": "111"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BREAKOUT_NOT_CLOSED"]}},
+          {"id": "long-body-quantum-below", "set": {"m15.open": "111.000000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BODY_FILTER_FAILED"]}},
+          {"id": "long-body-equality", "set": {"m15.open": "111"}, "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "long-overextended", "set": {"m15.close": "122.500000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["TRIGGER_OVEREXTENDED"]}},
+          {"id": "long-extension-equality", "set": {"m15.close": "122.5"}, "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "long-roll-gate", "gate": "ROLL_GUARD", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_ROLL_GUARD_ACTIVE"]}},
+          {"id": "long-reopen-gate", "gate": "REOPEN_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_REOPEN_COOLDOWN_ACTIVE"]}},
+          {"id": "long-scheduler-cooldown", "gate": "FALSE_BREAKOUT_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_COOLDOWN_ACTIVE"]}},
+          {"id": "long-data-discontinuity", "data_mutation": "gap", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["GAP_DETECTED"]}},
+          {"id": "long-new-range-after-cooldown", "gate": "OPEN", "new_range_final_candle_id": "new-h1-final", "expected": {"outcome": "OPPORTUNITY", "direction": "LONG", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}}
+        ],
+        "short": [
+          {"id": "short-range-min-equality", "set": {"h1.range_low": "100", "m15.open": "93.5", "m15.close": "88"}, "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "short-range-max-equality", "set": {"h1.range_low": "80", "m15.close": "74"}, "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "short-range-too-narrow", "set": {"h1.range_low": "100.000000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
+          {"id": "short-range-too-wide", "set": {"h1.range_low": "79.999999999999999999"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_RANGE_WIDTH_FAILED"]}},
+          {"id": "short-compression-quantum-above", "set": {"h1.atr6": "6.500000000000000001"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_COMPRESSION_FAILED"]}},
+          {"id": "short-forming-h1-excluded", "set": {"h1.forming_high": "1000", "h1.forming_low": "1"}, "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "short-buffer-equality", "set": {"m15.close": "89"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BREAKOUT_NOT_CLOSED"]}},
+          {"id": "short-body-quantum-below", "set": {"m15.open": "88.999999999999999999"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BODY_FILTER_FAILED"]}},
+          {"id": "short-body-equality", "set": {"m15.open": "89"}, "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "short-directional-body-negative", "set": {"m15.open": "78"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["WTI_BODY_FILTER_FAILED"]}},
+          {"id": "short-overextended", "set": {"m15.close": "77.499999999999999999"}, "expected": {"outcome": "NO_OPPORTUNITY", "reason_codes": ["TRIGGER_OVEREXTENDED"]}},
+          {"id": "short-extension-equality", "set": {"m15.close": "77.5"}, "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}},
+          {"id": "short-roll-gate", "gate": "ROLL_GUARD", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_ROLL_GUARD_ACTIVE"]}},
+          {"id": "short-reopen-gate", "gate": "REOPEN_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_REOPEN_COOLDOWN_ACTIVE"]}},
+          {"id": "short-scheduler-cooldown", "gate": "FALSE_BREAKOUT_COOLDOWN", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["WTI_COOLDOWN_ACTIVE"]}},
+          {"id": "short-data-discontinuity", "data_mutation": "gap", "expected": {"outcome": "SKIP_EVALUATION", "reason_codes": ["GAP_DETECTED"]}},
+          {"id": "short-new-range-after-cooldown", "gate": "OPEN", "new_range_final_candle_id": "new-h1-final", "expected": {"outcome": "OPPORTUNITY", "direction": "SHORT", "confidence": "0.68", "reason_codes": ["H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"]}}
+        ]
+      },
       "expiry_gate": {"execution_time": "2026-01-05T01:30:00Z", "expires_at": "2026-01-05T01:30:00Z", "expected": {"outcome": "SIGNAL_BLOCKED", "reason_codes": ["SIGNAL_EXPIRED"]}}
     },
     "execution_exit_cases": [
