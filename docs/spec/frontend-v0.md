@@ -1,5 +1,7 @@
 # Trading Engine V0 — Frontend Specification
 
+**Canonical V0 destination:** [Spec Kanonik: Trading Engine V0 — destination untuk tickets & implementasi](https://github.com/igarukas4/trading-engine-dev/issues/24)
+
 ## 1. Purpose
 
 This is the implementation contract for the single-user Indonesian dashboard. It exposes V0 market observation, account-scoped decision making, real-market execution controls, and operational recovery without weakening backend safety gates.

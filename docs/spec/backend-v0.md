@@ -6,6 +6,8 @@
 
 **Revision ticket:** [Revise Backend V0 for simultaneous multi-account execution](https://github.com/igarukas4/trading-engine-dev/issues/11)
 
+**Canonical V0 destination:** [Spec Kanonik: Trading Engine V0 — destination untuk tickets & implementasi](https://github.com/igarukas4/trading-engine-dev/issues/24)
+
 **Domain language:** [`CONTEXT.md`](../../CONTEXT.md)
 
 ## 1. Objective
@@ -489,6 +491,7 @@ Rules:
 - Unique `evaluation_key = strategy_config_version_id + pair_id + trigger_time`.
 - A conflict is rejected deterministically as `None` and audited as `CONFLICTING_SETUPS`.
 - News, LLM output, mutable account state, and broker calls are not available inside Strategy.
+- The initial V0 plugin set, exact seed parameters, deterministic fixtures, and strategy-specific acceptance contract are normative in [`strategy-templates-v0.md`](strategy-templates-v0.md). Those values are editable V0 seeds, not profitability claims.
 
 ## 8. Broker interface
 
@@ -877,5 +880,4 @@ Initial implementation schema work must:
 ## 20. Deferred decisions owned by later tickets
 
 - Exact event blackout durations; EnrichmentPolicy must require explicit versioned values.
-- Initial Strategy set and indicator parameters.
 - Deployment/DNS/Caddy provisioning details.
