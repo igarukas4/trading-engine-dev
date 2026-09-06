@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "template_contract": {
+    "trigger_timeframe": "M15",
+    "required_timeframes": ["H4", "H1", "M15"],
+    "default_activation_status": "DISABLED",
+    "h4_trend": {
+      "ema_fast_period": 34,
+      "ema_slow_period": 150,
+      "atr_period": 14,
+      "adx_period": 14,
+      "adx_min": "22",
+      "ema_separation_atr": "0.10",
+      "slope_bars": 5
+    },
+    "h1_pullback": {
+      "ema_period": 34,
+      "atr_period": 14,
+      "rsi_period": 14,
+      "pullback_window_bars": 2,
+      "pullback_tolerance_atr": "0.50",
+      "reclaim_level_rsi": "50",
+      "min_body_fraction": "0.55"
+    },
+    "trend_m15": {
+      "channel_bars": 12,
+      "atr_period": 14,
+      "buffer_spread_multiple": "1.50",
+      "min_body_fraction": "0.55",
+      "max_extension_atr": "1.00"
+    },
+    "templates": [
+      {
+        "key": "xauusd-trend-pullback-v0",
+        "pair": "XAUUSD",
+        "strategy": "TrendPullbackContinuationStrategy@0.1.0",
+        "lookback": {"H4": 450, "H1": 150, "M15": 60},
+        "m15": {"buffer_atr": "0.10", "signal_ttl_m15_bars": 4, "ttl_minutes": 60}
+      },
+      {
+        "key": "eurusd-trend-pullback-v0",
+        "pair": "EURUSD",
+        "strategy": "TrendPullbackContinuationStrategy@0.1.0",
+        "lookback": {"H4": 450, "H1": 150, "M15": 60},
+        "m15": {"buffer_atr": "0.10", "signal_ttl_m15_bars": 2, "ttl_minutes": 30}
+      },
+      {
+        "key": "usdjpy-trend-pullback-v0",
+        "pair": "USDJPY",
+        "strategy": "TrendPullbackContinuationStrategy@0.1.0",
+        "lookback": {"H4": 450, "H1": 150, "M15": 60},
+        "m15": {"buffer_atr": "0.05", "signal_ttl_m15_bars": 4, "ttl_minutes": 60}
+      },
+      {
+        "key": "wti-trend-breakout-v0",
+        "pair": "WTI",
+        "strategy": "TrendFilteredBreakoutStrategy@0.1.0",
+        "lookback": {"H4": 450, "H1": 300, "M15": 500},
+        "wti": {
+          "range_lookback_h1": 12,
+          "atr_h1_period": 14,
+          "atr_short_h1_period": 6,
+          "atr_long_h1_period": 30,
+          "compression_ratio_max": "0.65",
+          "range_width_atr_min": "1.00",
+          "range_width_atr_max": "3.00",
+          "atr_m15_period": 14,
+          "break_buffer_atr": "0.10",
+          "min_body_atr": "0.50",
+          "max_extension_atr": "1.25",
+          "signal_ttl_m15_bars": 2,
+          "ttl_minutes": 30,
+          "false_breakout_cooldown_m15_bars": 8,
+          "reopen_cooldown_minutes": 30,
+          "roll_guard_before_expiry_broker_trading_days": 3
+        }
+      }
+    ],
+    "exit_policy": {
+      "tp1_r": "1.00",
+      "tp1_fraction": "0.40",
+      "tp2_r": "2.00",
+      "tp2_fraction": "0.30",
+      "runner_fraction_nominal": "0.30",
+      "native_safety_tp_r": "4.00",
+      "trailing": {"starts_after": "TP2_CONFIRMED", "timeframe": "M15", "atr_period": 14, "atr_multiple": "2.00", "update_on": "CLOSED_CANDLE"}
+    },
+    "wti_activation_safeguards": [
+      "cannot_be_identified_as_wti_us_crude",
+      "currently_tradeable",
+      "valid_volume_minimum_and_step",
+      "native_stop_loss_and_take_profit_support",
+      "known_fixed_expiry_or_continuous_roll_semantics"
+    ],
+    "strategy_input_boundary": {
+      "market_state_account_scoped": true,
+      "strategy_is_pure_and_deterministic": true,
+      "forbidden_inputs": ["news", "llm", "mutable_account_state", "broker_calls"]
+    }
+  },
+  "indicator_vectors": {
+    "precision": 38,
+    "rounding": "ROUND_HALF_EVEN",
+    "persisted_scale": 18,
+    "bars": [
+      {"id": "predecessor", "open": "9", "high": "10", "low": "8", "close": "9", "is_closed": true},
+      {"id": "bar-1", "open": "9", "high": "11", "low": "9", "close": "10", "is_closed": true},
+      {"id": "bar-2", "open": "10", "high": "13", "low": "10", "close": "12", "is_closed": true},
+      {"id": "bar-3", "open": "12", "high": "15", "low": "11", "close": "14", "is_closed": true},
+      {"id": "bar-4", "open": "14", "high": "14", "low": "12", "close": "13", "is_closed": true},
+      {"id": "bar-5", "open": "13", "high": "16", "low": "13", "close": "15", "is_closed": true},
+      {"id": "bar-6", "open": "15", "high": "17", "low": "14", "close": "16", "is_closed": true}
+    ],
+    "expected_terminal_values": [
+      {"indicator_key": "ema", "indicator_definition_id": "indicator-definition-ema-v1", "implementation_version": "v1", "parameters": {"period": 3, "price": "close"}, "parameter_hash": "d02c3d1605f52aa0b2ff238b78743baf83946abf3176a98e0464821c8fe280d8", "value": "14.875000000000000000"},
+      {"indicator_key": "atr", "indicator_definition_id": "indicator-definition-atr-v1", "implementation_version": "v1", "parameters": {"period": 3}, "parameter_hash": "a34b70ea82f38ca36359ebb01d0f247f3d163b0be5cead80f0ac5534176c53d0", "value": "2.851851851851851852"},
+      {"indicator_key": "rsi", "indicator_definition_id": "indicator-definition-rsi-v1", "implementation_version": "v1", "parameters": {"period": 3}, "parameter_hash": "bdef1928d98d730809b893a17895c3c0184bcca877ef94537af59f45b1561220", "value": "89.565217391304347826"},
+      {"indicator_key": "adx", "indicator_definition_id": "indicator-definition-adx-v1", "implementation_version": "v1", "parameters": {"period": 3}, "parameter_hash": "92347435ecca57efe301dab60de79cab50a09cdfbcf8950cbd058d7a0dfd8f26", "value": "100.000000000000000000"}
+    ]
+  }
+}
