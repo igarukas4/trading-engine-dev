@@ -8,7 +8,11 @@ trap 'rm -rf "$test_directory"' EXIT
 mkdir -p "$test_directory/deploy/secrets" "$test_directory/deploy/releases" "$test_directory/bin"
 touch "$test_directory/deploy/compose.production.yml"
 for secret in app_secret_key caddy_basic_auth_hash postgres_password redis_password; do
-  printf 'secret\n' >"$test_directory/deploy/secrets/$secret"
+  if [[ "$secret" == postgres_password ]]; then
+    printf 'deployed-postgres-password\n' >"$test_directory/deploy/secrets/$secret"
+  else
+    printf 'secret\n' >"$test_directory/deploy/secrets/$secret"
+  fi
   chmod 600 "$test_directory/deploy/secrets/$secret"
 done
 
@@ -35,6 +39,28 @@ if [[ "$*" == *' port backend 8000' ]]; then
 fi
 
 if [[ "$*" == *'exec -T postgres pg_dump'* ]]; then
+  printf 'legacy unauthenticated pg_dump invocation\n' >&2
+  exit 1
+fi
+
+if [[ "$*" == *'exec -T postgres sh -ec'* ]]; then
+  docker_arguments="$*"
+  [[ "$docker_arguments" == *'cat /run/secrets/postgres_password'* ]] || {
+    printf 'backup did not read the deployed PostgreSQL secret inside the container\n' >&2
+    exit 1
+  }
+  [[ "$docker_arguments" == *'export PGPASSFILE='* ]] || {
+    printf 'backup did not export PGPASSFILE inside the container\n' >&2
+    exit 1
+  }
+  [[ "$docker_arguments" == *'pg_dump -U trading_engine -d trading_engine --format=custom'* ]] || {
+    printf 'backup did not invoke pg_dump with explicit database credentials\n' >&2
+    exit 1
+  }
+  [[ "$docker_arguments" != *'deployed-postgres-password'* ]] || {
+    printf 'backup interpolated the PostgreSQL secret into command arguments\n' >&2
+    exit 1
+  }
   printf 'mock postgres dump\n'
 fi
 EOF

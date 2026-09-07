@@ -86,7 +86,10 @@ grep -Fq 'PGPASSFILE=' "$restore_script" || fail 'restore verification must auth
 
 backup_script="$repository_root/scripts/backup-postgres.sh"
 grep -Fq 'umask 077' "$backup_script" || fail 'backup output must be created with a restrictive umask'
-grep -Fq 'pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_file"' "$backup_script" || fail 'backup must redirect only after restrictive umask is set'
+grep -Fq 'cat /run/secrets/postgres_password' "$backup_script" || fail 'backup must read the deployed PostgreSQL secret inside the container'
+grep -Fq 'export PGPASSFILE=' "$backup_script" || fail 'backup must authenticate through a container-local password file'
+grep -Fq 'pg_dump -U trading_engine -d trading_engine --format=custom' "$backup_script" || fail 'backup must invoke pg_dump with the trading_engine database credentials'
+! grep -Fq 'PGPASSWORD=' "$backup_script" || fail 'backup must not authenticate through a password environment variable'
 
 ! grep -Fq 'source "$release_file"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not execute the release environment'
 grep -Fq 'read_release_env' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must parse the release environment'
