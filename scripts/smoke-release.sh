@@ -5,6 +5,24 @@ repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 compose_file="$repository_root/deploy/compose.production.yml"
 release_file=${1:?"usage: smoke-release.sh RELEASE_ENV_FILE"}
 smoke_password_file=${SMOKE_BASIC_AUTH_PASSWORD_FILE:?set SMOKE_BASIC_AUTH_PASSWORD_FILE to a protected Basic Auth password file}
+release_environment_keys=(
+  BACKEND_IMAGE
+  CADDY_IMAGE
+  TIMESCALEDB_IMAGE
+  REDIS_IMAGE
+  DOMAIN
+  ACME_EMAIL
+  CADDY_BASIC_AUTH_USER
+)
+
+run_sanitized() {
+  local key
+  local -a sanitized_environment=()
+  for key in "${release_environment_keys[@]}"; do
+    sanitized_environment+=(-u "$key")
+  done
+  env "${sanitized_environment[@]}" "$@"
+}
 
 [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
 [[ -s "$smoke_password_file" ]] || { printf 'smoke Basic Auth password file not found or empty: %s\n' "$smoke_password_file" >&2; exit 1; }
@@ -63,7 +81,7 @@ printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(cu
     --header 'X-Forwarded-Proto: http' \
     --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 
-if docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
+if run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
   printf 'backend port is directly published\n' >&2
   exit 1
 fi

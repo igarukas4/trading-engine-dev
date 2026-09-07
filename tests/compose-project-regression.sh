@@ -32,6 +32,12 @@ if [[ ${1:-} != compose || ${2:-} != -p || ${3:-} != trading-engine ]]; then
   printf 'Compose project was not pinned: %s\n' "$*" >&2
   exit 1
 fi
+for key in BACKEND_IMAGE CADDY_IMAGE TIMESCALEDB_IMAGE REDIS_IMAGE DOMAIN ACME_EMAIL CADDY_BASIC_AUTH_USER; do
+  [[ -z ${!key+x} ]] || {
+    printf 'ambient %s reached Compose\n' "$key" >&2
+    exit 1
+  }
+done
 printf '%s\n' "$*" >>"$DOCKER_LOG"
 
 if [[ "$*" == *' port backend 8000' ]]; then
@@ -101,6 +107,13 @@ chmod +x "$test_directory/bin/curl"
 
 PATH="$test_directory/bin:$PATH" \
   COMPOSE_PROJECT_NAME=ambient-project-must-not-win \
+  BACKEND_IMAGE=ambient.invalid/backend:latest \
+  CADDY_IMAGE=ambient.invalid/caddy:latest \
+  TIMESCALEDB_IMAGE=ambient.invalid/timescaledb:latest \
+  REDIS_IMAGE=ambient.invalid/redis:latest \
+  DOMAIN=ambient.example.com \
+  ACME_EMAIL=ambient@example.com \
+  CADDY_BASIC_AUTH_USER=ambient-operator \
   DOCKER_LOG="$docker_log" \
   SMOKE_BASIC_AUTH_PASSWORD_FILE="$password_file" \
   "$repository_root/scripts/smoke-release.sh" "$release_file"
@@ -108,6 +121,13 @@ PATH="$test_directory/bin:$PATH" \
 backup_directory="$test_directory/backups"
 PATH="$test_directory/bin:$PATH" \
   COMPOSE_PROJECT_NAME=ambient-project-must-not-win \
+  BACKEND_IMAGE=ambient.invalid/backend:latest \
+  CADDY_IMAGE=ambient.invalid/caddy:latest \
+  TIMESCALEDB_IMAGE=ambient.invalid/timescaledb:latest \
+  REDIS_IMAGE=ambient.invalid/redis:latest \
+  DOMAIN=ambient.example.com \
+  ACME_EMAIL=ambient@example.com \
+  CADDY_BASIC_AUTH_USER=ambient-operator \
   DOCKER_LOG="$docker_log" \
   "$repository_root/scripts/backup-postgres.sh" "$release_file" "$backup_directory"
 
