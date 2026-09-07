@@ -26,8 +26,13 @@ cd /srv/trading-engine
 for name in app_secret_key caddy_basic_auth_hash postgres_password redis_password; do
   install -m 600 /dev/null "deploy/secrets/$name"
 done
+openssl rand -base64 48 > deploy/secrets/app_secret_key
+openssl rand -base64 36 > deploy/secrets/postgres_password
+openssl rand -base64 36 > deploy/secrets/redis_password
 docker run --rm caddy:2.10.2-alpine caddy hash-password --plaintext 'choose-a-long-password' > deploy/secrets/caddy_basic_auth_hash
 ```
+
+Run these commands only on the VPS: each command overwrites the newly created empty secret file with a fresh value. Store the Basic Auth plaintext in an approved password manager; only its bcrypt hash belongs in `deploy/secrets/caddy_basic_auth_hash`.
 
 Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` with an immutable registry digest. Deploy only after the image implements `GET /health/live` on port `8000` without authentication.
 
