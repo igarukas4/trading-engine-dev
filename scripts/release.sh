@@ -15,8 +15,14 @@ usage() {
 
 validate_release() {
   local release_file=$1
+  local image_key
   [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
-  grep -Eq '^BACKEND_IMAGE=.*@sha256:[a-f0-9]{64}$' "$release_file" || { printf 'BACKEND_IMAGE must be pinned to a sha256 digest\n' >&2; exit 1; }
+  for image_key in BACKEND_IMAGE CADDY_IMAGE TIMESCALEDB_IMAGE REDIS_IMAGE; do
+    grep -Eq "^${image_key}=[^[:space:]]+@sha256:[a-f0-9]{64}$" "$release_file" || {
+      printf '%s must be pinned to a sha256 digest\n' "$image_key" >&2
+      exit 1
+    }
+  done
   for key in DOMAIN ACME_EMAIL CADDY_BASIC_AUTH_USER; do
     grep -Eq "^${key}=.+" "$release_file" || { printf '%s is required\n' "$key" >&2; exit 1; }
   done

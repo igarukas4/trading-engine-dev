@@ -40,6 +40,14 @@ curl --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://$
 unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
 [[ "$unauthenticated_status" == '401' ]] || { printf 'expected unauthenticated backend request to return 401, got %s\n' "$unauthenticated_status" >&2; exit 1; }
 
+forged_header_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --header 'X-Authenticated-User: forged-smoke-actor' \
+  --header 'X-Forwarded-For: 198.51.100.23' \
+  --header 'X-Forwarded-Host: forged.example' \
+  --header 'X-Forwarded-Proto: http' \
+  --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
+[[ "$forged_header_status" == '401' ]] || { printf 'forged trusted headers bypassed the public authentication boundary with status %s\n' "$forged_header_status" >&2; exit 1; }
+
 curl_config_escape() {
   local value=$1
   value=${value//\\/\\\\}
@@ -48,7 +56,12 @@ curl_config_escape() {
 }
 smoke_password=$(<"$smoke_password_file")
 printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$smoke_password")" | \
-  curl --config - --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
+  curl --config - --fail --silent --show-error \
+    --header 'X-Authenticated-User: forged-smoke-actor' \
+    --header 'X-Forwarded-For: 198.51.100.23' \
+    --header 'X-Forwarded-Host: forged.example' \
+    --header 'X-Forwarded-Proto: http' \
+    --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 
 if docker compose --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
   printf 'backend port is directly published\n' >&2

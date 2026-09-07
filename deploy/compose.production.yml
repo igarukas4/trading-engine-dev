@@ -1,9 +1,16 @@
 name: trading-engine
 
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   caddy:
-    image: caddy:2.10.2-alpine
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE to an immutable image digest in the release environment}
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "80:80"
       - "443:443"
@@ -41,6 +48,7 @@ services:
   backend:
     image: ${BACKEND_IMAGE:?set BACKEND_IMAGE to an immutable image digest in the release environment}
     restart: unless-stopped
+    logging: *default-logging
     environment:
       APP_SECRET_KEY_FILE: /run/secrets/app_secret_key
       DATABASE_HOST: postgres
@@ -73,8 +81,9 @@ services:
       start_period: 30s
 
   postgres:
-    image: timescale/timescaledb:2.17.2-pg16
+    image: ${TIMESCALEDB_IMAGE:?set TIMESCALEDB_IMAGE to an immutable image digest in the release environment}
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_DB: trading_engine
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
@@ -93,8 +102,9 @@ services:
       start_period: 20s
 
   redis:
-    image: redis:7.4.2-alpine
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable image digest in the release environment}
     restart: unless-stopped
+    logging: *default-logging
     command:
       - /bin/sh
       - -ec
@@ -112,7 +122,7 @@ services:
     networks:
       - private
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$(cat /run/secrets/redis_password)\" ping | grep -qx PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli --no-auth-warning ping | grep -qx PONG"]
       interval: 10s
       timeout: 5s
       retries: 5

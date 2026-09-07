@@ -29,12 +29,12 @@ done
 openssl rand -base64 48 > deploy/secrets/app_secret_key
 openssl rand -base64 36 > deploy/secrets/postgres_password
 openssl rand -base64 36 > deploy/secrets/redis_password
-docker run --rm -it caddy:2.10.2-alpine caddy hash-password > deploy/secrets/caddy_basic_auth_hash
+docker run --rm -it caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d caddy hash-password > deploy/secrets/caddy_basic_auth_hash
 ```
 
 Run these commands only on the VPS: each command overwrites the newly created empty secret file with a fresh value. Store the Basic Auth plaintext in an approved password manager; only its bcrypt hash belongs in `deploy/secrets/caddy_basic_auth_hash`.
 
-Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` with an immutable registry digest. Deploy only after the image implements `GET /health/live` on port `8000` without authentication.
+Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` with an immutable registry digest. Keep the Caddy, TimescaleDB, and Redis image values pinned as shown. Deploy only after the image implements `GET /health/live` on port `8000` without authentication.
 
 ```bash
 scripts/release.sh deploy /etc/trading-engine/release.env
@@ -47,7 +47,9 @@ SMOKE_BASIC_AUTH_PASSWORD_FILE=/etc/trading-engine/smoke-basic-auth-password \
   scripts/release.sh deploy /etc/trading-engine/release.env
 ```
 
-The smoke script supplies the password to curl through protected standard input rather than a process argument. Caddy manages certificates and writes JSON access logs to its persistent volume; Docker retains service logs via its configured logging driver.
+The smoke script supplies the password to curl through protected standard input rather than a process argument. It also sends forged trusted-principal and forwarded headers at the public boundary: the unauthenticated request must remain `401`, and the authenticated request must still reach the backend. The deterministic `tests/trusted-header-contract.sh` check verifies that the adapted Caddy route overwrites those headers with the authenticated principal and proxy-derived values; this checkout has no backend implementation or identity-echo endpoint, so it does not invent one.
+
+Caddy manages certificates and writes JSON access logs to its persistent volume with 10 rotated files retained for up to 30 days at 100 MiB each. Docker retains each service's stdout/stderr logs with the `json-file` driver, capped at five 10 MiB files. These limits rotate logs without removing the persistent Caddy, PostgreSQL, or Redis data volumes.
 
 ## Rollback, backup, and restore verification
 

@@ -39,4 +39,11 @@ fi
 PATH="$test_directory/bin:$PATH" CURL_LOG="$test_directory/curl.log" CURL_CONFIG="$test_directory/curl.config" SMOKE_BASIC_AUTH_PASSWORD_FILE="$password_file" "$repository_root/scripts/smoke-release.sh" "$release_file"
 ! grep -Fq 'safe-smoke-password' "$test_directory/curl.log" || { printf 'smoke password appeared in curl arguments\n' >&2; exit 1; }
 grep -Fxq 'user = "operator:safe-smoke-password"' "$test_directory/curl.config" || { printf 'smoke password was not supplied through curl stdin configuration\n' >&2; exit 1; }
+for header in \
+  'X-Authenticated-User: forged-smoke-actor' \
+  'X-Forwarded-For: 198.51.100.23' \
+  'X-Forwarded-Host: forged.example' \
+  'X-Forwarded-Proto: http'; do
+  grep -Fq -- "--header $header" "$test_directory/curl.log" || { printf 'forged header smoke check missing: %s\n' "$header" >&2; exit 1; }
+done
 printf 'smoke release regression passed\n'

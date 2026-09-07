@@ -16,7 +16,12 @@ previous_snapshot="$test_directory/deploy/releases/active.env"
 older_snapshot="$test_directory/deploy/releases/older.env"
 candidate="$test_directory/candidate.env"
 for file in "$previous_snapshot" "$older_snapshot" "$candidate"; do
-  printf '%s\n' 'BACKEND_IMAGE=example.invalid/backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'DOMAIN=dashboard.example.com' 'ACME_EMAIL=ops@example.com' 'CADDY_BASIC_AUTH_USER=operator' >"$file"
+  printf '%s\n' \
+    'BACKEND_IMAGE=example.invalid/backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'CADDY_IMAGE=caddy:2.10.2-alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'TIMESCALEDB_IMAGE=timescale/timescaledb:2.17.2-pg16@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'REDIS_IMAGE=redis:7.4.2-alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'DOMAIN=dashboard.example.com' 'ACME_EMAIL=ops@example.com' 'CADDY_BASIC_AUTH_USER=operator' >"$file"
 done
 printf 'CURRENT=%s\nPREVIOUS=%s\n' "$previous_snapshot" "$older_snapshot" >"$test_directory/deploy/releases/state"
 
