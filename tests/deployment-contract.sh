@@ -23,6 +23,7 @@ require_file "$repository_root/scripts/verify-backup-restore.sh"
 require_file "$repository_root/tests/smoke-release-regression.sh"
 require_file "$repository_root/tests/release-environment-regression.sh"
 require_file "$repository_root/tests/trusted-header-contract.sh"
+require_file "$repository_root/tests/caddy-health-contract.sh"
 
 for secret in postgres_password redis_password app_secret_key caddy_basic_auth_hash; do
   require_file "$repository_root/deploy/secrets/${secret}.example"
@@ -103,5 +104,6 @@ grep -Fq 'duplicate release environment key' "$release_script" || fail 'release 
 grep -Fq 'docker run --rm -it caddy:2.10.2-alpine@sha256:' "$readme" || fail 'README must use a digest-pinned Caddy image for password generation'
 
 "$repository_root/tests/trusted-header-contract.sh" || fail 'trusted-header contract check failed'
+"$repository_root/tests/caddy-health-contract.sh" || fail 'Caddy health contract check failed'
 
 printf 'deployment contract passed\n'

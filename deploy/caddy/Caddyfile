@@ -22,22 +22,25 @@
 		Referrer-Policy "no-referrer"
 	}
 
+	# Keep the public liveness probe outside the authenticated fallback route.
 	@health path /healthz
 	handle @health {
 		respond "ok" 200
 	}
 
-	basic_auth {
-		{$CADDY_BASIC_AUTH_USER} {$CADDY_BASIC_AUTH_HASH}
-	}
+	handle {
+		basic_auth {
+			{$CADDY_BASIC_AUTH_USER} {$CADDY_BASIC_AUTH_HASH}
+		}
 
-	reverse_proxy backend:8000 {
-		health_uri /health/live
-		health_interval 15s
-		health_timeout 3s
-		header_up X-Authenticated-User {http.auth.user.id}
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Host {host}
-		header_up X-Forwarded-Proto {scheme}
+		reverse_proxy backend:8000 {
+			health_uri /health/live
+			health_interval 15s
+			health_timeout 3s
+			header_up X-Authenticated-User {http.auth.user.id}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
 	}
 }
