@@ -21,6 +21,7 @@ require_file "$repository_root/scripts/smoke-release.sh"
 require_file "$repository_root/scripts/backup-postgres.sh"
 require_file "$repository_root/scripts/verify-backup-restore.sh"
 require_file "$repository_root/tests/smoke-release-regression.sh"
+require_file "$repository_root/tests/release-environment-regression.sh"
 require_file "$repository_root/tests/trusted-header-contract.sh"
 
 for secret in postgres_password redis_password app_secret_key caddy_basic_auth_hash; do
@@ -94,7 +95,9 @@ grep -Fq 'curl --config -' "$repository_root/scripts/smoke-release.sh" || fail '
 
 release_script="$repository_root/scripts/release.sh"
 grep -Fq 'rollback failed; restoring the recorded active release' "$release_script" || fail 'failed rollback must restore the active release'
-grep -Fq '"$smoke_script" "$formerly_current"' "$release_script" || fail 'failed rollback recovery must smoke check the active release'
+grep -Fq 'run_smoke "$formerly_current"' "$release_script" || fail 'failed rollback recovery must smoke check the active release'
+grep -Fq 'run_sanitized()' "$release_script" || fail 'release subprocesses must use the sanitized environment wrapper'
+grep -Fq 'duplicate release environment key' "$release_script" || fail 'release environment duplicate keys must be rejected'
 
 ! grep -Fq -- 'hash-password --plaintext' "$readme" || fail 'README must not pass the Basic Auth password as a process argument'
 grep -Fq 'docker run --rm -it caddy:2.10.2-alpine@sha256:' "$readme" || fail 'README must use a digest-pinned Caddy image for password generation'
