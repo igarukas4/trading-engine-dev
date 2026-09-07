@@ -48,17 +48,31 @@ while pending:
         pending.extend(value)
 
 assert len(proxies) == 1, f"expected one reverse proxy, found {len(proxies)}"
-request_headers = proxies[0]["headers"]["request"]["set"]
+request = proxies[0]["headers"]["request"]
+request_headers = request["set"]
 assert request_headers == expected, request_headers
+assert not set(expected) & set(request.get("add", {})), request.get("add", {})
 PY
 else
-  for directive in \
-    'header_up X-Authenticated-User {http.auth.user.id}' \
-    'header_up X-Forwarded-For {remote_host}' \
-    'header_up X-Forwarded-Host {host}' \
-    'header_up X-Forwarded-Proto {scheme}'; do
-    grep -Fq "$directive" "$caddyfile"
-  done
+  CADDYFILE="$caddyfile" python3 - <<'PY'
+import os
+import re
+
+source = open(os.environ["CADDYFILE"], encoding="utf-8").read()
+match = re.search(r"(?ms)^\s*reverse_proxy backend:8000 \{(?P<body>.*?)^\s*\}", source)
+assert match, "backend reverse_proxy block not found"
+proxy = match.group("body")
+expected = {
+    "X-Authenticated-User": "{http.auth.user.id}",
+    "X-Forwarded-For": "{remote_host}",
+    "X-Forwarded-Host": "{host}",
+    "X-Forwarded-Proto": "{scheme}",
+}
+for header, value in expected.items():
+    directive = rf"(?m)^\s*header_up {re.escape(header)} {re.escape(value)}\s*$"
+    assert re.search(directive, proxy), f"missing overwrite for {header}"
+    assert not re.search(rf"(?m)^\s*header_up (?:\+|-){re.escape(header)}\b", proxy), f"ambiguous header operation for {header}"
+PY
 fi
 
 printf 'trusted header contract passed\n'

@@ -22,6 +22,7 @@ require_file "$repository_root/scripts/backup-postgres.sh"
 require_file "$repository_root/scripts/verify-backup-restore.sh"
 require_file "$repository_root/tests/smoke-release-regression.sh"
 require_file "$repository_root/tests/release-environment-regression.sh"
+require_file "$repository_root/tests/compose-project-regression.sh"
 require_file "$repository_root/tests/trusted-header-contract.sh"
 require_file "$repository_root/tests/caddy-health-contract.sh"
 
@@ -105,5 +106,6 @@ grep -Fq 'docker run --rm -it caddy:2.10.2-alpine@sha256:' "$readme" || fail 'RE
 
 "$repository_root/tests/trusted-header-contract.sh" || fail 'trusted-header contract check failed'
 "$repository_root/tests/caddy-health-contract.sh" || fail 'Caddy health contract check failed'
+"$repository_root/tests/compose-project-regression.sh" || fail 'Compose project regression check failed'
 
 printf 'deployment contract passed\n'

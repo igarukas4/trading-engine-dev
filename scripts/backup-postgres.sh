@@ -11,6 +11,6 @@ install -d -m 700 "$backup_directory"
 backup_file="$backup_directory/postgres-$(date -u +%Y%m%dT%H%M%SZ).dump"
 
 umask 077
-docker compose --env-file "$release_file" -f "$compose_file" exec -T postgres pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_file"
+docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" exec -T postgres pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_file"
 sha256sum "$backup_file" >"${backup_file}.sha256"
 printf 'created backup: %s\n' "$backup_file"

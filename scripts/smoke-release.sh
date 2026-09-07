@@ -63,7 +63,7 @@ printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(cu
     --header 'X-Forwarded-Proto: http' \
     --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 
-if docker compose --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
+if docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
   printf 'backend port is directly published\n' >&2
   exit 1
 fi

@@ -15,7 +15,7 @@ ufw allow 443/tcp
 ufw enable
 ```
 
-Do not publish database, Redis, or backend ports with ad-hoc Docker commands. Keep SSH restricted to operator IPs at the provider firewall where possible. The backend image must reject `X-Authenticated-User` and forwarded headers unless the peer is `172.30.0.2`, enforce `PUBLIC_ORIGIN` for state-changing requests and WebSocket origins, and read the `*_FILE` secret paths supplied by Compose.
+Do not publish database, Redis, or backend ports with ad-hoc Docker commands. Keep SSH restricted to operator IPs at the provider firewall where possible. The deployment supplies the external backend image with its configured trusted actor header, trusted proxy address, origin, and secret-file paths; this repository verifies the ingress and network boundary without making claims about backend implementation internals.
 
 ## Secrets and first release
 
@@ -47,7 +47,7 @@ SMOKE_BASIC_AUTH_PASSWORD_FILE=/etc/trading-engine/smoke-basic-auth-password \
   scripts/release.sh deploy /etc/trading-engine/release.env
 ```
 
-The smoke script supplies the password to curl through protected standard input rather than a process argument. It also sends forged trusted-principal and forwarded headers at the public boundary: the unauthenticated request must remain `401`, and the authenticated request must still reach the backend. The deterministic `tests/trusted-header-contract.sh` check verifies that the adapted Caddy route overwrites those headers with the authenticated principal and proxy-derived values; this checkout has no backend implementation or identity-echo endpoint, so it does not invent one.
+The smoke script supplies the password to curl through protected standard input rather than a process argument. It also sends forged `X-Authenticated-User` and `X-Forwarded-*` headers at the public boundary: the unauthenticated request must remain `401`, and the authenticated request must still reach the backend. Before proxying, Caddy’s `reverse_proxy` `header_up` assignments overwrite those forged values with the authenticated Basic Auth identity and request-derived host, client address, and scheme. The deterministic `tests/trusted-header-contract.sh` check proves those assignments are in the adapted proxy’s request-header `set` map (or in the proxy block when the adapter is unavailable); it does not infer backend internals or require an identity-echo endpoint.
 
 The public `GET /healthz` endpoint intentionally returns `ok` without Basic Auth so external liveness checks can observe it. Dashboard and backend routes remain behind Basic Auth, including the backend's `/health/live` route when accessed through Caddy.
 

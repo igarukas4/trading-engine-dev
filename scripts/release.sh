@@ -72,7 +72,7 @@ run_sanitized() {
 run_compose() {
   local release_file=$1
   shift
-  run_sanitized docker compose --env-file "$release_file" -f "$compose_file" "$@"
+  run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" "$@"
 }
 
 run_smoke() {
