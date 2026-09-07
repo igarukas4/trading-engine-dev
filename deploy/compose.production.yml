@@ -95,7 +95,16 @@ services:
   redis:
     image: redis:7.4.2-alpine
     restart: unless-stopped
-    command: ["/bin/sh", "-ec", "exec redis-server --appendonly yes --requirepass $$(cat /run/secrets/redis_password)"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        {
+          printf '%s\n' 'appendonly yes'
+          printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)"
+        } > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf
     volumes:
       - redis_data:/data
     secrets:

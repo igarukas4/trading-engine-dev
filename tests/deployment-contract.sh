@@ -20,6 +20,7 @@ require_file "$repository_root/scripts/release.sh"
 require_file "$repository_root/scripts/smoke-release.sh"
 require_file "$repository_root/scripts/backup-postgres.sh"
 require_file "$repository_root/scripts/verify-backup-restore.sh"
+require_file "$repository_root/tests/smoke-release-regression.sh"
 
 for secret in postgres_password redis_password app_secret_key caddy_basic_auth_hash; do
   require_file "$repository_root/deploy/secrets/${secret}.example"
@@ -38,6 +39,8 @@ grep -Fq 'redis_data:' "$compose_file" || fail 'Redis must use persistent storag
 grep -Fq 'restart: unless-stopped' "$compose_file" || fail 'services must be supervised by Compose'
 grep -Fq 'healthcheck:' "$compose_file" || fail 'services must define health checks'
 grep -Fq 'internal: true' "$compose_file" || fail 'private service network must be internal'
+! grep -Fq -- '--requirepass $$(cat /run/secrets/redis_password)' "$compose_file" || fail 'Redis password must not be expanded into the Redis process arguments'
+grep -Fq 'exec redis-server /tmp/redis.conf' "$compose_file" || fail 'Redis must read its password from a generated protected config file'
 
 grep -Fq 'basic_auth' "$caddyfile" || fail 'dashboard must require Caddy Basic Auth'
 grep -Fq 'header_up X-Authenticated-User {http.auth.user.id}' "$caddyfile" || fail 'Caddy must set the trusted actor header'
@@ -59,6 +62,9 @@ grep -Fq 'sha256sum --check --status "$checksum_file"' "$restore_script" || fail
 grep -Fq 'docker network create --internal "$network_name"' "$restore_script" || fail 'restore verification must create an isolated network'
 grep -Fq 'pg_restore -U postgres -d postgres --clean --if-exists --no-owner --exit-on-error' "$restore_script" || fail 'restore verification must ignore dump ownership while preserving restore errors'
 ! grep -Fq 'trading-engine_private' "$restore_script" || fail 'restore verification must not use the live private network'
+grep -Fq 'POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password' "$restore_script" || fail 'restore verification must use the Postgres password file interface'
+grep -Fq -- '--mount "type=bind,src=$restore_password_file,dst=/run/secrets/postgres_password,readonly"' "$restore_script" || fail 'restore verification must mount a protected temporary password file'
+! grep -Fq 'POSTGRES_PASSWORD="$password"' "$restore_script" || fail 'restore verification must not put its password in docker arguments or environment'
 
 backup_script="$repository_root/scripts/backup-postgres.sh"
 grep -Fq 'umask 077' "$backup_script" || fail 'backup output must be created with a restrictive umask'
@@ -66,8 +72,14 @@ grep -Fq 'pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_
 
 ! grep -Fq 'source "$release_file"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not execute the release environment'
 grep -Fq 'read_release_env' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must parse the release environment'
+grep -Fq 'SMOKE_BASIC_AUTH_PASSWORD_FILE' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must require a protected Basic Auth password file'
+! grep -Fq 'SMOKE_BASIC_AUTH_PASSWORD:-' "$repository_root/scripts/smoke-release.sh" || fail 'authenticated smoke check must not be optional'
 ! grep -Fq -- '--user "${CADDY_BASIC_AUTH_USER}:${SMOKE_BASIC_AUTH_PASSWORD}"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not expose Basic Auth credentials in curl arguments'
-grep -Fq 'curl --config -' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must provide optional Basic Auth through curl stdin configuration'
+grep -Fq 'curl --config -' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must provide mandatory Basic Auth through curl stdin configuration'
+
+release_script="$repository_root/scripts/release.sh"
+grep -Fq 'rollback failed; restoring the recorded active release' "$release_script" || fail 'failed rollback must restore the active release'
+grep -Fq '"$smoke_script" "$formerly_current"' "$release_script" || fail 'failed rollback recovery must smoke check the active release'
 
 ! grep -Fq -- 'hash-password --plaintext' "$readme" || fail 'README must not pass the Basic Auth password as a process argument'
 grep -Fq 'docker run --rm -it caddy:2.10.2-alpine caddy hash-password' "$readme" || fail 'README must use Caddy interactive password input'

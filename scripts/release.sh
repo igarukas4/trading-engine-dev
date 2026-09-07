@@ -94,10 +94,17 @@ rollback() {
   rollback_snapshot=$previous_snapshot
   formerly_current=$current_snapshot
   [[ -f "$rollback_snapshot" ]] || { printf 'previous release file is missing: %s\n' "$rollback_snapshot" >&2; exit 1; }
-  docker compose --env-file "$rollback_snapshot" -f "$compose_file" config --quiet
-  docker compose --env-file "$rollback_snapshot" -f "$compose_file" pull
-  docker compose --env-file "$rollback_snapshot" -f "$compose_file" up --detach --wait --remove-orphans
-  "$smoke_script" "$rollback_snapshot"
+  if ! docker compose --env-file "$rollback_snapshot" -f "$compose_file" config --quiet || \
+     ! docker compose --env-file "$rollback_snapshot" -f "$compose_file" pull || \
+     ! docker compose --env-file "$rollback_snapshot" -f "$compose_file" up --detach --wait --remove-orphans || \
+     ! "$smoke_script" "$rollback_snapshot"; then
+    printf 'rollback failed; restoring the recorded active release\n' >&2
+    docker compose --env-file "$formerly_current" -f "$compose_file" config --quiet
+    docker compose --env-file "$formerly_current" -f "$compose_file" pull
+    docker compose --env-file "$formerly_current" -f "$compose_file" up --detach --wait --remove-orphans
+    "$smoke_script" "$formerly_current"
+    exit 1
+  fi
   write_release_metadata "$rollback_snapshot" "$formerly_current"
   printf 'rolled back to: %s\n' "$rollback_snapshot"
 }

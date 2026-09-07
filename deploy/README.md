@@ -40,17 +40,25 @@ Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` w
 scripts/release.sh deploy /etc/trading-engine/release.env
 ```
 
-The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, waits for health checks, and runs an HTTPS smoke check. Set `SMOKE_BASIC_AUTH_PASSWORD` only in the shell running the script to additionally verify the authenticated backend path; the smoke script supplies it to curl through protected standard input rather than a process argument. Caddy manages certificates and writes JSON access logs to its persistent volume; Docker retains service logs via its configured logging driver.
+The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, waits for health checks, and runs an HTTPS smoke check. The authenticated proxy-to-backend check is mandatory: place the Basic Auth plaintext in a separate `0600` file outside the repository and provide its path without putting the password in an environment variable or command argument:
+
+```bash
+SMOKE_BASIC_AUTH_PASSWORD_FILE=/etc/trading-engine/smoke-basic-auth-password \
+  scripts/release.sh deploy /etc/trading-engine/release.env
+```
+
+The smoke script supplies the password to curl through protected standard input rather than a process argument. Caddy manages certificates and writes JSON access logs to its persistent volume; Docker retains service logs via its configured logging driver.
 
 ## Rollback, backup, and restore verification
 
-Each successful deploy snapshots its release environment under the ignored `deploy/releases/` directory. A successful rollback atomically swaps the active and prior release metadata, so the command can also return to the release that was active before the rollback. Roll back to the prior successful snapshot with:
+Each successful deploy snapshots its release environment under the ignored `deploy/releases/` directory. A successful rollback atomically swaps the active and prior release metadata, so the command can also return to the release that was active before the rollback. If rollback startup or its smoke check fails, the script restores and smoke-checks the recorded active release without changing metadata. Roll back to the prior successful snapshot with:
 
 ```bash
-scripts/release.sh rollback
+SMOKE_BASIC_AUTH_PASSWORD_FILE=/etc/trading-engine/smoke-basic-auth-password \
+  scripts/release.sh rollback
 ```
 
-Take a custom-format PostgreSQL backup and verify it by restoring into an ephemeral isolated TimescaleDB container. The verification does not modify production data.
+Take a custom-format PostgreSQL backup and verify it by restoring into an ephemeral isolated TimescaleDB container. The verification does not modify production data; it generates the ephemeral database password in a temporary `0600` file mounted through PostgreSQL's `_FILE` interface, so the password is not placed in Docker arguments or environment.
 
 ```bash
 backup=$(scripts/backup-postgres.sh /etc/trading-engine/release.env /var/backups/trading-engine | sed -n 's/^created backup: //p')

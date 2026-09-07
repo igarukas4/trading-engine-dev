@@ -4,8 +4,11 @@ set -euo pipefail
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 compose_file="$repository_root/deploy/compose.production.yml"
 release_file=${1:?"usage: smoke-release.sh RELEASE_ENV_FILE"}
+smoke_password_file=${SMOKE_BASIC_AUTH_PASSWORD_FILE:?set SMOKE_BASIC_AUTH_PASSWORD_FILE to a protected Basic Auth password file}
 
 [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
+[[ -s "$smoke_password_file" ]] || { printf 'smoke Basic Auth password file not found or empty: %s\n' "$smoke_password_file" >&2; exit 1; }
+[[ $(stat -c '%a' "$smoke_password_file") == '600' ]] || { printf 'smoke Basic Auth password file must have mode 600: %s\n' "$smoke_password_file" >&2; exit 1; }
 
 read_release_env() {
   local line key value
@@ -31,22 +34,21 @@ read_release_env() {
 read_release_env
 
 : "${DOMAIN:?DOMAIN is required}"
+: "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required}"
 curl --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/healthz" | grep -qx 'ok'
 
 unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
 [[ "$unauthenticated_status" == '401' ]] || { printf 'expected unauthenticated backend request to return 401, got %s\n' "$unauthenticated_status" >&2; exit 1; }
 
-if [[ -n "${SMOKE_BASIC_AUTH_PASSWORD:-}" ]]; then
-  : "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required with SMOKE_BASIC_AUTH_PASSWORD}"
-  curl_config_escape() {
-    local value=$1
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    printf '%s' "$value"
-  }
-  printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$SMOKE_BASIC_AUTH_PASSWORD")" | \
-    curl --config - --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
-fi
+curl_config_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
+}
+smoke_password=$(<"$smoke_password_file")
+printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$smoke_password")" | \
+  curl --config - --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 
 if docker compose --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
   printf 'backend port is directly published\n' >&2
