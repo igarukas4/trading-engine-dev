@@ -31,8 +31,8 @@
 		health_interval 15s
 		health_timeout 3s
 		header_up X-Authenticated-User {http.auth.user.id}
-		header_up -X-Forwarded-For {remote_host}
-		header_up -X-Forwarded-Host {host}
-		header_up -X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-Proto {scheme}
 	}
 }

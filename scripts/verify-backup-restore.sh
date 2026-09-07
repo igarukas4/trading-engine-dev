@@ -30,6 +30,6 @@ for _ in {1..30}; do
 done
 docker exec "$container_name" pg_isready -U postgres >/dev/null
 docker cp "$backup_file" "$container_name:/tmp/backup.dump"
-docker exec "$container_name" sh -ec 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -U postgres -d postgres --clean --if-exists --exit-on-error /tmp/backup.dump'
+docker exec "$container_name" sh -ec 'PGPASSWORD="$POSTGRES_PASSWORD" pg_restore -U postgres -d postgres --clean --if-exists --no-owner --exit-on-error /tmp/backup.dump'
 docker exec "$container_name" psql -U postgres -d postgres -Atqc "select 1" | grep -qx '1'
 printf 'backup restore verification passed: %s\n' "$backup_file"

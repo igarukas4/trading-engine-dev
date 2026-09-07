@@ -42,8 +42,10 @@ grep -Fq 'internal: true' "$compose_file" || fail 'private service network must 
 grep -Fq 'basic_auth' "$caddyfile" || fail 'dashboard must require Caddy Basic Auth'
 grep -Fq 'header_up X-Authenticated-User {http.auth.user.id}' "$caddyfile" || fail 'Caddy must set the trusted actor header'
 ! grep -Fq 'header_up -X-Authenticated-User' "$caddyfile" || fail 'Caddy must not delete the trusted actor header'
-grep -Fq 'header_up -X-Forwarded-For {remote_host}' "$caddyfile" || fail 'Caddy must overwrite forwarded client address'
-grep -Fq 'header_up -X-Forwarded-Proto {scheme}' "$caddyfile" || fail 'Caddy must overwrite forwarded scheme'
+grep -Fq 'header_up X-Forwarded-For {remote_host}' "$caddyfile" || fail 'Caddy must overwrite forwarded client address'
+grep -Fq 'header_up X-Forwarded-Host {host}' "$caddyfile" || fail 'Caddy must overwrite forwarded host'
+grep -Fq 'header_up X-Forwarded-Proto {scheme}' "$caddyfile" || fail 'Caddy must overwrite forwarded scheme'
+! grep -Fq 'header_up -X-Forwarded-' "$caddyfile" || fail 'Caddy must not delete forwarded headers'
 grep -Fq 'health_uri /health/live' "$caddyfile" || fail 'Caddy must actively check backend liveness'
 
 readme="$repository_root/deploy/README.md"
@@ -55,6 +57,16 @@ grep -Fqx '$2a$14$replace-with-a-bcrypt-hash' "$repository_root/deploy/secrets/c
 restore_script="$repository_root/scripts/verify-backup-restore.sh"
 grep -Fq 'sha256sum --check --status "$checksum_file"' "$restore_script" || fail 'restore verification must check the backup checksum'
 grep -Fq 'docker network create --internal "$network_name"' "$restore_script" || fail 'restore verification must create an isolated network'
+grep -Fq 'pg_restore -U postgres -d postgres --clean --if-exists --no-owner --exit-on-error' "$restore_script" || fail 'restore verification must ignore dump ownership while preserving restore errors'
 ! grep -Fq 'trading-engine_private' "$restore_script" || fail 'restore verification must not use the live private network'
+
+backup_script="$repository_root/scripts/backup-postgres.sh"
+grep -Fq 'umask 077' "$backup_script" || fail 'backup output must be created with a restrictive umask'
+grep -Fq 'pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_file"' "$backup_script" || fail 'backup must redirect only after restrictive umask is set'
+
+! grep -Fq 'source "$release_file"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not execute the release environment'
+grep -Fq 'read_release_env' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must parse the release environment'
+
+grep -Fq "read -rsp 'Caddy Basic Auth password: ' caddy_basic_auth_password" "$readme" || fail 'README must read the Basic Auth password without shell history'
 
 printf 'deployment contract passed\n'

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repository_root=${REPOSITORY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 compose_file="$repository_root/deploy/compose.production.yml"
 release_directory="$repository_root/deploy/releases"
+smoke_script=${SMOKE_SCRIPT:-"$repository_root/scripts/smoke-release.sh"}
 command=${1:-}
 
 usage() {
@@ -27,21 +28,32 @@ validate_release() {
 }
 
 deploy() {
-  local source_file=$1 snapshot previous_snapshot
+  local source_file=$1 snapshot current_snapshot
   validate_release "$source_file"
   mkdir -p "$release_directory"
   umask 077
   snapshot="$release_directory/release-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM.env"
   cp "$source_file" "$snapshot"
-  previous_snapshot=''
-  [[ -f "$release_directory/current" ]] && previous_snapshot=$(<"$release_directory/current")
+  current_snapshot=''
+  [[ -f "$release_directory/current" ]] && current_snapshot=$(<"$release_directory/current")
 
   docker compose --env-file "$snapshot" -f "$compose_file" config --quiet
   docker compose --env-file "$snapshot" -f "$compose_file" pull
-  docker compose --env-file "$snapshot" -f "$compose_file" up --detach --wait --remove-orphans
-  "$repository_root/scripts/smoke-release.sh" "$snapshot"
+  if ! docker compose --env-file "$snapshot" -f "$compose_file" up --detach --wait --remove-orphans || ! "$smoke_script" "$snapshot"; then
+    printf 'release failed; restoring the recorded active release\n' >&2
+    if [[ -n "$current_snapshot" ]]; then
+      [[ -f "$current_snapshot" ]] || { printf 'recorded active release file is missing: %s\n' "$current_snapshot" >&2; exit 1; }
+      docker compose --env-file "$current_snapshot" -f "$compose_file" config --quiet
+      docker compose --env-file "$current_snapshot" -f "$compose_file" pull
+      docker compose --env-file "$current_snapshot" -f "$compose_file" up --detach --wait --remove-orphans
+      "$smoke_script" "$current_snapshot"
+    else
+      docker compose --env-file "$snapshot" -f "$compose_file" down --remove-orphans
+    fi
+    exit 1
+  fi
 
-  [[ -n "$previous_snapshot" ]] && printf '%s\n' "$previous_snapshot" >"$release_directory/previous"
+  [[ -n "$current_snapshot" ]] && printf '%s\n' "$current_snapshot" >"$release_directory/previous"
   printf '%s\n' "$snapshot" >"$release_directory/current"
   printf 'release deployed: %s\n' "$snapshot"
 }
@@ -54,7 +66,7 @@ rollback() {
   docker compose --env-file "$snapshot" -f "$compose_file" config --quiet
   docker compose --env-file "$snapshot" -f "$compose_file" pull
   docker compose --env-file "$snapshot" -f "$compose_file" up --detach --wait --remove-orphans
-  "$repository_root/scripts/smoke-release.sh" "$snapshot"
+  "$smoke_script" "$snapshot"
   printf '%s\n' "$snapshot" >"$release_directory/current"
   printf 'rolled back to: %s\n' "$snapshot"
 }

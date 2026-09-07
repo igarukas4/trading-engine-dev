@@ -29,7 +29,10 @@ done
 openssl rand -base64 48 > deploy/secrets/app_secret_key
 openssl rand -base64 36 > deploy/secrets/postgres_password
 openssl rand -base64 36 > deploy/secrets/redis_password
-docker run --rm caddy:2.10.2-alpine caddy hash-password --plaintext 'choose-a-long-password' > deploy/secrets/caddy_basic_auth_hash
+read -rsp 'Caddy Basic Auth password: ' caddy_basic_auth_password
+printf '\n'
+docker run --rm caddy:2.10.2-alpine caddy hash-password --plaintext "$caddy_basic_auth_password" > deploy/secrets/caddy_basic_auth_hash
+unset caddy_basic_auth_password
 ```
 
 Run these commands only on the VPS: each command overwrites the newly created empty secret file with a fresh value. Store the Basic Auth plaintext in an approved password manager; only its bcrypt hash belongs in `deploy/secrets/caddy_basic_auth_hash`.

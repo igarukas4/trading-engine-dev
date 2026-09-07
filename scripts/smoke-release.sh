@@ -6,11 +6,29 @@ compose_file="$repository_root/deploy/compose.production.yml"
 release_file=${1:?"usage: smoke-release.sh RELEASE_ENV_FILE"}
 
 [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
-set -a
-# Release environment files are operator-controlled key=value files, not repository input.
-# shellcheck disable=SC1090
-source "$release_file"
-set +a
+
+read_release_env() {
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || {
+      printf 'invalid release environment line: %s\n' "$line" >&2
+      exit 1
+    }
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+    case "$key" in
+      DOMAIN) DOMAIN=$value ;;
+      CADDY_BASIC_AUTH_USER) CADDY_BASIC_AUTH_USER=$value ;;
+    esac
+  done <"$release_file"
+}
+
+read_release_env
 
 : "${DOMAIN:?DOMAIN is required}"
 curl --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/healthz" | grep -qx 'ok'
