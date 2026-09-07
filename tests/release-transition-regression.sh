@@ -18,8 +18,7 @@ candidate="$test_directory/candidate.env"
 for file in "$previous_snapshot" "$older_snapshot" "$candidate"; do
   printf '%s\n' 'BACKEND_IMAGE=example.invalid/backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'DOMAIN=dashboard.example.com' 'ACME_EMAIL=ops@example.com' 'CADDY_BASIC_AUTH_USER=operator' >"$file"
 done
-printf '%s\n' "$previous_snapshot" >"$test_directory/deploy/releases/current"
-printf '%s\n' "$older_snapshot" >"$test_directory/deploy/releases/previous"
+printf 'CURRENT=%s\nPREVIOUS=%s\n' "$previous_snapshot" "$older_snapshot" >"$test_directory/deploy/releases/state"
 
 cat >"$test_directory/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -39,7 +38,15 @@ if PATH="$test_directory/bin:$PATH" DOCKER_LOG="$test_directory/docker.log" REPO
   exit 1
 fi
 
-[[ $(<"$test_directory/deploy/releases/current") == "$previous_snapshot" ]] || { printf 'current metadata changed after failed release\n' >&2; exit 1; }
-[[ $(<"$test_directory/deploy/releases/previous") == "$older_snapshot" ]] || { printf 'previous metadata changed after failed release\n' >&2; exit 1; }
+grep -Fxq "CURRENT=$previous_snapshot" "$test_directory/deploy/releases/state" || { printf 'current metadata changed after failed release\n' >&2; exit 1; }
+grep -Fxq "PREVIOUS=$older_snapshot" "$test_directory/deploy/releases/state" || { printf 'previous metadata changed after failed release\n' >&2; exit 1; }
 grep -Fq -- "--env-file $previous_snapshot" "$test_directory/docker.log" || { printf 'recorded active release was not restored\n' >&2; exit 1; }
+
+PATH="$test_directory/bin:$PATH" DOCKER_LOG="$test_directory/docker.log" REPOSITORY_ROOT="$test_directory" SMOKE_SCRIPT="$test_directory/smoke" "$repository_root/scripts/release.sh" rollback
+grep -Fxq "CURRENT=$older_snapshot" "$test_directory/deploy/releases/state" || { printf 'first rollback did not activate the prior release\n' >&2; exit 1; }
+grep -Fxq "PREVIOUS=$previous_snapshot" "$test_directory/deploy/releases/state" || { printf 'first rollback did not retain the formerly active release\n' >&2; exit 1; }
+
+PATH="$test_directory/bin:$PATH" DOCKER_LOG="$test_directory/docker.log" REPOSITORY_ROOT="$test_directory" SMOKE_SCRIPT="$test_directory/smoke" "$repository_root/scripts/release.sh" rollback
+grep -Fxq "CURRENT=$previous_snapshot" "$test_directory/deploy/releases/state" || { printf 'second rollback could not return to the formerly active release\n' >&2; exit 1; }
+grep -Fxq "PREVIOUS=$older_snapshot" "$test_directory/deploy/releases/state" || { printf 'second rollback did not preserve its previous release\n' >&2; exit 1; }
 printf 'release transition regression passed\n'

@@ -66,7 +66,10 @@ grep -Fq 'pg_dump -U trading_engine -d trading_engine --format=custom >"$backup_
 
 ! grep -Fq 'source "$release_file"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not execute the release environment'
 grep -Fq 'read_release_env' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must parse the release environment'
+! grep -Fq -- '--user "${CADDY_BASIC_AUTH_USER}:${SMOKE_BASIC_AUTH_PASSWORD}"' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must not expose Basic Auth credentials in curl arguments'
+grep -Fq 'curl --config -' "$repository_root/scripts/smoke-release.sh" || fail 'smoke check must provide optional Basic Auth through curl stdin configuration'
 
-grep -Fq "read -rsp 'Caddy Basic Auth password: ' caddy_basic_auth_password" "$readme" || fail 'README must read the Basic Auth password without shell history'
+! grep -Fq -- 'hash-password --plaintext' "$readme" || fail 'README must not pass the Basic Auth password as a process argument'
+grep -Fq 'docker run --rm -it caddy:2.10.2-alpine caddy hash-password' "$readme" || fail 'README must use Caddy interactive password input'
 
 printf 'deployment contract passed\n'

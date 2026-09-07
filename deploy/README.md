@@ -29,10 +29,7 @@ done
 openssl rand -base64 48 > deploy/secrets/app_secret_key
 openssl rand -base64 36 > deploy/secrets/postgres_password
 openssl rand -base64 36 > deploy/secrets/redis_password
-read -rsp 'Caddy Basic Auth password: ' caddy_basic_auth_password
-printf '\n'
-docker run --rm caddy:2.10.2-alpine caddy hash-password --plaintext "$caddy_basic_auth_password" > deploy/secrets/caddy_basic_auth_hash
-unset caddy_basic_auth_password
+docker run --rm -it caddy:2.10.2-alpine caddy hash-password > deploy/secrets/caddy_basic_auth_hash
 ```
 
 Run these commands only on the VPS: each command overwrites the newly created empty secret file with a fresh value. Store the Basic Auth plaintext in an approved password manager; only its bcrypt hash belongs in `deploy/secrets/caddy_basic_auth_hash`.
@@ -43,11 +40,11 @@ Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` w
 scripts/release.sh deploy /etc/trading-engine/release.env
 ```
 
-The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, waits for health checks, and runs an HTTPS smoke check. Set `SMOKE_BASIC_AUTH_PASSWORD` only in the shell running the script to additionally verify the authenticated backend path. Caddy manages certificates and writes JSON access logs to its persistent volume; Docker retains service logs via its configured logging driver.
+The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, waits for health checks, and runs an HTTPS smoke check. Set `SMOKE_BASIC_AUTH_PASSWORD` only in the shell running the script to additionally verify the authenticated backend path; the smoke script supplies it to curl through protected standard input rather than a process argument. Caddy manages certificates and writes JSON access logs to its persistent volume; Docker retains service logs via its configured logging driver.
 
 ## Rollback, backup, and restore verification
 
-Each successful deploy snapshots its release environment under the ignored `deploy/releases/` directory. Roll back to the prior successful snapshot with:
+Each successful deploy snapshots its release environment under the ignored `deploy/releases/` directory. A successful rollback atomically swaps the active and prior release metadata, so the command can also return to the release that was active before the rollback. Roll back to the prior successful snapshot with:
 
 ```bash
 scripts/release.sh rollback

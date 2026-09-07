@@ -38,7 +38,14 @@ unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_co
 
 if [[ -n "${SMOKE_BASIC_AUTH_PASSWORD:-}" ]]; then
   : "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required with SMOKE_BASIC_AUTH_PASSWORD}"
-  curl --fail --silent --show-error --user "${CADDY_BASIC_AUTH_USER}:${SMOKE_BASIC_AUTH_PASSWORD}" --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
+  curl_config_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '%s' "$value"
+  }
+  printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$SMOKE_BASIC_AUTH_PASSWORD")" | \
+    curl --config - --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 fi
 
 if docker compose --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then

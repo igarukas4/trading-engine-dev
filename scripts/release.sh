@@ -4,6 +4,7 @@ set -euo pipefail
 repository_root=${REPOSITORY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 compose_file="$repository_root/deploy/compose.production.yml"
 release_directory="$repository_root/deploy/releases"
+release_metadata="$release_directory/state"
 smoke_script=${SMOKE_SCRIPT:-"$repository_root/scripts/smoke-release.sh"}
 command=${1:-}
 
@@ -27,15 +28,44 @@ validate_release() {
   done
 }
 
+current_snapshot=''
+previous_snapshot=''
+
+read_release_metadata() {
+  local key value
+  current_snapshot=''
+  previous_snapshot=''
+  [[ -f "$release_metadata" ]] || return 0
+
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    case "$key" in
+      CURRENT) current_snapshot=$value ;;
+      PREVIOUS) previous_snapshot=$value ;;
+      *) printf 'invalid release metadata entry: %s\n' "$key" >&2; exit 1 ;;
+    esac
+  done <"$release_metadata"
+
+  [[ -n "$current_snapshot" ]] || { printf 'release metadata has no current snapshot\n' >&2; exit 1; }
+}
+
+write_release_metadata() {
+  local current=$1 previous=$2 temporary_metadata
+  temporary_metadata=$(mktemp "$release_directory/.state.XXXXXX")
+  {
+    printf 'CURRENT=%s\n' "$current"
+    printf 'PREVIOUS=%s\n' "$previous"
+  } >"$temporary_metadata"
+  mv -f "$temporary_metadata" "$release_metadata"
+}
+
 deploy() {
-  local source_file=$1 snapshot current_snapshot
+  local source_file=$1 snapshot
   validate_release "$source_file"
   mkdir -p "$release_directory"
   umask 077
   snapshot="$release_directory/release-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM.env"
   cp "$source_file" "$snapshot"
-  current_snapshot=''
-  [[ -f "$release_directory/current" ]] && current_snapshot=$(<"$release_directory/current")
+  read_release_metadata
 
   docker compose --env-file "$snapshot" -f "$compose_file" config --quiet
   docker compose --env-file "$snapshot" -f "$compose_file" pull
@@ -53,22 +83,23 @@ deploy() {
     exit 1
   fi
 
-  [[ -n "$current_snapshot" ]] && printf '%s\n' "$current_snapshot" >"$release_directory/previous"
-  printf '%s\n' "$snapshot" >"$release_directory/current"
+  write_release_metadata "$snapshot" "$current_snapshot"
   printf 'release deployed: %s\n' "$snapshot"
 }
 
 rollback() {
-  local snapshot
-  [[ -f "$release_directory/previous" ]] || { printf 'no previous release is recorded\n' >&2; exit 1; }
-  snapshot=$(<"$release_directory/previous")
-  [[ -f "$snapshot" ]] || { printf 'previous release file is missing: %s\n' "$snapshot" >&2; exit 1; }
-  docker compose --env-file "$snapshot" -f "$compose_file" config --quiet
-  docker compose --env-file "$snapshot" -f "$compose_file" pull
-  docker compose --env-file "$snapshot" -f "$compose_file" up --detach --wait --remove-orphans
-  "$smoke_script" "$snapshot"
-  printf '%s\n' "$snapshot" >"$release_directory/current"
-  printf 'rolled back to: %s\n' "$snapshot"
+  local rollback_snapshot formerly_current
+  read_release_metadata
+  [[ -n "$previous_snapshot" ]] || { printf 'no previous release is recorded\n' >&2; exit 1; }
+  rollback_snapshot=$previous_snapshot
+  formerly_current=$current_snapshot
+  [[ -f "$rollback_snapshot" ]] || { printf 'previous release file is missing: %s\n' "$rollback_snapshot" >&2; exit 1; }
+  docker compose --env-file "$rollback_snapshot" -f "$compose_file" config --quiet
+  docker compose --env-file "$rollback_snapshot" -f "$compose_file" pull
+  docker compose --env-file "$rollback_snapshot" -f "$compose_file" up --detach --wait --remove-orphans
+  "$smoke_script" "$rollback_snapshot"
+  write_release_metadata "$rollback_snapshot" "$formerly_current"
+  printf 'rolled back to: %s\n' "$rollback_snapshot"
 }
 
 case "$command" in
