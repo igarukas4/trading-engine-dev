@@ -4,7 +4,8 @@ Repository ini adalah baseline bersih untuk implementasi Trading Engine V0.
 
 ## Current State
 
-- Spesifikasi kanonik dipertahankan di `docs/spec/`.
+- Satu pintu masuk spesifikasi kanonik tersedia di [`docs/spec/trading-engine-v0.md`](docs/spec/trading-engine-v0.md).
+- Kontrak backend, frontend, dan strategy di `docs/spec/` merupakan lampiran normatif dari spec tersebut, bukan proposal yang saling bersaing.
 - Domain glossary dipertahankan di `CONTEXT.md`.
 - D1 production deployment foundation sudah tersedia di `deploy/`, `scripts/`, dan `tests/`.
 - Implementasi aplikasi trading berikutnya belum dimulai di `main`.
