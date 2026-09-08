@@ -39,6 +39,7 @@ class RiskLimits:
 @dataclass(frozen=True)
 class EnrichmentPolicy:
     strategy_config_id: str
+    broker_account_id: str = ""
     version: int = 1
     source_rules: dict[str, Literal["REQUIRED", "ADVISORY", "DISABLED"]] = field(default_factory=lambda: {"calendar": "REQUIRED"})
     freshness_ttl_seconds: dict[str, int] = field(default_factory=lambda: {"calendar": 3600})
@@ -152,6 +153,7 @@ class RiskAssessment:
     purpose: Literal["INITIAL", "PRE_ORDER"] = "INITIAL"
     signal_revision: int | None = None
     assessed_at: datetime | None = None
+    evidence: tuple[tuple[str, str], ...] = ()
 
 
 class RiskEngine:
@@ -180,6 +182,8 @@ class RiskEngine:
     ) -> RiskAssessment:
         reasons: list[str] = []
         assessed_at = now or _now()
+        if limits is not None and limits.broker_account_id != account_id:
+            raise ValueError("RISK_LIMITS_ACCOUNT_MISMATCH")
         if signal_revision is not None and approved_revision is not None and signal_revision != approved_revision:
             reasons.append("SIGNAL_REVISION_CHANGED")
         if signal_expires_at is not None and assessed_at >= signal_expires_at:
@@ -209,6 +213,18 @@ class RiskEngine:
         if account_state != "RUNNING":
             reasons.append("ACCOUNT_STATE_UNSAFE")
         valid_until = assessed_at + timedelta(seconds=30) if not reasons else None
+        evidence = tuple(sorted({
+            "account_state": account_state,
+            "baseline_samples": str(baseline_samples),
+            "daily_loss": str(daily_loss),
+            "open_positions": str(open_positions),
+            "open_risk": str(open_risk),
+            "requested_risk": str(requested_risk),
+            "policy_healthy": str(policy_healthy),
+            "calendar_blackout": str(calendar_blackout),
+            "spread_multiple": str(spread_multiple),
+            "volatility_multiple": str(volatility_multiple),
+        }.items()))
         return RiskAssessment(
             broker_account_id=account_id,
             risk_limits_version=limits.version if limits else None,
@@ -218,6 +234,7 @@ class RiskEngine:
             purpose=purpose,
             signal_revision=signal_revision,
             assessed_at=assessed_at,
+            evidence=evidence,
         )
 
 
@@ -252,6 +269,8 @@ class ActivationGate:
         if policy is None:
             reasons.append("ENRICHMENT_POLICY_MISSING")
         else:
+            if policy.broker_account_id and policy.broker_account_id != account_id:
+                reasons.append("POLICY_ACCOUNT_MISMATCH")
             for currency in policy.required_currencies:
                 health = calendar_health.get(currency)
                 ttl = policy.freshness_ttl_seconds.get("calendar", 3600)

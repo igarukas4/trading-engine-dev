@@ -61,3 +61,67 @@ print("ok")
 `);
   assert.match(output, /ok/);
 });
+
+test("SignalStore rejects cross-account references and freezes its evidence", () => {
+  const output = run(`
+from datetime import datetime, timezone
+from backend.app.signals import SignalStore
+from backend.app.risk_calendar import RiskLimits
+
+at = datetime(2026, 1, 5, tzinfo=timezone.utc)
+store = SignalStore()
+opportunity = {
+    "id": "opp-immutable", "account_id": "account-a", "pair": "EURUSD",
+    "strategy_config_version_id": "config-account-a-v1",
+    "market_snapshot_id": "snapshot-account-a",
+}
+signal = store.create(
+    account_id="account-a", opportunity=opportunity,
+    market_snapshot_id="snapshot-account-a", policy_version=1, created_at=at,
+    limits=RiskLimits(broker_account_id="account-a"),
+)
+opportunity["pair"] = "XAUUSD"
+assert signal.opportunity["pair"] == "EURUSD"
+try:
+    store.create(account_id="account-a", opportunity={**opportunity, "account_id": "account-b"},
+        market_snapshot_id="snapshot-account-a", policy_version=1, created_at=at)
+except ValueError as error:
+    assert str(error) == "ACCOUNT_CONTEXT_MISMATCH"
+else:
+    raise AssertionError("cross-account opportunity accepted")
+try:
+    store.create(account_id="account-a", opportunity={**opportunity, "strategy_config_version_id": "config-account-b-v1"},
+        market_snapshot_id="snapshot-account-a", policy_version=1, created_at=at)
+except ValueError as error:
+    assert str(error) == "CONFIG_CONTEXT_MISMATCH"
+else:
+    raise AssertionError("cross-account config accepted")
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("Signal revisions reassess preserved risk context and invalidate approval", () => {
+  const output = run(`
+from datetime import datetime, timezone
+from backend.app.signals import SignalStore
+from backend.app.risk_calendar import RiskLimits
+
+at = datetime(2026, 1, 5, tzinfo=timezone.utc)
+limits = RiskLimits(broker_account_id="account-a")
+store = SignalStore()
+signal = store.create(account_id="account-a", opportunity={
+    "id": "opp-revision", "account_id": "account-a", "strategy_config_version_id": "config-account-a-v1",
+    "market_snapshot_id": "snapshot-account-a",
+}, market_snapshot_id="snapshot-account-a", policy_version=1, created_at=at,
+    limits=limits, risk_kwargs={"baseline_samples": 20})
+revised = store.create_revision(signal.id, policy_version=2, created_at=at, limits=limits)
+assert store.get(signal.id).status == "INVALIDATED"
+assert revised.revision == 2
+assert revised.risk_assessment.purpose == "INITIAL"
+assert revised.risk_assessment.signal_revision == 2
+assert revised.risk_assessment.risk_limits_version == 1
+print("ok")
+`);
+  assert.match(output, /ok/);
+});

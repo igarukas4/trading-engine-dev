@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -74,7 +75,7 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
 risk_limits = RiskLimitsStore()
-enrichment_policies: dict[str, EnrichmentPolicy] = {}
+enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
 safety = AccountSafety()
 activation_gate = ActivationGate()
@@ -365,9 +366,10 @@ def set_calendar_health(account_id: str, request: CalendarHealthRequest) -> dict
 def create_enrichment_policy(account_id: str, config_id: str, request: EnrichmentPolicyRequest) -> dict[str, Any]:
     _require_account(account_id)
     _strategy_config_for(account_id, config_id)
-    prior = enrichment_policies.get(config_id)
+    prior = enrichment_policies.get((account_id, config_id))
     policy = EnrichmentPolicy(
         strategy_config_id=config_id,
+        broker_account_id=account_id,
         version=(prior.version + 1 if prior else 1),
         required_currencies=request.required_currencies,
         event_kinds=request.event_kinds,
@@ -375,7 +377,7 @@ def create_enrichment_policy(account_id: str, config_id: str, request: Enrichmen
         blackout_after_minutes=request.blackout_after_minutes,
         reason=request.reason,
     )
-    enrichment_policies[config_id] = policy
+    enrichment_policies[(account_id, config_id)] = policy
     return {"account_id": account_id, **policy.__dict__}
 
 
@@ -419,7 +421,7 @@ def activate_strategy_config(
         mapping=mapping,
         connector_capabilities=request.connector_capabilities,
         risk_limits=risk_limits.active(account_id),
-        policy=enrichment_policies.get(config_id),
+        policy=enrichment_policies.get((account_id, config_id)),
         calendar_health=calendar_health.get(account_id, {}),
         session_allowed=request.session_allowed,
         wti_gate=request.wti_gate,
@@ -453,51 +455,48 @@ def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> di
     result = evaluate_snapshot({**request.snapshot, "account_id": account_id}, config)
     payload = result.as_dict()
     if result.opportunity:
-        opportunities.setdefault(account_id, []).append(payload["opportunity"])
-        opportunity = opportunities[account_id][-1]
+        opportunity = deepcopy(payload["opportunity"])
         opportunity["id"] = f"opportunity-{uuid4()}"
         opportunity["market_snapshot_id"] = str(request.snapshot.get("snapshot_id", ""))
+        opportunity["strategy_config_account_id"] = account_id
+        opportunity["market_snapshot_account_id"] = account_id
+        opportunity["created_at"] = datetime.now(timezone.utc).isoformat()
+        opportunities.setdefault(account_id, []).append(opportunity)
+        payload["opportunity"] = deepcopy(opportunity)
     return payload
 
 
 def _signals_for_account(account_id: str) -> list[dict[str, Any]]:
-    return [
+    return sorted([
         signal.as_dict()
         for signal in signals.signals.values()
         if signal.account_id == account_id
-    ]
+    ], key=lambda signal: signal["created_at"], reverse=True)
 
 
 def _signals_for_opportunity(account_id: str, opportunity_id: Any) -> list[dict[str, Any]]:
-    return [
+    return sorted([
         signal.as_dict()
         for signal in signals.signals.values()
         if signal.account_id == account_id
         and signal.opportunity.get("id") == opportunity_id
-    ]
+    ], key=lambda signal: signal["created_at"], reverse=True)
 
 
-def _risk_kwargs(request: SignalEnrichmentRequest, account_state: str) -> dict[str, Any]:
-    excluded_fields = {
-        "opportunity_id",
-        "market_snapshot_id",
-        "policy_version",
-        "entry_zone",
-        "stop_loss",
-        "take_profit",
-        "ttl_seconds",
-        "policy_healthy",
-        "calendar_blackout",
-    }
-    risk_kwargs = request.model_dump(exclude=excluded_fields)
-    risk_kwargs.update(
-        {
-            "policy_healthy": request.policy_healthy,
-            "calendar_blackout": request.calendar_blackout,
-            "account_state": account_state,
-        }
-    )
-    return risk_kwargs
+def _risk_kwargs(request: SignalEnrichmentRequest, account_state: str,
+                 policy: EnrichmentPolicy | None, account_id: str) -> dict[str, Any]:
+    # Risk inputs are observations owned by the backend.  Browser-supplied
+    # booleans and measurements are intentionally ignored.
+    policy_healthy = bool(policy)
+    if policy:
+        for currency in policy.required_currencies:
+            health = calendar_health.get(account_id, {}).get(currency)
+            ttl = policy.freshness_ttl_seconds.get("calendar", 3600)
+            if health is None or not health.is_fresh(ttl_seconds=ttl):
+                policy_healthy = False
+                break
+    return {"baseline_samples": 0, "account_state": account_state,
+            "policy_healthy": policy_healthy, "calendar_blackout": False}
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
@@ -510,7 +509,8 @@ def list_opportunities(account_id: str) -> dict[str, Any]:
                 **item,
                 "signals": _signals_for_opportunity(account_id, item.get("id")),
             }
-            for item in opportunities.get(account_id, [])
+            for item in sorted(opportunities.get(account_id, []),
+                               key=lambda item: item.get("created_at", ""), reverse=True)
         ],
         "has_more": False,
     }
@@ -525,20 +525,29 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
     )
     if opportunity is None:
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    if request.market_snapshot_id and request.market_snapshot_id != opportunity.get("market_snapshot_id"):
+        raise HTTPException(status_code=409, detail="MarketStateSnapshot does not match Opportunity")
+    config = _strategy_config_for(account_id, str(opportunity["strategy_config_version_id"]))
+    policy = enrichment_policies.get((account_id, config.id))
+    if policy is None or policy.version != request.policy_version:
+        raise HTTPException(status_code=409, detail="EnrichmentPolicy version is not account-scoped/current")
     limits = risk_limits.active(account_id)
     account = accounts.accounts[account_id]
-    risk_kwargs = _risk_kwargs(request, account.bot_state)
-    signal = signals.create(
-        account_id=account_id,
-        opportunity=opportunity,
-        market_snapshot_id=request.market_snapshot_id or opportunity.get("market_snapshot_id", ""),
-        policy_version=request.policy_version,
-        ttl=timedelta(seconds=request.ttl_seconds),
-        entry_zone=request.entry_zone,
-        stop_loss=request.stop_loss,
-        take_profit=request.take_profit,
-        limits=limits, risk_kwargs=risk_kwargs,
-    )
+    risk_kwargs = _risk_kwargs(request, account.bot_state, policy, account_id)
+    try:
+        signal = signals.create(
+            account_id=account_id,
+            opportunity=opportunity,
+            market_snapshot_id=opportunity.get("market_snapshot_id", ""),
+            policy_version=request.policy_version,
+            ttl=timedelta(seconds=request.ttl_seconds),
+            entry_zone=request.entry_zone,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            limits=limits, risk_kwargs=risk_kwargs,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return signal.as_dict()
 
 
@@ -561,7 +570,12 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
         raise HTTPException(status_code=404, detail="Signal not found") from error
     if signal.account_id != account_id:
         raise HTTPException(status_code=404, detail="Signal not found")
-    return signals.create_revision(signal_id, policy_version=policy_version).as_dict()
+    policy = enrichment_policies.get((account_id, signal.strategy_config_version_id))
+    if policy is None or policy.version != policy_version:
+        raise HTTPException(status_code=409, detail="EnrichmentPolicy version is not account-scoped/current")
+    limits = risk_limits.active(account_id)
+    return signals.create_revision(signal_id, policy_version=policy_version,
+                                   limits=limits).as_dict()
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/connector-binding", tags=["broker-accounts"])
