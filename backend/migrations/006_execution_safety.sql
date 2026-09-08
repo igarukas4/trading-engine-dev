@@ -88,4 +88,19 @@ CREATE TABLE IF NOT EXISTS execution_fences (
     UNIQUE (broker_account_id, sequence)
 );
 
+-- Operator intent is separate from broker execution and remains auditable.
+CREATE TABLE IF NOT EXISTS operator_commands (
+    id UUID PRIMARY KEY,
+    broker_account_id UUID NOT NULL REFERENCES broker_accounts(id),
+    signal_id UUID,
+    kind TEXT NOT NULL CHECK (kind IN ('APPROVE_SIGNAL', 'EXECUTE_SIGNAL', 'CLOSE_ALL')),
+    idempotency_key TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    confirmed BOOLEAN NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ACCEPTED', 'REJECTED', 'EXECUTED')),
+    rejection_code TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (broker_account_id, idempotency_key)
+);
+
 INSERT INTO schema_migrations (version) VALUES ('006_execution_safety') ON CONFLICT (version) DO NOTHING;

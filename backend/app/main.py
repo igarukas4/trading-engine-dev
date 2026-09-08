@@ -27,6 +27,7 @@ from .risk_calendar import (
     RiskLimitsStore,
 )
 from .signals import SignalStore
+from .execution import ExecutionError, ExecutionSubstrate
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ accounts = AccountRegistry()
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
+execution = ExecutionSubstrate()
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
@@ -209,6 +211,20 @@ class SignalEnrichmentRequest(BaseModel):
     volatility_multiple: Decimal | None = None
     policy_healthy: bool = True
     calendar_blackout: bool = False
+
+
+class OperatorActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+    confirmed: bool = False
+    signal_revision: int = Field(default=1, ge=1)
+
+
+class ExecuteSignalRequest(OperatorActionRequest):
+    order_payload: dict[str, Any] = Field(default_factory=dict)
+    risk_amount: Decimal = Decimal("0")
 
 
 def _account_error(error: AccountError) -> HTTPException:
@@ -600,6 +616,68 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
     limits = risk_limits.active(account_id)
     return signals.create_revision(signal_id, policy_version=policy_version,
                                    limits=limits).as_dict()
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", tags=["execution"])
+def approve_signal(account_id: str, signal_id: str, request: OperatorActionRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        signal = signals.get(signal_id)
+        if signal.account_id != account_id:
+            raise ValueError("SIGNAL_NOT_FOUND")
+        command = execution.approve_signal(
+            account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
+            reason=request.reason, confirmed=request.confirmed, signal_revision=signal.revision,
+            signal_eligible=(signal.as_dict()["status"] == "ELIGIBLE" and signal.revision == request.signal_revision),
+        )
+        if command.status == "REJECTED":
+            raise ExecutionError(command.rejection_code or "APPROVAL_REJECTED")
+        signal = signals.approve(signal_id, account_id=account_id, revision=request.signal_revision)
+    except (KeyError, ValueError, ExecutionError) as error:
+        code = getattr(error, "code", str(error))
+        raise HTTPException(status_code=409, detail={"code": code}) from error
+    return {"account_id": account_id, "signal": signal.as_dict(), "command": command.__dict__}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/execute", tags=["execution"])
+def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        signal = signals.get(signal_id)
+        if signal.account_id != account_id:
+            raise ValueError("SIGNAL_NOT_FOUND")
+        account = accounts.accounts[account_id]
+        result = execution.execute_signal(
+            account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
+            reason=request.reason, confirmed=request.confirmed, signal_revision=request.signal_revision,
+            risk_approved=signal.risk_assessment.approved, signal_fresh=signal.as_dict()["status"] == "APPROVED",
+            fence_safe=execution.account(account_id).exposure_gate == "OPEN",
+            account_state=account.bot_state, live_lock=account.connector_healthy and account.connector_bound,
+            execution_epoch=execution.account(account_id).execution_epoch,
+            order_payload=request.order_payload, risk_amount=str(request.risk_amount),
+        )
+    except (KeyError, ValueError, ExecutionError) as error:
+        code = getattr(error, "code", str(error))
+        raise HTTPException(status_code=409, detail={"code": code}) from error
+    return {"account_id": account_id, "order": result.order.__dict__, "status": result.order.status}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/emergency-stop", tags=["execution"])
+def emergency_stop(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    fence = execution.emergency_stop(account_id)
+    return {"account_id": account_id, "fence": fence.__dict__}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/close-all", tags=["execution"])
+def close_all(account_id: str, request: OperatorActionRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        command = execution.close_all(account_id=account_id, idempotency_key=request.idempotency_key,
+                                      reason=request.reason, confirmed=request.confirmed)
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    return {"account_id": account_id, "command": command.__dict__}
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/connector-binding", tags=["broker-accounts"])

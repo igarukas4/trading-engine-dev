@@ -134,6 +134,22 @@ class PreOrderResult:
     outbox_event: OutboxEvent
 
 
+@dataclass
+class OperatorCommand:
+    """An auditable, idempotent operator action tied to one account."""
+
+    id: str
+    account_id: str
+    signal_id: str | None
+    kind: Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
+    idempotency_key: str
+    reason: str
+    confirmed: bool
+    status: Literal["ACCEPTED", "REJECTED", "EXECUTED"]
+    rejection_code: str | None = None
+    order_id: str | None = None
+
+
 class ExecutionSubstrate:
     """In-memory reference implementation of the account-local transaction.
 
@@ -152,6 +168,9 @@ class ExecutionSubstrate:
         self.positions: dict[tuple[str, str], Position] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
         self._order_reservations: dict[str, str] = {}
+        self.commands: dict[str, OperatorCommand] = {}
+        self._command_keys: dict[tuple[str, str], str] = {}
+        self._approved_signals: dict[tuple[str, str], str] = {}
 
     def _lock_for(self, account_id: str) -> threading.RLock:
         return self._locks.setdefault(account_id, threading.RLock())
@@ -200,6 +219,93 @@ class ExecutionSubstrate:
             self.events[event.id] = event
             self._idempotency[(account_id, idempotency_key)] = (order.id, canonical_hash)
             return PreOrderResult(reservation, order, event)
+
+    def _command(
+        self, *, account_id: str, signal_id: str | None, kind: Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"],
+        idempotency_key: str, reason: str, confirmed: bool,
+    ) -> OperatorCommand:
+        if not reason.strip():
+            raise ExecutionError("OPERATOR_REASON_REQUIRED")
+        if not confirmed:
+            raise ExecutionError("OPERATOR_CONFIRMATION_REQUIRED")
+        prior_id = self._command_keys.get((account_id, idempotency_key))
+        if prior_id:
+            return self.commands[prior_id]
+        command = OperatorCommand(str(uuid4()), account_id, signal_id, kind,
+                                   idempotency_key, reason, confirmed, "ACCEPTED")
+        self.commands[command.id] = command
+        self._command_keys[(account_id, idempotency_key)] = command.id
+        return command
+
+    def approve_signal(
+        self, *, account_id: str, signal_id: str, idempotency_key: str,
+        reason: str, confirmed: bool, signal_revision: int,
+        signal_eligible: bool = True,
+    ) -> OperatorCommand:
+        """Approve only; approval never dispatches a broker side effect."""
+        with self._lock_for(account_id):
+            command = self._command(account_id=account_id, signal_id=signal_id,
+                                     kind="APPROVE_SIGNAL", idempotency_key=idempotency_key,
+                                     reason=reason, confirmed=confirmed)
+            if command.status != "ACCEPTED":
+                return command
+            if not signal_eligible:
+                command.status, command.rejection_code = "REJECTED", "SIGNAL_NOT_ELIGIBLE"
+                return command
+            self._approved_signals[(account_id, signal_id)] = command.id
+            command.reason = f"{reason} [revision:{signal_revision}]"
+            return command
+
+    def execute_signal(
+        self, *, account_id: str, signal_id: str, idempotency_key: str,
+        reason: str, confirmed: bool, signal_revision: int,
+        risk_approved: bool, signal_fresh: bool, fence_safe: bool,
+        account_state: str, live_lock: bool, execution_epoch: int,
+        order_payload: dict[str, Any], risk_amount: str = "0",
+    ) -> PreOrderResult:
+        """Execute an already approved Signal after every last-mile gate."""
+        with self._lock_for(account_id):
+            approval_id = self._approved_signals.get((account_id, signal_id))
+            if approval_id is None:
+                raise ExecutionError("SIGNAL_APPROVAL_REQUIRED")
+            if not all((risk_approved, signal_fresh, fence_safe, live_lock)):
+                raise ExecutionError("EXECUTION_GATE_UNSAFE")
+            if account_state != "RUNNING":
+                raise ExecutionError("ACCOUNT_STATE_UNSAFE")
+            if order_payload.get("signal_revision") not in (None, signal_revision):
+                raise ExecutionError("SIGNAL_REVISION_CHANGED")
+            if not order_payload.get("stop_loss") or not order_payload.get("take_profit"):
+                raise ExecutionError("NATIVE_PROTECTION_REQUIRED")
+            command = self._command(account_id=account_id, signal_id=signal_id,
+                                    kind="EXECUTE_SIGNAL", idempotency_key=idempotency_key,
+                                    reason=reason, confirmed=confirmed)
+            result = self.pre_order(account_id=account_id, signal_id=signal_id,
+                                    idempotency_key=idempotency_key,
+                                    canonical_hash=json.dumps(order_payload, sort_keys=True),
+                                    risk_approved=True, execution_epoch=execution_epoch,
+                                    order_payload=order_payload, risk_amount=risk_amount)
+            command.status, command.order_id = "EXECUTED", result.order.id
+            return result
+
+    def close_all(
+        self, *, account_id: str, idempotency_key: str, reason: str,
+        confirmed: bool, connector: Any | None = None,
+    ) -> OperatorCommand:
+        """Explicitly close positions; emergency stop itself never closes them."""
+        with self._lock_for(account_id):
+            command = self._command(account_id=account_id, signal_id=None, kind="CLOSE_ALL",
+                                    idempotency_key=idempotency_key, reason=reason,
+                                    confirmed=confirmed)
+            if command.status == "ACCEPTED" and connector is not None:
+                try:
+                    response = connector.close_all(account_id)
+                except Exception:
+                    response = None
+                if response is None or (isinstance(response, dict) and response.get("status") == "UNKNOWN"):
+                    command.rejection_code = "RECONCILIATION_PENDING"
+                else:
+                    command.status = "EXECUTED"
+            return command
 
     def outbox(self, account_id: str) -> list[OutboxEvent]:
         pending = (

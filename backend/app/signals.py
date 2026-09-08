@@ -167,6 +167,21 @@ class SignalStore:
     def get(self, signal_id: str) -> Signal:
         return self.signals[signal_id]
 
+    def approve(self, signal_id: str, *, account_id: str, revision: int) -> Signal:
+        signal = self.get(signal_id)
+        if signal.account_id != account_id:
+            raise ValueError("ACCOUNT_CONTEXT_MISMATCH")
+        if signal.revision != revision:
+            raise ValueError("SIGNAL_REVISION_CHANGED")
+        view = signal.as_dict()
+        if view["status"] == "APPROVED":
+            return signal
+        if view["status"] != "ELIGIBLE":
+            raise ValueError("SIGNAL_NOT_ELIGIBLE")
+        approved = replace(signal, status="APPROVED")
+        self.signals[signal_id] = approved
+        return approved
+
     def create_revision(self, signal_id: str, *, policy_version: int, created_at: datetime | None = None,
                         limits: RiskLimits | None = None) -> Signal:
         prior = self.get(signal_id)
