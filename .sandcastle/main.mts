@@ -125,7 +125,6 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   const plan = await sandcastle.run({
     hooks: authHooks,
     sandbox: sandboxProvider,
-    branchStrategy: { type: "merge-to-head" },
     name: "planner",
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
@@ -209,7 +208,13 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
         return implement;
       } finally {
-        await sandbox.close();
+        try {
+          await sandbox.close();
+        } catch (error) {
+          console.warn(
+            `Preserving ${issue.branch} worktree after cleanup failed: ${String(error)}`,
+          );
+        }
       }
     }),
   );
@@ -268,9 +273,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // uses to know which branches to merge and which issues to close.
   // -------------------------------------------------------------------------
   await sandcastle.run({
-    hooks,
+    hooks: authHooks,
     sandbox: sandboxProvider,
-    branchStrategy: { type: "merge-to-head" },
     name: "merger",
     maxIterations: 1,
     agent: codeAgent,
