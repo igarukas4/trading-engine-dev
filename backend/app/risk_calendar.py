@@ -210,14 +210,14 @@ class RiskEngine:
             reasons.append("ACCOUNT_STATE_UNSAFE")
         valid_until = assessed_at + timedelta(seconds=30) if not reasons else None
         return RiskAssessment(
-            account_id,
-            limits.version if limits else None,
-            not reasons,
-            tuple(dict.fromkeys(reasons)),
-            valid_until,
-            purpose,
-            signal_revision,
-            assessed_at,
+            broker_account_id=account_id,
+            risk_limits_version=limits.version if limits else None,
+            approved=not reasons,
+            reason_codes=tuple(dict.fromkeys(reasons)),
+            valid_until=valid_until,
+            purpose=purpose,
+            signal_revision=signal_revision,
+            assessed_at=assessed_at,
         )
 
 

@@ -460,6 +460,46 @@ def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> di
     return payload
 
 
+def _signals_for_account(account_id: str) -> list[dict[str, Any]]:
+    return [
+        signal.as_dict()
+        for signal in signals.signals.values()
+        if signal.account_id == account_id
+    ]
+
+
+def _signals_for_opportunity(account_id: str, opportunity_id: Any) -> list[dict[str, Any]]:
+    return [
+        signal.as_dict()
+        for signal in signals.signals.values()
+        if signal.account_id == account_id
+        and signal.opportunity.get("id") == opportunity_id
+    ]
+
+
+def _risk_kwargs(request: SignalEnrichmentRequest, account_state: str) -> dict[str, Any]:
+    excluded_fields = {
+        "opportunity_id",
+        "market_snapshot_id",
+        "policy_version",
+        "entry_zone",
+        "stop_loss",
+        "take_profit",
+        "ttl_seconds",
+        "policy_healthy",
+        "calendar_blackout",
+    }
+    risk_kwargs = request.model_dump(exclude=excluded_fields)
+    risk_kwargs.update(
+        {
+            "policy_healthy": request.policy_healthy,
+            "calendar_blackout": request.calendar_blackout,
+            "account_state": account_state,
+        }
+    )
+    return risk_kwargs
+
+
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
 def list_opportunities(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
@@ -468,8 +508,7 @@ def list_opportunities(account_id: str) -> dict[str, Any]:
         "opportunities": [
             {
                 **item,
-                "signals": [signal.as_dict() for signal in signals.signals.values()
-                            if signal.account_id == account_id and signal.opportunity.get("id") == item.get("id")],
+                "signals": _signals_for_opportunity(account_id, item.get("id")),
             }
             for item in opportunities.get(account_id, [])
         ],
@@ -488,13 +527,16 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
         raise HTTPException(status_code=404, detail="Opportunity not found")
     limits = risk_limits.active(account_id)
     account = accounts.accounts[account_id]
-    risk_kwargs = request.model_dump(exclude={"opportunity_id", "market_snapshot_id", "policy_version", "entry_zone", "stop_loss", "take_profit", "ttl_seconds", "policy_healthy", "calendar_blackout"})
-    risk_kwargs.update({"policy_healthy": request.policy_healthy, "calendar_blackout": request.calendar_blackout, "account_state": account.bot_state})
+    risk_kwargs = _risk_kwargs(request, account.bot_state)
     signal = signals.create(
-        account_id=account_id, opportunity=opportunity,
+        account_id=account_id,
+        opportunity=opportunity,
         market_snapshot_id=request.market_snapshot_id or opportunity.get("market_snapshot_id", ""),
-        policy_version=request.policy_version, ttl=timedelta(seconds=request.ttl_seconds),
-        entry_zone=request.entry_zone, stop_loss=request.stop_loss, take_profit=request.take_profit,
+        policy_version=request.policy_version,
+        ttl=timedelta(seconds=request.ttl_seconds),
+        entry_zone=request.entry_zone,
+        stop_loss=request.stop_loss,
+        take_profit=request.take_profit,
         limits=limits, risk_kwargs=risk_kwargs,
     )
     return signal.as_dict()
@@ -505,7 +547,7 @@ def list_signals(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return {
         "account_id": account_id,
-        "signals": [signal.as_dict() for signal in signals.signals.values() if signal.account_id == account_id],
+        "signals": _signals_for_account(account_id),
         "has_more": False,
     }
 
