@@ -4,22 +4,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TypedDict
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg import connect
-
-
-def _read_setting(name: str, default: str = "") -> str:
-    file_name = os.getenv(f"{name}_FILE")
-    if file_name:
-        try:
-            return Path(file_name).read_text(encoding="utf-8").strip()
-        except OSError:
-            return ""
-    return os.getenv(name, default)
 
 
 @dataclass(frozen=True)
@@ -36,6 +25,21 @@ class Settings:
             public_origin=os.getenv("PUBLIC_ORIGIN", cls.public_origin),
             database_url=os.getenv("DATABASE_URL", ""),
         )
+
+
+class ServiceStates(TypedDict):
+    api: str
+    database: str
+    connector: str
+
+
+class SystemStatus(TypedDict):
+    status: str
+    version: str
+    services: ServiceStates
+    execution_available: bool
+    trading_enabled: bool
+    message: str
 
 
 settings = Settings.from_environment()
@@ -62,7 +66,7 @@ def _database_state() -> str:
         return "unavailable"
 
 
-def _service_state() -> dict[str, str]:
+def _service_state() -> ServiceStates:
     """Return conservative status values; absence is never treated as healthy."""
 
     return {"api": "healthy", "database": _database_state(), "connector": "unavailable"}
@@ -79,7 +83,7 @@ def system_version() -> dict[str, str]:
 
 
 @app.get("/api/v1/system/status", tags=["system"])
-def system_status() -> dict[str, Any]:
+def system_status() -> SystemStatus:
     services = _service_state()
     return {
         "status": "healthy" if all(value == "healthy" for value in services.values()) else "degraded",
