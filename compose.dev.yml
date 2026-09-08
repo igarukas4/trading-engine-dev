@@ -1,0 +1,52 @@
+name: trading-engine-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: trading_engine
+      POSTGRES_USER: trading_engine
+      POSTGRES_PASSWORD: local-development-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading_engine -d trading_engine"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - dev_postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: local-development-only
+    volumes:
+      - ./backend/migrations:/migrations:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["for migration in /migrations/*.sql; do psql -h postgres -U trading_engine -d trading_engine -v ON_ERROR_STOP=1 -f \"$migration\"; done"]
+
+  backend:
+    build: ./backend
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_VERSION: 0.1.0
+      DATABASE_URL: postgresql://trading_engine:local-development-only@postgres:5432/trading_engine
+      PUBLIC_ORIGIN: http://localhost:3000
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+
+volumes:
+  dev_postgres_data:
