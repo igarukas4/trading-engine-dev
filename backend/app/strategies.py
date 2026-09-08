@@ -25,6 +25,7 @@ class StrategyConfig:
     strategy: str
     version: int = 1
     activation_status: Literal["DISABLED", "ACTIVE"] = "DISABLED"
+    session_policy: str = "ALL_BROKER_OPEN"
 
 
 @dataclass(frozen=True)
