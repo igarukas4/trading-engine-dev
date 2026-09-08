@@ -41,8 +41,8 @@ class EnrichmentPolicy:
     strategy_config_id: str
     broker_account_id: str = ""
     version: int = 1
-    source_rules: dict[str, Literal["REQUIRED", "ADVISORY", "DISABLED"]] = field(default_factory=lambda: {"calendar": "REQUIRED"})
-    freshness_ttl_seconds: dict[str, int] = field(default_factory=lambda: {"calendar": 3600})
+    source_rules: dict[str, Literal["REQUIRED", "ADVISORY", "DISABLED"]] = field(default_factory=lambda: {"calendar": "REQUIRED", "news": "DISABLED"})
+    freshness_ttl_seconds: dict[str, int] = field(default_factory=lambda: {"calendar": 3600, "news": 3600})
     required_currencies: tuple[str, ...] = ()
     event_kinds: tuple[str, ...] = ()
     blackout_before_minutes: int | None = None
@@ -50,6 +50,10 @@ class EnrichmentPolicy:
     reason: str = ""
 
     def __post_init__(self) -> None:
+        if any(value not in {"REQUIRED", "ADVISORY", "DISABLED"} for value in self.source_rules.values()):
+            raise ValueError("invalid enrichment source policy")
+        if any(value < 1 for value in self.freshness_ttl_seconds.values()):
+            raise ValueError("enrichment freshness TTL must be positive")
         if self.source_rules.get("calendar") == "REQUIRED" and (
             self.blackout_before_minutes is None or self.blackout_after_minutes is None
         ):

@@ -181,6 +181,8 @@ class EnrichmentPolicyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     required_currencies: tuple[str, ...] = ()
     event_kinds: tuple[str, ...] = ()
+    news_policy: Literal["REQUIRED", "ADVISORY", "DISABLED"] = "DISABLED"
+    news_freshness_seconds: int = Field(default=3600, ge=1)
     blackout_before_minutes: int = Field(ge=0)
     blackout_after_minutes: int = Field(ge=0)
     reason: str = Field(min_length=1, max_length=500)
@@ -211,6 +213,7 @@ class SignalEnrichmentRequest(BaseModel):
     volatility_multiple: Decimal | None = None
     policy_healthy: bool = True
     calendar_blackout: bool = False
+    context_revision: int = Field(default=0, ge=0)
 
 
 class OperatorActionRequest(BaseModel):
@@ -387,6 +390,8 @@ def create_enrichment_policy(account_id: str, config_id: str, request: Enrichmen
         strategy_config_id=config_id,
         broker_account_id=account_id,
         version=(prior.version + 1 if prior else 1),
+        source_rules={"calendar": "REQUIRED", "news": request.news_policy},
+        freshness_ttl_seconds={"calendar": 3600, "news": request.news_freshness_seconds},
         required_currencies=request.required_currencies,
         event_kinds=request.event_kinds,
         blackout_before_minutes=request.blackout_before_minutes,
@@ -585,6 +590,7 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
             stop_loss=request.stop_loss,
             take_profit=request.take_profit,
             limits=limits, risk_kwargs=risk_kwargs,
+            context_revision=request.context_revision,
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error

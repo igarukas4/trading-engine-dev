@@ -62,6 +62,7 @@ class Signal:
     reason_codes: tuple[str, ...]
     supersedes_signal_id: str | None = None
     risk_context: Any = field(default_factory=dict)
+    context_revision: int = 0
 
     def __post_init__(self) -> None:
         if self.account_id != self.opportunity.get("account_id"):
@@ -92,6 +93,7 @@ class Signal:
             "status": status,
             "reason_codes": list(reasons),
             "supersedes_signal_id": self.supersedes_signal_id,
+            "context_revision": self.context_revision,
             "risk_assessment": {
                 "approved": assessment.approved,
                 "purpose": assessment.purpose,
@@ -115,6 +117,7 @@ class SignalStore:
         entry_zone: dict[str, Any] | None = None, stop_loss: Decimal | str = "0",
         take_profit: tuple[Decimal | str, ...] = (), limits: RiskLimits | None = None,
         risk_kwargs: dict[str, Any] | None = None,
+        context_revision: int = 0,
     ) -> Signal:
         if opportunity.get("account_id") != account_id:
             raise ValueError("ACCOUNT_CONTEXT_MISMATCH")
@@ -159,6 +162,7 @@ class SignalStore:
             status="ELIGIBLE" if assessment.approved else "BLOCKED_RISK",
             reason_codes=assessment.reason_codes,
             risk_context=_freeze(deepcopy(risk_kwargs or {})),
+            context_revision=context_revision,
         )
         self.signals[signal.id] = signal
         self._latest_by_opportunity[str(opportunity.get("id") or opportunity.get("evaluation_key"))] = signal.id
@@ -183,7 +187,7 @@ class SignalStore:
         return approved
 
     def create_revision(self, signal_id: str, *, policy_version: int, created_at: datetime | None = None,
-                        limits: RiskLimits | None = None) -> Signal:
+                        limits: RiskLimits | None = None, context_revision: int | None = None) -> Signal:
         prior = self.get(signal_id)
         invalidated_reasons = tuple(
             dict.fromkeys((*prior.reason_codes, "SIGNAL_REVISION_SUPERSEDED"))
@@ -206,6 +210,7 @@ class SignalStore:
             take_profit=prior.take_profit,
             limits=limits,
             risk_kwargs=_thaw(prior.risk_context),
+            context_revision=prior.context_revision if context_revision is None else context_revision,
         )
         revised = replace(
             created,
