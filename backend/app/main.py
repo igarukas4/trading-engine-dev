@@ -28,6 +28,7 @@ from .risk_calendar import (
 )
 from .signals import SignalStore
 from .execution import ExecutionError, ExecutionSubstrate, GlobalEmergencyOperation
+from .dashboard import audit_hub, dashboard_hub
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,11 @@ safety = AccountSafety()
 activation_gate = ActivationGate()
 
 
+def _audit(account_id: str, event_type: str, reason: str = "", payload: dict[str, Any] | None = None) -> None:
+    audit_hub.record(account_id, event_type, reason, payload)
+    dashboard_hub.publish("account", account_id, event_type, payload or {})
+
+
 def _strategy_configs_for(account_id: str) -> tuple[StrategyConfig, ...]:
     return strategy_configs.setdefault(account_id, canonical_configs(account_id))
 
@@ -106,6 +112,7 @@ class GlobalEmergencyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     account_ids: tuple[str, ...] = Field(min_length=1)
     kind: Literal["STOP_ONLY", "CLOSE_ALL"] = "STOP_ONLY"
+    reason: str = Field(default="operator emergency", min_length=1, max_length=500)
 
 
 class ConnectorBindingRequest(BaseModel):
@@ -313,6 +320,104 @@ def system_status() -> SystemStatus:
     }
 
 
+@app.get("/api/v1/broker-accounts", tags=["broker-accounts"])
+def list_broker_accounts() -> dict[str, Any]:
+    """Return the authorized, non-secret account context for the dashboard."""
+    return {
+        "accounts": [
+            {
+                "id": account.id,
+                "display_name": account.display_name,
+                "environment": account.environment,
+                "lifecycle_status": account.lifecycle_status,
+                "bot_state": account.bot_state,
+                "execution_mode": account.execution_mode,
+                "version": account.version,
+            }
+            for account in accounts.accounts.values()
+            if account.lifecycle_status != "ARCHIVED"
+        ],
+        "has_more": False,
+    }
+
+
+def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
+    account = accounts.accounts[account_id]
+    stream_key = ("account", account_id)
+    return {
+        "account_id": account_id,
+        "account": accounts.read_only_snapshot(account_id),
+        "watchlist": [mapping.__dict__ for mapping in market_data.pairs.get(account_id, {}).values()],
+        "opportunities": sorted(opportunities.get(account_id, []), key=lambda item: item.get("created_at", ""), reverse=True),
+        "signals": _signals_for_account(account_id),
+        "orders": [order.__dict__ for order in execution.orders.values() if order.account_id == account_id],
+        "fills": [fill.__dict__ for fill in execution.fills.values() if fill.account_id == account_id],
+        "positions": [position.__dict__ for position in execution.positions.values() if position.account_id == account_id],
+        "audit_events": audit_hub.list(account_id, limit=50)["audit_events"],
+        "stream_watermark": dashboard_hub._sequences[stream_key],
+    }
+
+
+@app.get("/api/v1/dashboard-summary-snapshot", tags=["dashboard"])
+def dashboard_summary_snapshot() -> dict[str, Any]:
+    available = [account for account in accounts.accounts.values() if account.lifecycle_status != "ARCHIVED"]
+    return {
+        "accounts": [
+            {
+                "account_id": account.id, "display_name": account.display_name,
+                "environment": account.environment, "lifecycle_status": account.lifecycle_status,
+                "bot_state": account.bot_state, "execution_mode": account.execution_mode,
+                "open_positions": sum(1 for position in execution.positions.values() if position.account_id == account.id and position.stage != "CLOSED"),
+            }
+            for account in available
+        ],
+        "critical_alerts": [event for account_id in (account.id for account in available) for event in audit_hub.events.get(account_id, []) if event["event_type"].startswith("critical")],
+        "global_emergency": [_global_emergency_payload(operation) for operation in execution.global_emergencies.values()],
+        "account_watermarks": {account.id: dashboard_hub._sequences[("account", account.id)] for account in available},
+        "system_watermark": dashboard_hub._sequences[("system", None)],
+        "execution_available": False,
+        "cross_stream_total_order": False,
+    }
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/dashboard-snapshot", tags=["dashboard"])
+def dashboard_snapshot(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    return _account_dashboard_payload(account_id)
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/audit-events", tags=["audit"])
+def list_audit_events(account_id: str, limit: int = 50, cursor: int = 0) -> dict[str, Any]:
+    _require_account(account_id)
+    if not 1 <= limit <= 100 or cursor < 0:
+        raise HTTPException(status_code=422, detail="invalid audit pagination")
+    return audit_hub.list(account_id, limit, cursor)
+
+
+@app.get("/api/v1/commands/{command_id}", tags=["system"])
+def command_status(command_id: str) -> dict[str, Any]:
+    command = execution.commands.get(command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return {"command_id": command.id, "status": command.status, "command": command.__dict__}
+
+
+@app.websocket("/ws/v1/dashboard")
+async def dashboard_stream(websocket: WebSocket) -> None:
+    # snapshot.required is emitted per affected stream; healthy streams continue.
+    await websocket.accept()
+    try:
+        hello = await websocket.receive_json()
+        account_ids = {account.id for account in accounts.accounts.values() if account.lifecycle_status != "ARCHIVED"}
+        await websocket.send_json(dashboard_hub.connect(hello, account_ids=account_ids))
+        while True:
+            message = await websocket.receive_json()
+            if message.get("type") == "ack":
+                await websocket.send_json({"type": "acknowledged", "stream": message.get("stream"), "stream_sequence": message.get("stream_sequence")})
+    except (WebSocketDisconnect, ValueError, TypeError):
+        return
+
+
 @app.post("/api/v1/broker-accounts", status_code=status.HTTP_201_CREATED, tags=["broker-accounts"])
 def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any]:
     try:
@@ -320,6 +425,7 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
         strategy_configs[account.id] = canonical_configs(account.id)
     except AccountError as error:
         raise _account_error(error) from error
+    _audit(account.id, "broker_account.created", "account registered", {"display_name": account.display_name})
     return {
         "id": account.id,
         "provider": account.provider,
@@ -357,6 +463,7 @@ def _global_emergency_payload(
 def set_execution_mode(account_id: str, request: ExecutionModeRequest) -> dict[str, Any]:
     _require_account(account_id)
     account = accounts.set_execution_mode(account_id, request.mode)
+    _audit(account_id, "bot.mode.changed", "execution mode changed", {"execution_mode": account.execution_mode})
     return {
         "account_id": account_id,
         "execution_mode": account.execution_mode,
@@ -374,6 +481,23 @@ def begin_global_emergency(request: GlobalEmergencyRequest) -> dict[str, Any]:
         operation = execution.begin_global_emergency(list(request.account_ids), kind=request.kind)
     except ExecutionError as error:
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    dashboard_hub.publish("system", None, "global_emergency.operation.updated", _global_emergency_payload(operation, include_kind=True))
+    for account_id in operation.target_account_ids:
+        _audit(account_id, "emergency.operation.updated", request.reason, {"global_operation_id": operation.id, "kind": request.kind})
+    return _global_emergency_payload(operation, include_kind=True)
+
+
+@app.post("/api/v1/global-emergency", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
+def accept_global_emergency(request: GlobalEmergencyRequest) -> dict[str, Any]:
+    """Canonical dashboard command; completion is reported by the operation resource."""
+    return begin_global_emergency(request)
+
+
+@app.get("/api/v1/global-emergency-operations/{operation_id}", tags=["execution"])
+def global_emergency_operation(operation_id: str) -> dict[str, Any]:
+    operation = execution.global_emergencies.get(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Global emergency operation not found")
     return _global_emergency_payload(operation, include_kind=True)
 
 
