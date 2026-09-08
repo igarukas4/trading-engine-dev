@@ -89,9 +89,96 @@ print("ok")
   assert.match(output, /ok/);
 });
 
+test("protective position stages exits only on confirmed fills and preserves rounding residual", () => {
+  const output = run(`
+from backend.app.execution import ExecutionSubstrate, ExecutionError
+
+engine = ExecutionSubstrate()
+entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
+    risk_approved=True, execution_epoch=1,
+    order_payload={"symbol": "EURUSD", "volume": "0.38", "side": "BUY", "stop_loss": "1.09000", "take_profit": "1.11000"})
+engine.record_fill("a", entry.order.id, "deal-entry", "0.38", native_protection_confirmed=True)
+position = engine.position("a", entry.order.id)
+assert position.remaining_volume == "0.38"
+try:
+    engine.stage_exit("a", entry.order.id, "TP1")
+except ExecutionError as error:
+    assert error.code == "EXIT_FILL_NOT_CONFIRMED"
+else:
+    raise AssertionError("target crossing created an exit")
+engine.record_exit_fill("a", entry.order.id, "deal-tp1", "TP1", "0.15")
+assert engine.position("a", entry.order.id).stage == "TP1_CONFIRMED"
+engine.record_exit_fill("a", entry.order.id, "deal-tp2", "TP2", "0.10")
+position = engine.position("a", entry.order.id)
+assert position.stage == "TP2_CONFIRMED"
+assert position.remaining_volume == "0.13"
+assert position.runner_volume == "0.13"
+assert all(command.reduce_only for command in engine.position_commands)
+try:
+    engine.record_exit_fill("a", entry.order.id, "deal-too-much", "RUNNER", "0.14")
+except ExecutionError as error:
+    assert error.code == "REDUCTION_EXCEEDS_EXPOSURE"
+else:
+    raise AssertionError("reduction crossed zero")
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
 test("execution migration contains durable account-local safety records", () => {
   const migration = readFileSync("backend/migrations/006_execution_safety.sql", "utf8");
   for (const phrase of ["risk_reservations", "order_intents", "outbox_events", "connector_journal", "idempotency_key", "dispatch_sequence", "execution_epoch", "UNIQUE (broker_account_id, dispatch_sequence)"]) {
     assert.match(migration, new RegExp(phrase.replace(/[()]/g, "\\$&")));
   }
+});
+
+test("trailing is monotonic, closed-candle gated, and capability safe", () => {
+  const output = run(`
+from backend.app.execution import ExecutionSubstrate, ExecutionError
+
+engine = ExecutionSubstrate()
+entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
+    risk_approved=True, execution_epoch=1,
+    order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
+engine.record_fill("a", entry.order.id, "entry", "1", native_protection_confirmed=True)
+engine.record_exit_fill("a", entry.order.id, "tp1", "TP1", "0.4")
+engine.record_exit_fill("a", entry.order.id, "tp2", "TP2", "0.3")
+try:
+    engine.request_trailing("a", entry.order.id, "95", direction="LONG", closed_candle=False, atomic_capability=True)
+except ExecutionError as error:
+    assert error.code == "TRAIL_WAITING_FOR_CLOSED_CANDLE"
+else:
+    raise AssertionError("trailing used an open candle")
+assert engine.request_trailing("a", entry.order.id, "95", direction="LONG", closed_candle=True, atomic_capability=False) is None
+command = engine.request_trailing("a", entry.order.id, "96", direction="LONG", closed_candle=True, atomic_capability=True)
+engine.confirm_trailing("a", entry.order.id, command.id, "96")
+try:
+    engine.request_trailing("a", entry.order.id, "95", direction="LONG", closed_candle=True, atomic_capability=True)
+except ExecutionError as error:
+    assert error.code == "TRAIL_NOT_TIGHTER"
+else:
+    raise AssertionError("trailing loosened protection")
+engine.mark_position_command_unknown("a", command.id)
+assert engine.account("a").exposure_gate == "QUARANTINED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("partial entry fills accumulate in one account-scoped position", () => {
+  const output = run(`
+from backend.app.execution import ExecutionSubstrate
+
+engine = ExecutionSubstrate()
+entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
+    risk_approved=True, execution_epoch=1, order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
+engine.record_fill("a", entry.order.id, "deal-1", "0.4", native_protection_confirmed=True)
+engine.record_fill("a", entry.order.id, "deal-2", "0.6", native_protection_confirmed=True)
+position = engine.position("a", entry.order.id)
+assert position.volume == "1"
+assert position.remaining_volume == "1"
+assert position.protection_status == "CONFIRMED"
+print("ok")
+`);
+  assert.match(output, /ok/);
 });

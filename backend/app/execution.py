@@ -12,6 +12,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -110,6 +111,32 @@ class Position:
     order_id: str
     volume: str
     protection_status: Literal["CONFIRMED", "UNCONFIRMED", "QUARANTINED"]
+    remaining_volume: str | None = None
+    stage: Literal["ENTRY", "TP1_CONFIRMED", "TP2_CONFIRMED", "CLOSING", "CLOSED"] = "ENTRY"
+    runner_volume: str | None = None
+    native_stop_loss: str | None = None
+    native_take_profit: str | None = None
+    last_confirmed_stop: str | None = None
+    accounting_mode: Literal["NETTING", "HEDGING"] = "NETTING"
+    external_position_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.remaining_volume is None:
+            self.remaining_volume = self.volume
+
+
+@dataclass
+class PositionCommand:
+    id: str
+    account_id: str
+    order_id: str
+    command_type: Literal["TP1", "TP2", "TRAIL", "CLOSE"]
+    requested_volume: str | None
+    reduce_only: bool = True
+    status: Literal["RECEIVED", "CONFIRMED", "UNKNOWN", "REJECTED"] = "RECEIVED"
+    requested_stop: str | None = None
+    confirmed_stop: str | None = None
+    reason: str | None = None
 
 
 @dataclass
@@ -169,6 +196,7 @@ class ExecutionSubstrate:
         self.journal: dict[str, ConnectorJournalEntry] = {}
         self.fills: dict[str, Fill] = {}
         self.positions: dict[tuple[str, str], Position] = {}
+        self.position_commands: list[PositionCommand] = []
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
         self._order_reservations: dict[str, str] = {}
         self.commands: dict[str, OperatorCommand] = {}
@@ -468,6 +496,8 @@ class ExecutionSubstrate:
         volume: str,
         *,
         native_protection_confirmed: bool,
+        external_position_id: str | None = None,
+        accounting_mode: Literal["NETTING", "HEDGING"] = "NETTING",
     ) -> Fill:
         with self._lock_for(account_id):
             order = self.orders.get(order_id)
@@ -494,13 +524,150 @@ class ExecutionSubstrate:
             self.fills[fill.id] = fill
             order.status = "FILLED"
             self._reservation_for(order_id).status = "CONSUMED"
-            protection = "CONFIRMED" if native_protection_confirmed else "UNCONFIRMED"
-            self.positions[(account_id, order_id)] = Position(account_id, order_id, str(volume), protection)
+            payload = order.payload
+            position = self.positions.get((account_id, order_id))
+            if position is None:
+                protection = "CONFIRMED" if native_protection_confirmed else "UNCONFIRMED"
+                position = Position(
+                    account_id, order_id, str(volume), protection,
+                    native_stop_loss=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
+                    native_take_profit=str(payload.get("take_profit")) if payload.get("take_profit") is not None else None,
+                    last_confirmed_stop=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
+                    accounting_mode=accounting_mode,
+                    external_position_id=external_position_id,
+                )
+                self.positions[(account_id, order_id)] = position
+            else:
+                total = self._volume(position.volume) + self._volume(volume)
+                position.volume = self._decimal_string(total)
+                position.remaining_volume = self._decimal_string(
+                    self._volume(position.remaining_volume or "0") + self._volume(volume)
+                )
+                if not native_protection_confirmed:
+                    position.protection_status = "UNCONFIRMED"
             if not native_protection_confirmed:
                 self.account(account_id).exposure_gate = "QUARANTINED"
                 self.install_fence(account_id, "SAFETY_FENCE")
-                self.positions[(account_id, order_id)].protection_status = "UNCONFIRMED"
+                position.protection_status = "UNCONFIRMED"
             return fill
+
+    def stage_exit(self, account_id: str, order_id: str, stage: str) -> None:
+        """Reject price-crossing or unconfirmed exit stages; fills own progression."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            if stage in {"TP1", "TP2"}:
+                raise ExecutionError("EXIT_FILL_NOT_CONFIRMED")
+            if stage not in {"CLOSE", "RUNNER"} or position.stage != "TP2_CONFIRMED":
+                raise ExecutionError("EXIT_STAGE_NOT_READY")
+
+    @staticmethod
+    def _volume(value: str | Decimal) -> Decimal:
+        return Decimal(str(value))
+
+    @staticmethod
+    def _decimal_string(value: Decimal) -> str:
+        return format(value.normalize(), "f")
+
+    def record_exit_fill(
+        self, account_id: str, order_id: str, external_deal_id: str,
+        stage: Literal["TP1", "TP2", "RUNNER", "CLOSE"], volume: str,
+    ) -> PositionCommand:
+        """Project a confirmed reduce-only broker fill onto the Position."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            existing_fill = next((fill for fill in self.fills.values()
+                                  if fill.account_id == account_id and fill.external_deal_id == external_deal_id), None)
+            if existing_fill is not None:
+                return next(command for command in self.position_commands
+                            if command.account_id == account_id and command.reason == external_deal_id)
+            requested = self._volume(volume)
+            remaining = self._volume(position.remaining_volume or position.volume)
+            if requested <= 0 or requested > remaining:
+                raise ExecutionError("REDUCTION_EXCEEDS_EXPOSURE")
+            if stage == "TP1" and position.stage != "ENTRY":
+                raise ExecutionError("EXIT_STAGE_ALREADY_CONFIRMED")
+            if stage == "TP2" and position.stage != "TP1_CONFIRMED":
+                raise ExecutionError("EXIT_STAGE_NOT_READY")
+            if stage == "RUNNER" and position.stage != "TP2_CONFIRMED":
+                raise ExecutionError("EXIT_STAGE_NOT_READY")
+            fill = Fill(str(uuid4()), account_id, order_id, external_deal_id, str(volume), True)
+            self.fills[fill.id] = fill
+            command = PositionCommand(str(uuid4()), account_id, order_id, stage, str(volume), reason=external_deal_id)
+            command.status = "CONFIRMED"
+            self.position_commands.append(command)
+            position.remaining_volume = self._decimal_string(remaining - requested)
+            if stage == "TP1":
+                position.stage = "TP1_CONFIRMED"
+            elif stage == "TP2":
+                position.stage = "TP2_CONFIRMED"
+                initial = self._volume(position.volume)
+                position.runner_volume = self._decimal_string(initial - self._volume(volume) - sum(
+                    (self._volume(c.requested_volume or "0") for c in self.position_commands
+                     if c.order_id == order_id and c.command_type == "TP1"), Decimal("0")
+                ))
+            elif position.remaining_volume == "0":
+                position.stage = "CLOSED"
+            return command
+
+    def request_trailing(
+        self, account_id: str, order_id: str, stop: str, *, direction: Literal["LONG", "SHORT"],
+        closed_candle: bool, atomic_capability: bool,
+    ) -> PositionCommand | None:
+        """Create only capability-safe monotonic trailing commands."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            if position.stage != "TP2_CONFIRMED":
+                raise ExecutionError("TRAILING_NOT_READY")
+            if not closed_candle:
+                raise ExecutionError("TRAIL_WAITING_FOR_CLOSED_CANDLE")
+            if not atomic_capability:
+                position.last_confirmed_stop = position.last_confirmed_stop or position.native_stop_loss
+                return None
+            candidate = self._volume(stop)
+            prior = self._volume(position.last_confirmed_stop or position.native_stop_loss or stop)
+            if (direction == "LONG" and candidate <= prior) or (direction == "SHORT" and candidate >= prior):
+                raise ExecutionError("TRAIL_NOT_TIGHTER")
+            command = PositionCommand(str(uuid4()), account_id, order_id, "TRAIL", None, requested_stop=stop)
+            self.position_commands.append(command)
+            return command
+
+    def confirm_trailing(self, account_id: str, order_id: str, command_id: str, stop: str) -> PositionCommand:
+        with self._lock_for(account_id):
+            command = next((item for item in self.position_commands if item.id == command_id), None)
+            if command is None or command.account_id != account_id or command.order_id != order_id:
+                raise ExecutionError("POSITION_COMMAND_NOT_FOUND")
+            command.status = "CONFIRMED"
+            command.confirmed_stop = stop
+            self.position(account_id, order_id).last_confirmed_stop = stop
+            return command
+
+    def mark_protection_unknown(self, account_id: str, order_id: str) -> Position:
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            position.protection_status = "QUARANTINED"
+            self.account(account_id).exposure_gate = "QUARANTINED"
+            self.install_fence(account_id, "PROTECTION_RECONCILIATION")
+            return position
+
+    def mark_position_command_unknown(self, account_id: str, command_id: str) -> PositionCommand:
+        with self._lock_for(account_id):
+            command = next((item for item in self.position_commands if item.id == command_id), None)
+            if command is None or command.account_id != account_id:
+                raise ExecutionError("POSITION_COMMAND_NOT_FOUND")
+            command.status = "UNKNOWN"
+            self.mark_protection_unknown(account_id, command.order_id)
+            return command
+
+    def connector_disconnected(self, account_id: str, order_id: str) -> Position:
+        """Fence new exposure on loss of connector while retaining broker-native safety."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            if position.protection_status != "CONFIRMED":
+                position.protection_status = "QUARANTINED"
+                self.account(account_id).exposure_gate = "QUARANTINED"
+            else:
+                self.install_fence(account_id, "CONNECTOR_DISCONNECTED")
+            return position
 
     def confirm_protection(self, account_id: str, order_id: str) -> Position:
         """Confirm broker-native SL/TP before releasing a protection quarantine."""
