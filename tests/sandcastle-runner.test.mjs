@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -8,7 +9,20 @@ const supervisor = readFileSync(".sandcastle/run-supervisor.ps1", "utf8");
 
 test("Sandcastle only plans ready agent tickets serially", () => {
   assert.match(planner, /--label ready-for-agent/);
-  assert.match(main, /plan\.output\.issues\.slice\(0, 1\)/);
+  assert.match(main, /const issues = nextIssue \? \[nextIssue\] : \[\]/);
+});
+
+test("closed blockers do not prevent the next ready issue", () => {
+  const program = `
+    import assert from "node:assert/strict";
+    import { selectNextUnblockedIssue } from "./.sandcastle/issue-selection.mts";
+    const issue = selectNextUnblockedIssue([
+      { number: 29, title: "T3", body: "## Blocked by\\n\\n- [T2](https://github.com/example/repo/issues/28)" },
+      { number: 30, title: "T4", body: "## Blocked by\\n\\n- [T3](https://github.com/example/repo/issues/29)" },
+    ]);
+    assert.equal(issue?.number, 29);
+  `;
+  execFileSync("node", ["--import", "tsx", "--input-type=module", "--eval", program]);
 });
 
 test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {

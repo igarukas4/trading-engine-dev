@@ -23,9 +23,15 @@
 
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { promisify } from "node:util";
 import type { SandboxRunResult } from "@ai-hero/sandcastle";
 import { z } from "zod";
+import {
+  selectNextUnblockedIssue,
+  type ReadyIssue,
+} from "./issue-selection.mts";
 
 if (existsSync(".sandcastle/.env")) {
   process.loadEnvFile(".sandcastle/.env");
@@ -38,21 +44,47 @@ if (!ghToken) {
 
 const sandboxEnv = { GH_TOKEN: ghToken, CODEX_HOME: "/tmp/codex" };
 
-// The planner emits its plan as JSON inside <plan> tags; Output.object extracts
-// and validates it against this schema. We use Zod here, but any Standard
-// Schema validator works just as well — Valibot, ArkType, etc. See
-// https://standardschema.dev.
 const planSchema = z.object({
   issues: z.array(
     z.object({ id: z.string(), title: z.string(), branch: z.string() }),
   ),
 });
 
+// The planner emits its plan as JSON inside <plan> tags; Output.object extracts
+// and validates it against this schema. We use Zod here, but any Standard
+// Schema validator works just as well — Valibot, ArkType, etc. See
+// https://standardschema.dev.
 type PlannedIssue = {
   id: string;
   title: string;
   branch: string;
 };
+
+const execFileAsync = promisify(execFile);
+
+async function nextUnblockedIssue(): Promise<PlannedIssue | undefined> {
+  const { stdout } = await execFileAsync("gh", [
+    "issue",
+    "list",
+    "--state",
+    "open",
+    "--label",
+    "ready-for-agent",
+    "--limit",
+    "100",
+    "--json",
+    "number,title,body",
+  ]);
+  const issue = selectNextUnblockedIssue(JSON.parse(stdout) as ReadyIssue[]);
+
+  return issue
+    ? {
+        id: String(issue.number),
+        title: issue.title,
+        branch: `sandcastle/issue-${issue.number}`,
+      }
+    : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -139,7 +171,8 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   // Enforce the rate-limit budget even if a planner response exceeds its
   // one-issue instruction.
-  const issues = plan.output.issues.slice(0, 1) as PlannedIssue[];
+  const nextIssue = await nextUnblockedIssue();
+  const issues = nextIssue ? [nextIssue] : [];
 
   if (issues.length === 0) {
     // No unblocked work — either everything is done or everything is blocked.
