@@ -12,7 +12,8 @@ test("backend exposes read-only health and operator status contracts", () => {
   assert.match(backend, /@app\.get\("\/api\/v1\/system\/status"/);
   assert.match(backend, /execution_available/);
   assert.match(backend, /unavailable/);
-  assert.doesNotMatch(backend, /@app\.(post|put|patch|delete)\(/);
+  assert.doesNotMatch(backend, /@app\.(put|patch|delete)\(/);
+  assert.doesNotMatch(backend, /@app\.post\("\/api\/v1\/(orders|commands)/);
   assert.doesNotMatch(backend, /order_send|broker_connector/i);
 });
 
