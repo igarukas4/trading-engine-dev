@@ -30,7 +30,9 @@ for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
     exit 0
   }
 
-  if ($exitCode -ne 75 -or $attempt -eq $MaxRetries) {
+  $rateLimited = Select-String -LiteralPath $logPath -Pattern 'rate[ -]?limit|rate_limit|\b429\b|quota' -CaseSensitive:$false -Quiet
+  $retryable = $exitCode -eq 75 -or $rateLimited
+  if (-not $retryable -or $attempt -eq $MaxRetries) {
     Write-Error "Sandcastle needs attention (exit $exitCode). See $logPath"
     exit $exitCode
   }

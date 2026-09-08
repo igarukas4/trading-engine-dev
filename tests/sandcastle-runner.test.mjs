@@ -4,6 +4,7 @@ import test from "node:test";
 
 const main = readFileSync(".sandcastle/main.mts", "utf8");
 const planner = readFileSync(".sandcastle/plan-prompt.md", "utf8");
+const supervisor = readFileSync(".sandcastle/run-supervisor.ps1", "utf8");
 
 test("Sandcastle only plans ready agent tickets serially", () => {
   assert.match(planner, /--label ready-for-agent/);
@@ -17,4 +18,10 @@ test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {
 
 test("Sandcastle uses the approved Codex model and effort", () => {
   assert.match(main, /codex\("gpt-5\.6-luna", \{ effort: "medium" \}\)/);
+});
+
+test("supervisor retries detected rate limits with bounded backoff", () => {
+  assert.match(supervisor, /MaxRetries = 12/);
+  assert.match(supervisor, /rate\[ -\]\?limit\|rate_limit/);
+  assert.match(supervisor, /\$delayMinutes \* 2/);
 });
