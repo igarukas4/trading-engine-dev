@@ -216,11 +216,27 @@ def _require_account(account_id: str) -> None:
 def ingest_closed_m1(account_id: str, request: CandleIngestRequest) -> dict[str, Any]:
     _require_account(account_id)
     try:
-        candle = market_data.ingest_candle(account_id, Candle(account_id, request.pair, "M1", request.open_time, request.close_time,
-            request.open, request.high, request.low, request.close, request.tick_volume, request.real_volume,
-            request.spread, request.source_revision, request.is_closed))
+        candle = market_data.ingest_candle(
+            account_id,
+            Candle(
+                account_id=account_id,
+                pair=request.pair,
+                timeframe="M1",
+                open_time=request.open_time,
+                close_time=request.close_time,
+                open=request.open,
+                high=request.high,
+                low=request.low,
+                close=request.close,
+                tick_volume=request.tick_volume,
+                real_volume=request.real_volume,
+                spread=request.spread,
+                source_revision=request.source_revision,
+                is_closed=request.is_closed,
+            ),
+        )
     except AccountError as error:
-        raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from error
+        raise _account_error(error) from error
     return {"account_id": account_id, "pair": candle.pair, "timeframe": candle.timeframe, "accepted": True}
 
 
@@ -235,9 +251,12 @@ def market_pairs(account_id: str) -> dict[str, Any]:
 def register_pair_mapping(account_id: str, request: PairMappingRequest) -> dict[str, Any]:
     _require_account(account_id)
     try:
-        mapping = market_data.register_pair(account_id, PairMapping(account_id, **request.model_dump()))
+        mapping = market_data.register_pair(
+            account_id,
+            PairMapping(account_id=account_id, **request.model_dump()),
+        )
     except AccountError as error:
-        raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from error
+        raise _account_error(error) from error
     return mapping.__dict__
 
 
