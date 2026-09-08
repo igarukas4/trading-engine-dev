@@ -5,15 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from types import MappingProxyType
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 from uuid import uuid4
 from xml.etree import ElementTree
 
 
 NewsPolicy = Literal["REQUIRED", "ADVISORY", "DISABLED"]
+NewsProvider = Literal["GOOGLE_NEWS", "INVESTING"]
+DirectionalBias = Literal["bullish", "bearish", "neutral"]
+
+_DIRECTIONAL_BIASES = {"bullish", "bearish", "neutral"}
 
 
 def _utc(value: datetime) -> datetime:
@@ -23,13 +26,13 @@ def _utc(value: datetime) -> datetime:
 @dataclass(frozen=True)
 class NewsEvent:
     id: str
-    provider: Literal["GOOGLE_NEWS", "INVESTING"]
+    provider: NewsProvider
     external_id: str
     source_url: str
     headline: str
     published_at: datetime
     observed_at: datetime
-    raw_payload: MappingProxyType | dict[str, Any]
+    raw_payload: Mapping[str, Any]
     content_hash: str = ""
 
     def __post_init__(self) -> None:
@@ -43,7 +46,7 @@ class NewsEvent:
 class NewsFeedIngestor:
     """Parse RSS while retaining the complete source document as provenance."""
 
-    def __init__(self, provider: Literal["GOOGLE_NEWS", "INVESTING"], feed_url: str = "") -> None:
+    def __init__(self, provider: NewsProvider, feed_url: str = "") -> None:
         self.provider = provider
         self.feed_url = feed_url
 
@@ -51,21 +54,38 @@ class NewsFeedIngestor:
         root = ElementTree.fromstring(xml)
         events: list[NewsEvent] = []
         for item in root.findall(".//item"):
-            def value(name: str) -> str:
-                node = item.find(name)
-                return (node.text or "").strip() if node is not None else ""
-
-            published = value("pubDate")
+            published = self._value(item, "pubDate")
             published_at = parsedate_to_datetime(published) if published else observed_at
             published_at = _utc(published_at)
-            external_id = value("guid") or value("link") or hashlib.sha256(value("title").encode()).hexdigest()
-            events.append(NewsEvent(
-                id=f"news-event-{uuid4()}", provider=self.provider, external_id=external_id,
-                source_url=value("link") or self.feed_url, headline=value("title"),
-                published_at=published_at, observed_at=_utc(observed_at),
-                raw_payload={"xml": xml, "item": {"guid": external_id, "title": value("title"), "link": value("link"), "description": value("description"), "pubDate": published}},
-            ))
+            guid = self._value(item, "guid")
+            link = self._value(item, "link")
+            title = self._value(item, "title")
+            external_id = guid or link or hashlib.sha256(title.encode()).hexdigest()
+            item_payload = {
+                "guid": external_id,
+                "title": title,
+                "link": link,
+                "description": self._value(item, "description"),
+                "pubDate": published,
+            }
+            events.append(
+                NewsEvent(
+                    id=f"news-event-{uuid4()}",
+                    provider=self.provider,
+                    external_id=external_id,
+                    source_url=link or self.feed_url,
+                    headline=title,
+                    published_at=published_at,
+                    observed_at=_utc(observed_at),
+                    raw_payload={"xml": xml, "item": item_payload},
+                )
+            )
         return events
+
+    @staticmethod
+    def _value(item: ElementTree.Element, name: str) -> str:
+        node = item.find(name)
+        return (node.text or "").strip() if node is not None else ""
 
 
 @dataclass(frozen=True)
@@ -74,7 +94,7 @@ class NewsAnalysis:
     news_event_id: str
     canonical_pair_codes: tuple[str, ...]
     currencies: tuple[str, ...]
-    directional_bias: Literal["bullish", "bearish", "neutral"]
+    directional_bias: DirectionalBias
     sentiment: str
     severity: str
     confidence: float
@@ -94,7 +114,13 @@ class NewsAnalyzer:
     def __init__(self, *, confidence_threshold: float = 0.65) -> None:
         self.confidence_threshold = confidence_threshold
 
-    def analyze(self, event: NewsEvent, *, extractor: Callable[[NewsEvent], dict[str, Any]], analyzer: Callable[[NewsEvent], dict[str, Any]] | None = None) -> NewsAnalysis:
+    def analyze(
+        self,
+        event: NewsEvent,
+        *,
+        extractor: Callable[[NewsEvent], dict[str, Any]],
+        analyzer: Callable[[NewsEvent], dict[str, Any]] | None = None,
+    ) -> NewsAnalysis:
         payload = extractor(event)
         confidence = float(payload.get("confidence", 0))
         conflict = bool(payload.get("conflict", False))
@@ -102,12 +128,21 @@ class NewsAnalyzer:
         if (confidence < self.confidence_threshold or conflict) and analyzer is not None:
             payload = analyzer(event)
             escalated = True
-        required = ("canonical_pair_codes", "currencies", "directional_bias", "sentiment", "severity", "trade_impact", "reason", "expires_at")
+        required = (
+            "canonical_pair_codes",
+            "currencies",
+            "directional_bias",
+            "sentiment",
+            "severity",
+            "trade_impact",
+            "reason",
+            "expires_at",
+        )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError("NEWS_STRUCTURED_OUTPUT_INCOMPLETE")
         bias = payload["directional_bias"]
-        if bias not in {"bullish", "bearish", "neutral"}:
+        if bias not in _DIRECTIONAL_BIASES:
             raise ValueError("NEWS_DIRECTIONAL_BIAS_INVALID")
         return NewsAnalysis(
             id=f"news-analysis-{uuid4()}", news_event_id=event.id,
@@ -155,10 +190,24 @@ class NewsContextStore:
     @staticmethod
     def _policy(policy: Any) -> tuple[NewsPolicy, int, int]:
         if isinstance(policy, dict):
-            return policy.get("news", "DISABLED"), int(policy.get("version", 1)), int(policy.get("news_freshness_seconds", 3600))
-        return policy.source_rules.get("news", "DISABLED"), policy.version, policy.freshness_ttl_seconds.get("news", 3600)
+            mode = policy.get("news", "DISABLED")
+            version = int(policy.get("version", 1))
+            ttl = int(policy.get("news_freshness_seconds", 3600))
+        else:
+            mode = policy.source_rules.get("news", "DISABLED")
+            version = policy.version
+            ttl = policy.freshness_ttl_seconds.get("news", 3600)
+        return mode, version, ttl
 
-    def apply(self, analysis_id: str, *, account_id: str, pair_mappings: dict[str, Any], policy: Any, now: datetime) -> ContextProjection:
+    def apply(
+        self,
+        analysis_id: str,
+        *,
+        account_id: str,
+        pair_mappings: dict[str, Any],
+        policy: Any,
+        now: datetime,
+    ) -> ContextProjection:
         mode, policy_version, ttl = self._policy(policy)
         revision = self._revisions.get(account_id, 0) + 1
         self._revisions[account_id] = revision
@@ -172,32 +221,67 @@ class NewsContextStore:
             status, reason = "ADVISORY_UNAVAILABLE", "NEWS_ANALYSIS_MISSING"
             if mode == "REQUIRED":
                 raise ValueError("REQUIRED_NEWS_UNAVAILABLE")
-        elif _utc(now) >= analysis.expires_at or (_utc(now) - analysis.created_at).total_seconds() > ttl:
+        elif self._is_stale(analysis, now, ttl):
             status, reason = "ADVISORY_UNAVAILABLE", "NEWS_ANALYSIS_STALE"
             if mode == "REQUIRED":
                 raise ValueError("REQUIRED_NEWS_STALE")
         else:
-            for code in analysis.canonical_pair_codes:
-                mapping = pair_mappings.get(code)
-                if mapping:
-                    if hasattr(mapping, "account_id") and mapping.account_id != account_id:
-                        raise ValueError("ACCOUNT_CONTEXT_MISMATCH")
-                    if isinstance(mapping, tuple):
-                        pair_id, mapping_version = mapping
-                    else:
-                        pair_id = getattr(mapping, "pair_id", getattr(mapping, "id", None))
-                        mapping_version = getattr(mapping, "mapping_version", getattr(mapping, "version", 1))
-                    break
+            pair_id, mapping_version = self._resolve_mapping(
+                analysis, account_id, pair_mappings
+            )
             if pair_id is None:
                 status, reason = "ADVISORY_UNAVAILABLE", "NEWS_PAIR_MAPPING_MISSING"
                 if mode == "REQUIRED":
                     raise ValueError("REQUIRED_NEWS_UNAVAILABLE")
-        projection = ContextProjection(f"context-{uuid4()}", account_id, pair_id, analysis_id if analysis else None, mapping_version, policy_version, revision, status, reason, _utc(now))
+        projection = ContextProjection(
+            id=f"context-{uuid4()}",
+            account_id=account_id,
+            pair_id=pair_id,
+            news_analysis_id=analysis_id if analysis else None,
+            mapping_version=mapping_version,
+            policy_version=policy_version,
+            context_revision=revision,
+            status=status,
+            audit_reason=reason,
+            created_at=_utc(now),
+        )
         self.projections[projection.id] = projection
         return projection
 
     @staticmethod
-    def revise_signal(signal_store: Any, signal_id: str, *, account_id: str, context_revision: int, policy_version: int, limits: Any) -> Any:
+    def _is_stale(analysis: NewsAnalysis, now: datetime, ttl: int) -> bool:
+        current = _utc(now)
+        return current >= analysis.expires_at or (current - analysis.created_at).total_seconds() > ttl
+
+    @staticmethod
+    def _resolve_mapping(
+        analysis: NewsAnalysis,
+        account_id: str,
+        pair_mappings: dict[str, Any],
+    ) -> tuple[str | None, int | None]:
+        for code in analysis.canonical_pair_codes:
+            mapping = pair_mappings.get(code)
+            if not mapping:
+                continue
+            if hasattr(mapping, "account_id") and mapping.account_id != account_id:
+                raise ValueError("ACCOUNT_CONTEXT_MISMATCH")
+            if isinstance(mapping, tuple):
+                return mapping
+            pair_id = getattr(mapping, "pair_id", getattr(mapping, "id", None))
+            version = getattr(mapping, "mapping_version", getattr(mapping, "version", 1))
+            return pair_id, version
+        return None, None
+
+    @staticmethod
+    def revise_signal(
+        signal_store: Any,
+        signal_id: str,
+        *,
+        account_id: str,
+        context_revision: int,
+        policy_version: int,
+        limits: Any,
+    ) -> Any:
         signal = signal_store.get(signal_id)
         if signal.account_id != account_id:
             raise ValueError("ACCOUNT_CONTEXT_MISMATCH")
