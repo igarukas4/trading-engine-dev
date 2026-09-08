@@ -390,6 +390,19 @@ class ExecutionSubstrate:
     def _event_for(self, order_id: str) -> OutboxEvent:
         return next(event for event in self.events.values() if event.order_id == order_id)
 
+    def _fill_for_deal(
+        self, account_id: str, external_deal_id: str
+    ) -> Fill | None:
+        return next(
+            (
+                fill
+                for fill in self.fills.values()
+                if fill.account_id == account_id
+                and fill.external_deal_id == external_deal_id
+            ),
+            None,
+        )
+
     def _reject_dispatch(
         self,
         event: OutboxEvent,
@@ -503,14 +516,7 @@ class ExecutionSubstrate:
             order = self.orders.get(order_id)
             if order is None or order.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            existing_fill = next(
-                (
-                    fill
-                    for fill in self.fills.values()
-                    if fill.external_deal_id == external_deal_id
-                ),
-                None,
-            )
+            existing_fill = self._fill_for_deal(account_id, external_deal_id)
             if existing_fill is not None:
                 return existing_fill
             fill = Fill(
@@ -538,10 +544,11 @@ class ExecutionSubstrate:
                 )
                 self.positions[(account_id, order_id)] = position
             else:
-                total = self._volume(position.volume) + self._volume(volume)
+                total = self._decimal(position.volume) + self._decimal(volume)
                 position.volume = self._decimal_string(total)
                 position.remaining_volume = self._decimal_string(
-                    self._volume(position.remaining_volume or "0") + self._volume(volume)
+                    self._decimal(position.remaining_volume or "0")
+                    + self._decimal(volume)
                 )
                 if not native_protection_confirmed:
                     position.protection_status = "UNCONFIRMED"
@@ -551,7 +558,12 @@ class ExecutionSubstrate:
                 position.protection_status = "UNCONFIRMED"
             return fill
 
-    def stage_exit(self, account_id: str, order_id: str, stage: str) -> None:
+    def stage_exit(
+        self,
+        account_id: str,
+        order_id: str,
+        stage: Literal["TP1", "TP2", "RUNNER", "CLOSE"],
+    ) -> None:
         """Reject price-crossing or unconfirmed exit stages; fills own progression."""
         with self._lock_for(account_id):
             position = self.position(account_id, order_id)
@@ -561,7 +573,7 @@ class ExecutionSubstrate:
                 raise ExecutionError("EXIT_STAGE_NOT_READY")
 
     @staticmethod
-    def _volume(value: str | Decimal) -> Decimal:
+    def _decimal(value: str | Decimal) -> Decimal:
         return Decimal(str(value))
 
     @staticmethod
@@ -575,13 +587,17 @@ class ExecutionSubstrate:
         """Project a confirmed reduce-only broker fill onto the Position."""
         with self._lock_for(account_id):
             position = self.position(account_id, order_id)
-            existing_fill = next((fill for fill in self.fills.values()
-                                  if fill.account_id == account_id and fill.external_deal_id == external_deal_id), None)
+            existing_fill = self._fill_for_deal(account_id, external_deal_id)
             if existing_fill is not None:
-                return next(command for command in self.position_commands
-                            if command.account_id == account_id and command.reason == external_deal_id)
-            requested = self._volume(volume)
-            remaining = self._volume(position.remaining_volume or position.volume)
+                return next(
+                    command
+                    for command in self.position_commands
+                    if command.account_id == account_id
+                    and command.order_id == order_id
+                    and command.reason == external_deal_id
+                )
+            requested = self._decimal(volume)
+            remaining = self._decimal(position.remaining_volume or position.volume)
             if requested <= 0 or requested > remaining:
                 raise ExecutionError("REDUCTION_EXCEEDS_EXPOSURE")
             if stage == "TP1" and position.stage != "ENTRY":
@@ -600,11 +616,20 @@ class ExecutionSubstrate:
                 position.stage = "TP1_CONFIRMED"
             elif stage == "TP2":
                 position.stage = "TP2_CONFIRMED"
-                initial = self._volume(position.volume)
-                position.runner_volume = self._decimal_string(initial - self._volume(volume) - sum(
-                    (self._volume(c.requested_volume or "0") for c in self.position_commands
-                     if c.order_id == order_id and c.command_type == "TP1"), Decimal("0")
-                ))
+                initial = self._decimal(position.volume)
+                tp1_volume = sum(
+                    (
+                        self._decimal(command.requested_volume or "0")
+                        for command in self.position_commands
+                        if command.account_id == account_id
+                        and command.order_id == order_id
+                        and command.command_type == "TP1"
+                    ),
+                    Decimal("0"),
+                )
+                position.runner_volume = self._decimal_string(
+                    initial - self._decimal(volume) - tp1_volume
+                )
             elif position.remaining_volume == "0":
                 position.stage = "CLOSED"
             return command
@@ -623,8 +648,10 @@ class ExecutionSubstrate:
             if not atomic_capability:
                 position.last_confirmed_stop = position.last_confirmed_stop or position.native_stop_loss
                 return None
-            candidate = self._volume(stop)
-            prior = self._volume(position.last_confirmed_stop or position.native_stop_loss or stop)
+            candidate = self._decimal(stop)
+            prior = self._decimal(
+                position.last_confirmed_stop or position.native_stop_loss or stop
+            )
             if (direction == "LONG" and candidate <= prior) or (direction == "SHORT" and candidate >= prior):
                 raise ExecutionError("TRAIL_NOT_TIGHTER")
             command = PositionCommand(str(uuid4()), account_id, order_id, "TRAIL", None, requested_stop=stop)

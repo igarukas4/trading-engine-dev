@@ -182,3 +182,26 @@ print("ok")
 `);
   assert.match(output, /ok/);
 });
+
+test("fill idempotency is scoped to the broker account", () => {
+  const output = run(`
+from backend.app.execution import ExecutionSubstrate
+
+engine = ExecutionSubstrate()
+orders = [
+    engine.pre_order(account_id=account, signal_id="s", idempotency_key="i", canonical_hash="h",
+        risk_approved=True, execution_epoch=1, order_payload={})
+    for account in ("account-a", "account-b")
+]
+fills = [
+    engine.record_fill(account, result.order.id, "shared-deal", "0.10",
+        native_protection_confirmed=True)
+    for account, result in zip(("account-a", "account-b"), orders)
+]
+assert fills[0].id != fills[1].id
+assert fills[0].account_id == "account-a"
+assert fills[1].account_id == "account-b"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
