@@ -10,11 +10,8 @@ that this slice owns indicator calculation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
-
-from .broker_accounts import AccountError
 
 Direction = Literal["LONG", "SHORT"]
 
@@ -75,10 +72,30 @@ class CanonicalTemplate:
 
 
 TEMPLATES = (
-    CanonicalTemplate("xauusd-trend-pullback-v0", "XAUUSD", "TrendPullbackContinuationStrategy@0.1.0", {"H4": 450, "H1": 150, "M15": 60}),
-    CanonicalTemplate("usdjpy-trend-pullback-v0", "USDJPY", "TrendPullbackContinuationStrategy@0.1.0", {"H4": 450, "H1": 150, "M15": 60}),
-    CanonicalTemplate("eurusd-snd-ao-qm-bidirectional-v0", "EURUSD", "SupplyDemandAOQMStrategy@0.1.0", {"H4": 200, "M30": 60}),
-    CanonicalTemplate("wti-trend-breakout-v0", "WTI", "TrendFilteredBreakoutStrategy@0.1.0", {"H4": 450, "H1": 300, "M15": 500}),
+    CanonicalTemplate(
+        "xauusd-trend-pullback-v0",
+        "XAUUSD",
+        "TrendPullbackContinuationStrategy@0.1.0",
+        {"H4": 450, "H1": 150, "M15": 60},
+    ),
+    CanonicalTemplate(
+        "usdjpy-trend-pullback-v0",
+        "USDJPY",
+        "TrendPullbackContinuationStrategy@0.1.0",
+        {"H4": 450, "H1": 150, "M15": 60},
+    ),
+    CanonicalTemplate(
+        "eurusd-snd-ao-qm-bidirectional-v0",
+        "EURUSD",
+        "SupplyDemandAOQMStrategy@0.1.0",
+        {"H4": 200, "M30": 60},
+    ),
+    CanonicalTemplate(
+        "wti-trend-breakout-v0",
+        "WTI",
+        "TrendFilteredBreakoutStrategy@0.1.0",
+        {"H4": 450, "H1": 300, "M15": 500},
+    ),
 )
 
 
@@ -111,7 +128,17 @@ def _profile(snapshot: Any, timeframe: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _result(snapshot: Any, config: StrategyConfig, direction: Direction, confidence: str, reasons: tuple[str, ...]) -> EvaluationResult:
+def _lookback_for_pair(pair: str) -> dict[str, int]:
+    return next(template.lookback for template in TEMPLATES if template.pair == pair)
+
+
+def _result(
+    snapshot: Any,
+    config: StrategyConfig,
+    direction: Direction,
+    confidence: str,
+    reasons: tuple[str, ...],
+) -> EvaluationResult:
     trigger = str(_get(snapshot, "trigger_time", ""))
     opportunity = Opportunity(
         account_id=config.account_id,
@@ -120,21 +147,28 @@ def _result(snapshot: Any, config: StrategyConfig, direction: Direction, confide
         direction=direction,
         confidence=_d(confidence),
         reason_codes=reasons,
-        evaluation_key={"strategy_config_version_id": config.id, "pair_id": config.pair, "trigger_time": trigger},
+        evaluation_key={
+            "strategy_config_version_id": config.id,
+            "pair_id": config.pair,
+            "trigger_time": trigger,
+        },
     )
     return EvaluationResult(opportunity, reasons, "OPPORTUNITY")
 
 
-def _failure(action: Literal["NO_OPPORTUNITY", "SKIP_EVALUATION", "REJECT_GRAPH"], reasons: tuple[str, ...]) -> EvaluationResult:
+def _failure(
+    action: Literal["NO_OPPORTUNITY", "SKIP_EVALUATION", "REJECT_GRAPH"],
+    reasons: tuple[str, ...],
+) -> EvaluationResult:
     return EvaluationResult(None, reasons, action)
 
 
 def _validate(snapshot: Any, config: StrategyConfig) -> EvaluationResult | None:
     if _get(snapshot, "account_id") != config.account_id or _get(snapshot, "pair") != config.pair:
         return _failure("REJECT_GRAPH", ("ACCOUNT_CONTEXT_MISMATCH",))
+    required_lookback = _lookback_for_pair(config.pair)
     candles = _get(snapshot, "candles", ())
     if candles:
-        required = next(t.lookback for t in TEMPLATES if t.pair == config.pair)
         by_timeframe: dict[str, list[Any]] = {}
         for candle in candles:
             timeframe = _get(candle, "timeframe")
@@ -145,13 +179,13 @@ def _validate(snapshot: Any, config: StrategyConfig) -> EvaluationResult | None:
                 return _failure("SKIP_EVALUATION", ("OPEN_CANDLE_INPUT",))
         if len({str(_get(candle, "source_revision", "")) for candle in candles}) > 1:
             return _failure("SKIP_EVALUATION", ("REVISION_MISMATCH",))
-        for timeframe, minimum in required.items():
+        for timeframe, minimum in required_lookback.items():
             if len(by_timeframe.get(timeframe, ())) < minimum:
                 return _failure("SKIP_EVALUATION", ("INSUFFICIENT_LOOKBACK",))
     if _get(snapshot, "completeness", "COMPLETE") != "COMPLETE":
         reasons = tuple(_get(snapshot, "reasons", ())) or ("INCOMPLETE_MARKET_DATA",)
         return _failure("SKIP_EVALUATION", reasons)
-    for timeframe, minimum in next(t.lookback for t in TEMPLATES if t.pair == config.pair).items():
+    for timeframe, minimum in required_lookback.items():
         available = _get(snapshot, "available_closed_bars", {}).get(timeframe, minimum)
         if int(available) < minimum:
             return _failure("SKIP_EVALUATION", ("INSUFFICIENT_LOOKBACK",))
@@ -161,16 +195,22 @@ def _validate(snapshot: Any, config: StrategyConfig) -> EvaluationResult | None:
 
 
 def _trend(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
-    h4, h1, m15 = _profile(snapshot, "H4"), _profile(snapshot, "H1"), _profile(snapshot, "M15")
-    direction: Direction = "SHORT" if _d(h4.get("close", 0)) < _d(h4.get("ema150", 0)) else "LONG"
+    h4 = _profile(snapshot, "H4")
+    h1 = _profile(snapshot, "H1")
+    m15 = _profile(snapshot, "M15")
+    h4_close = _d(h4.get("close", 0))
+    h4_ema150 = _d(h4.get("ema150", 0))
+    direction: Direction = "SHORT" if h4_close < h4_ema150 else "LONG"
     sign = Decimal("-1") if direction == "SHORT" else Decimal("1")
-    if not sign * (_d(h4.get("close", 0)) - _d(h4.get("ema150", 0))) > 0:
+    if not sign * (h4_close - h4_ema150) > 0:
         return _failure("NO_OPPORTUNITY", ("TREND_PRICE_FILTER_FAILED",))
-    if not sign * (_d(h4.get("ema34", 0)) - _d(h4.get("ema150", 0))) > 0:
+    h4_ema34 = _d(h4.get("ema34", 0))
+    ema_separation = sign * (h4_ema34 - h4_ema150)
+    if not ema_separation > 0:
         return _failure("NO_OPPORTUNITY", ("EMA_ORDER_FAILED",))
-    if not sign * (_d(h4.get("ema34", 0)) - _d(h4.get("ema150", 0))) >= _d("0.10") * _d(h4.get("atr", 0)):
+    if not ema_separation >= _d("0.10") * _d(h4.get("atr", 0)):
         return _failure("NO_OPPORTUNITY", ("EMA_SEPARATION_FAILED",))
-    if not sign * (_d(h4.get("ema150", 0)) - _d(h4.get("ema150_previous", 0))) > 0:
+    if not sign * (h4_ema150 - _d(h4.get("ema150_previous", 0))) > 0:
         return _failure("NO_OPPORTUNITY", ("EMA_SLOPE_FAILED",))
     if _d(h4.get("adx", 0)) < _d("22"):
         return _failure("NO_OPPORTUNITY", ("ADX_FILTER_FAILED",))
@@ -181,7 +221,15 @@ def _trend(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
     invalidation = _d(h1.get("invalidation_close", h1.get("close", 0)))
     if not sign * (invalidation - _d(h1.get("ema34", 0))) > -tolerance:
         return _failure("NO_OPPORTUNITY", ("PULLBACK_INVALIDATED",))
-    close, open_, high, low = map(_d, (h1.get("latest_close", 0), h1.get("latest_open", 0), h1.get("high", 0), h1.get("low", 0)))
+    close, open_, high, low = map(
+        _d,
+        (
+            h1.get("latest_close", 0),
+            h1.get("latest_open", 0),
+            h1.get("high", 0),
+            h1.get("low", 0),
+        ),
+    )
     body = Decimal(0) if high == low else abs(close - open_) / (high - low)
     if not sign * (close - _d(h1.get("ema34", 0))) > 0 or not sign * (close - open_) > 0 or body < _d("0.55"):
         return _failure("NO_OPPORTUNITY", ("H1_BODY_FILTER_FAILED",))
@@ -189,7 +237,15 @@ def _trend(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
         return _failure("NO_OPPORTUNITY", ("RSI_RECLAIM_FAILED",))
     boundary = _d(m15.get("channel_high" if direction == "LONG" else "channel_low", 0))
     trigger_buffer = max(_d("0.10") * _d(m15.get("atr", 0)), _d("1.50") * _d(m15.get("spread", 0)))
-    mclose, mopen, mhigh, mlow = map(_d, (m15.get("close", 0), m15.get("open", 0), m15.get("high", 0), m15.get("low", 0)))
+    mclose, mopen, mhigh, mlow = map(
+        _d,
+        (
+            m15.get("close", 0),
+            m15.get("open", 0),
+            m15.get("high", 0),
+            m15.get("low", 0),
+        ),
+    )
     extension = sign * (mclose - boundary)
     if not extension > trigger_buffer:
         return _failure("NO_OPPORTUNITY", ("M15_BREAKOUT_NOT_CLOSED",))
@@ -203,13 +259,29 @@ def _trend(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
 
 def _wti(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
     gate = _get(snapshot, "gate", "OPEN")
-    gate_reasons = {"ROLL_GUARD": "WTI_ROLL_GUARD_ACTIVE", "REOPEN_COOLDOWN": "WTI_REOPEN_COOLDOWN_ACTIVE", "FALSE_BREAKOUT_COOLDOWN": "WTI_COOLDOWN_ACTIVE"}
+    gate_reasons = {
+        "ROLL_GUARD": "WTI_ROLL_GUARD_ACTIVE",
+        "REOPEN_COOLDOWN": "WTI_REOPEN_COOLDOWN_ACTIVE",
+        "FALSE_BREAKOUT_COOLDOWN": "WTI_COOLDOWN_ACTIVE",
+    }
     if gate in gate_reasons:
         return _failure("SKIP_EVALUATION", (gate_reasons[gate],))
-    h4, h1, m15 = _profile(snapshot, "H4"), _profile(snapshot, "H1"), _profile(snapshot, "M15")
-    direction: Direction = "SHORT" if _d(h4.get("close", 0)) < _d(h4.get("ema150", 0)) else "LONG"
+    h4 = _profile(snapshot, "H4")
+    h1 = _profile(snapshot, "H1")
+    m15 = _profile(snapshot, "M15")
+    h4_close = _d(h4.get("close", 0))
+    h4_ema150 = _d(h4.get("ema150", 0))
+    h4_ema34 = _d(h4.get("ema34", 0))
+    direction: Direction = "SHORT" if h4_close < h4_ema150 else "LONG"
     sign = Decimal("-1") if direction == "SHORT" else Decimal("1")
-    if not sign * (_d(h4.get("close", 0)) - _d(h4.get("ema150", 0))) > 0 or not sign * (_d(h4.get("ema34", 0)) - _d(h4.get("ema150", 0))) > 0 or sign * (_d(h4.get("ema34", 0)) - _d(h4.get("ema150", 0))) < _d("0.10") * _d(h4.get("atr", 0)) or not sign * (_d(h4.get("ema150", 0)) - _d(h4.get("ema150_previous", 0))) > 0 or _d(h4.get("adx", 0)) < _d("22"):
+    trend_filter_passed = (
+        sign * (h4_close - h4_ema150) > 0
+        and sign * (h4_ema34 - h4_ema150) > 0
+        and sign * (h4_ema34 - h4_ema150) >= _d("0.10") * _d(h4.get("atr", 0))
+        and sign * (h4_ema150 - _d(h4.get("ema150_previous", 0))) > 0
+        and _d(h4.get("adx", 0)) >= _d("22")
+    )
+    if not trend_filter_passed:
         return _failure("NO_OPPORTUNITY", ("H4_TREND_FILTER_FAILED",))
     high, low = _d(h1.get("range_high", 0)), _d(h1.get("range_low", 0))
     if not _d("1.00") * _d(h1.get("atr14", 0)) <= high - low <= _d("3.00") * _d(h1.get("atr14", 0)):
@@ -224,7 +296,13 @@ def _wti(snapshot: Any, config: StrategyConfig) -> EvaluationResult:
         return _failure("NO_OPPORTUNITY", ("WTI_BODY_FILTER_FAILED",))
     if extension > _d("1.25") * _d(m15.get("atr", 0)):
         return _failure("NO_OPPORTUNITY", ("TRIGGER_OVEREXTENDED",))
-    return _result(snapshot, config, direction, "0.68", ("H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"))
+    return _result(
+        snapshot,
+        config,
+        direction,
+        "0.68",
+        ("H4_TREND_CONFIRMED", "H1_COMPRESSION_CONFIRMED", "M15_RANGE_BREAK_CONFIRMED"),
+    )
 
 
 def _eurusd(snapshot: Any, config: StrategyConfig) -> EvaluationResult:

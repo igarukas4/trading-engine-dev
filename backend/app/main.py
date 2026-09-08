@@ -64,6 +64,10 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 
 
+def _strategy_configs_for(account_id: str) -> tuple[StrategyConfig, ...]:
+    return strategy_configs.setdefault(account_id, canonical_configs(account_id))
+
+
 class BrokerAccountRegistration(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -201,7 +205,7 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
 @app.get("/api/v1/broker-accounts/{account_id}/strategy-configs", tags=["strategies"])
 def list_strategy_configs(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
-    configs = strategy_configs.setdefault(account_id, canonical_configs(account_id))
+    configs = _strategy_configs_for(account_id)
     return {
         "account_id": account_id,
         "configs": [
@@ -222,7 +226,7 @@ def list_strategy_configs(account_id: str) -> dict[str, Any]:
 @app.post("/api/v1/broker-accounts/{account_id}/strategy-evaluations", tags=["strategies"])
 def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> dict[str, Any]:
     _require_account(account_id)
-    configs = strategy_configs.setdefault(account_id, canonical_configs(account_id))
+    configs = _strategy_configs_for(account_id)
     config = next((item for item in configs if item.id == request.config_version_id), None)
     if config is None:
         raise HTTPException(status_code=404, detail="StrategyConfig version not found")
