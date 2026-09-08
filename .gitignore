@@ -1,0 +1,4 @@
+node_modules/
+.sandcastle/.env
+.sandcastle/logs/
+.sandcastle/worktrees/
