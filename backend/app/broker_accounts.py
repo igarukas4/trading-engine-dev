@@ -15,8 +15,12 @@ from typing import Any, Literal
 from uuid import uuid4
 
 AccountErrorCode = Literal[
-    "ACCOUNT_CONTEXT_MISMATCH", "DUPLICATE_IDENTITY", "STALE_GENERATION",
-    "WRONG_ACCOUNT", "NOT_READY", "INVALID_KEY",
+    "ACCOUNT_CONTEXT_MISMATCH",
+    "DUPLICATE_IDENTITY",
+    "STALE_GENERATION",
+    "WRONG_ACCOUNT",
+    "NOT_READY",
+    "INVALID_KEY",
 ]
 
 
@@ -34,13 +38,22 @@ def hash_connector_secret(secret: str, salt: bytes | None = None) -> tuple[str, 
     if not secret or len(secret) < 32:
         raise AccountError("INVALID_KEY", "connector key must contain at least 32 characters")
     key_salt = salt or secrets.token_bytes(16)
-    derived = hashlib.scrypt(secret.encode(), salt=key_salt, n=2**14, r=8, p=1, dklen=32)
+    derived = hashlib.scrypt(
+        secret.encode(), salt=key_salt, n=2**14, r=8, p=1, dklen=32
+    )
     return key_salt.hex(), derived.hex()
 
 
 def verify_connector_secret(secret: str, salt_hex: str, digest_hex: str) -> bool:
     try:
-        candidate = hashlib.scrypt(secret.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32)
+        candidate = hashlib.scrypt(
+            secret.encode(),
+            salt=bytes.fromhex(salt_hex),
+            n=2**14,
+            r=8,
+            p=1,
+            dklen=32,
+        )
         return hmac.compare_digest(candidate.hex(), digest_hex)
     except (TypeError, ValueError):
         return False
@@ -76,7 +89,16 @@ class BrokerAccount:
 
     @property
     def can_enable(self) -> bool:
-        return self.connector_bound and self.connector_healthy and self.reconciliation_complete and self.risk_limits_active and self.mappings_valid and (self.environment == "DEMO" or self.live_execution_enabled)
+        readiness_gates = (
+            self.connector_bound,
+            self.connector_healthy,
+            self.reconciliation_complete,
+            self.risk_limits_active,
+            self.mappings_valid,
+        )
+        return all(readiness_gates) and (
+            self.environment == "DEMO" or self.live_execution_enabled
+        )
 
     def enable(self) -> None:
         if not self.can_enable:
@@ -102,11 +124,25 @@ class AccountRegistry:
         self.accounts: dict[str, BrokerAccount] = {}
         self.bindings: dict[str, ConnectorBinding] = {}
 
-    def register(self, **values: Any) -> BrokerAccount:
-        identity = (values["provider"], values["broker_server"], values["external_account_id"])
+    def register(
+        self,
+        *,
+        provider: str,
+        broker_server: str,
+        external_account_id: str,
+        display_name: str,
+        environment: Literal["DEMO", "LIVE"],
+    ) -> BrokerAccount:
+        identity = (provider, broker_server, external_account_id)
         if any(account.identity == identity for account in self.accounts.values()):
             raise AccountError("DUPLICATE_IDENTITY", "BrokerAccount identity already exists")
-        account = BrokerAccount(**values)
+        account = BrokerAccount(
+            provider=provider,
+            broker_server=broker_server,
+            external_account_id=external_account_id,
+            display_name=display_name,
+            environment=environment,
+        )
         self.accounts[account.id] = account
         return account
 
@@ -114,14 +150,23 @@ class AccountRegistry:
         account = self.accounts[account_id]
         salt_hex, digest = hash_connector_secret(secret)
         key_id = secrets.token_urlsafe(12)
-        self.bindings[account_id] = ConnectorBinding(account.id, *account.identity, key_id, salt_hex, digest)
+        self.bindings[account_id] = ConnectorBinding(
+            account.id, *account.identity, key_id, salt_hex, digest
+        )
         account.connector_bound = True
         return key_id
 
     def authenticate(self, account_id: str, key_id: str, secret: str, generation: int) -> BrokerAccount:
         account = self.accounts.get(account_id)
         binding = self.bindings.get(account_id)
-        if not account or not binding or binding.revoked or not hmac.compare_digest(binding.key_id, key_id) or not verify_connector_secret(secret, binding.salt_hex, binding.secret_hash):
+        credentials_valid = (
+            account is not None
+            and binding is not None
+            and not binding.revoked
+            and hmac.compare_digest(binding.key_id, key_id)
+            and verify_connector_secret(secret, binding.salt_hex, binding.secret_hash)
+        )
+        if not credentials_valid:
             raise AccountError("WRONG_ACCOUNT", "connector authentication failed")
         if generation != account.connector_generation:
             raise AccountError("STALE_GENERATION", "connector generation is not current")
@@ -141,7 +186,26 @@ class AccountRegistry:
 
     def read_only_snapshot(self, account_id: str) -> dict[str, Any]:
         account = self.accounts[account_id]
-        return {"account_id": account.id, "identity": {"provider": account.provider, "broker_server": account.broker_server, "external_account_id": account.external_account_id}, "lifecycle_status": account.lifecycle_status, "bot_state": account.bot_state, "execution_mode": account.execution_mode, "live_execution_enabled": account.live_execution_enabled, "connector": {"bound": account.connector_bound, "healthy": account.connector_healthy, "generation": account.connector_generation}, "reconciliation": {"complete": account.reconciliation_complete}, "readiness": {"can_enable": account.can_enable}, "execution_locked": True}
+        return {
+            "account_id": account.id,
+            "identity": {
+                "provider": account.provider,
+                "broker_server": account.broker_server,
+                "external_account_id": account.external_account_id,
+            },
+            "lifecycle_status": account.lifecycle_status,
+            "bot_state": account.bot_state,
+            "execution_mode": account.execution_mode,
+            "live_execution_enabled": account.live_execution_enabled,
+            "connector": {
+                "bound": account.connector_bound,
+                "healthy": account.connector_healthy,
+                "generation": account.connector_generation,
+            },
+            "reconciliation": {"complete": account.reconciliation_complete},
+            "readiness": {"can_enable": account.can_enable},
+            "execution_locked": True,
+        }
 
 
 def assert_account_scope(account_id: str, referenced_account_id: str) -> None:

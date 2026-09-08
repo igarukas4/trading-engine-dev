@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +65,7 @@ class BrokerAccountRegistration(BaseModel):
     broker_server: str = Field(min_length=1, max_length=160)
     external_account_id: str = Field(min_length=1, max_length=160)
     display_name: str = Field(min_length=1, max_length=160)
-    environment: str = Field(pattern="^(DEMO|LIVE)$")
+    environment: Literal["DEMO", "LIVE"]
 
 
 class ConnectorBindingRequest(BaseModel):
@@ -75,7 +75,10 @@ class ConnectorBindingRequest(BaseModel):
 
 
 def _account_error(error: AccountError) -> HTTPException:
-    return HTTPException(status_code=409, detail={"code": error.code, "message": str(error)})
+    return HTTPException(
+        status_code=409,
+        detail={"code": error.code, "message": str(error)},
+    )
 
 
 def _database_state() -> str:
@@ -111,12 +114,18 @@ def system_version() -> dict[str, str]:
 def system_status() -> SystemStatus:
     services = _service_state()
     return {
-        "status": "healthy" if all(value == "healthy" for value in services.values()) else "degraded",
+        "status": (
+            "healthy"
+            if all(value == "healthy" for value in services.values())
+            else "degraded"
+        ),
         "version": settings.version,
         "services": services,
         "execution_available": False,
         "trading_enabled": False,
-        "message": "Sistem siap untuk pemantauan; konektor broker belum tersedia.",
+        "message": (
+            "Sistem siap untuk pemantauan; konektor broker belum tersedia."
+        ),
     }
 
 
@@ -126,7 +135,18 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
         account = accounts.register(**request.model_dump())
     except AccountError as error:
         raise _account_error(error) from error
-    return {"id": account.id, "provider": account.provider, "broker_server": account.broker_server, "external_account_id": account.external_account_id, "display_name": account.display_name, "environment": account.environment, "lifecycle_status": account.lifecycle_status, "bot_state": account.bot_state, "execution_mode": account.execution_mode, "live_execution_enabled": account.live_execution_enabled}
+    return {
+        "id": account.id,
+        "provider": account.provider,
+        "broker_server": account.broker_server,
+        "external_account_id": account.external_account_id,
+        "display_name": account.display_name,
+        "environment": account.environment,
+        "lifecycle_status": account.lifecycle_status,
+        "bot_state": account.bot_state,
+        "execution_mode": account.execution_mode,
+        "live_execution_enabled": account.live_execution_enabled,
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/connector-binding", tags=["broker-accounts"])
@@ -154,12 +174,27 @@ async def connector_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     try:
         hello = await websocket.receive_json()
-        required = {"type", "account_id", "provider", "broker_server", "external_account_id", "key_id", "secret", "generation", "session_id"}
+        required = {
+            "type",
+            "account_id",
+            "provider",
+            "broker_server",
+            "external_account_id",
+            "key_id",
+            "secret",
+            "generation",
+            "session_id",
+        }
         if set(hello) != required or hello["type"] != "hello":
             await websocket.close(code=1008, reason="invalid authenticated handshake")
             return
         account = accounts.accounts.get(hello["account_id"])
-        if not account or (hello["provider"], hello["broker_server"], hello["external_account_id"]) != account.identity:
+        requested_identity = (
+            hello["provider"],
+            hello["broker_server"],
+            hello["external_account_id"],
+        )
+        if not account or requested_identity != account.identity:
             await websocket.close(code=1008, reason="WRONG_ACCOUNT")
             return
         try:
