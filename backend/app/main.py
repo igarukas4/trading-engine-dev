@@ -16,7 +16,14 @@ from psycopg import connect
 from .broker_accounts import AccountError, AccountRegistry
 from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
 from .strategies import StrategyConfig, canonical_configs, evaluate_snapshot
-from .risk_calendar import CalendarHealth, EnrichmentPolicy, ActivationGate, RiskLimits, RiskLimitsStore, AccountSafety
+from .risk_calendar import (
+    AccountSafety,
+    ActivationGate,
+    CalendarHealth,
+    EnrichmentPolicy,
+    RiskLimits,
+    RiskLimitsStore,
+)
 
 
 @dataclass(frozen=True)
@@ -159,7 +166,7 @@ class CalendarHealthRequest(BaseModel):
 
 class ActivationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    connector_capabilities: dict[str, bool] = {}
+    connector_capabilities: dict[str, bool] = Field(default_factory=dict)
     session_allowed: bool = True
     wti_gate: str = "OPEN"
 
@@ -184,6 +191,23 @@ def _account_error(error: AccountError) -> HTTPException:
         status_code=409,
         detail={"code": error.code, "message": str(error)},
     )
+
+
+def _strategy_config_for(account_id: str, config_id: str) -> StrategyConfig:
+    config = next(
+        (item for item in _strategy_configs_for(account_id) if item.id == config_id),
+        None,
+    )
+    if config is None:
+        raise HTTPException(status_code=404, detail="StrategyConfig version not found")
+    return config
+
+
+def _risk_limits_payload(limits: RiskLimits) -> dict[str, Any]:
+    return {
+        key: str(value) if isinstance(value, Decimal) else value
+        for key, value in limits.__dict__.items()
+    }
 
 
 def _database_state() -> str:
@@ -279,9 +303,15 @@ def list_strategy_configs(account_id: str) -> dict[str, Any]:
 @app.post("/api/v1/broker-accounts/{account_id}/risk-limits", status_code=status.HTTP_201_CREATED, tags=["risk"])
 def create_risk_limits(account_id: str, request: RiskLimitsRequest) -> dict[str, Any]:
     _require_account(account_id)
-    version = risk_limits.create(RiskLimits(broker_account_id=account_id, **request.model_dump()))
+    version = risk_limits.create(
+        RiskLimits(broker_account_id=account_id, **request.model_dump())
+    )
     accounts.accounts[account_id].risk_limits_active = True
-    return {"account_id": account_id, "version": version.version, "risk_limits": {k: str(v) if isinstance(v, Decimal) else v for k, v in version.__dict__.items()}}
+    return {
+        "account_id": account_id,
+        "version": version.version,
+        "risk_limits": _risk_limits_payload(version),
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/calendar/health", status_code=status.HTTP_201_CREATED, tags=["calendar"])
@@ -291,17 +321,26 @@ def set_calendar_health(account_id: str, request: CalendarHealthRequest) -> dict
     previous = calendar_health.setdefault(account_id, {}).get(health.currency)
     calendar_health.setdefault(account_id, {})[health.currency] = health
     fence = None
-    if previous is None or previous.healthy != health.healthy or previous.covered != health.covered or previous.source_revision != health.source_revision:
+    health_changed = (
+        previous is None
+        or previous.healthy != health.healthy
+        or previous.covered != health.covered
+        or previous.source_revision != health.source_revision
+    )
+    if health_changed:
         fence = safety.install_fence(account_id)
-    return {"account_id": account_id, **health.__dict__, "observed_at": health.observed_at.isoformat(), "fence": fence.__dict__ if fence else None}
+    return {
+        "account_id": account_id,
+        **health.__dict__,
+        "observed_at": health.observed_at.isoformat(),
+        "fence": fence.__dict__ if fence else None,
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/strategy-configs/{config_id}/enrichment-policies", status_code=status.HTTP_201_CREATED, tags=["strategies"])
 def create_enrichment_policy(account_id: str, config_id: str, request: EnrichmentPolicyRequest) -> dict[str, Any]:
     _require_account(account_id)
-    config = next((item for item in _strategy_configs_for(account_id) if item.id == config_id), None)
-    if config is None:
-        raise HTTPException(status_code=404, detail="StrategyConfig version not found")
+    _strategy_config_for(account_id, config_id)
     prior = enrichment_policies.get(config_id)
     policy = EnrichmentPolicy(
         strategy_config_id=config_id,
@@ -321,22 +360,34 @@ def choose_strategy_session(account_id: str, config_id: str, request: SessionCho
     """Session choice is a new disabled immutable version, never an in-place edit."""
     _require_account(account_id)
     configs = _strategy_configs_for(account_id)
-    config = next((item for item in configs if item.id == config_id), None)
-    if config is None:
-        raise HTTPException(status_code=404, detail="StrategyConfig version not found")
+    config = _strategy_config_for(account_id, config_id)
     version = config.version + 1
-    updated = replace(config, id=f"{config.id.rsplit('-v', 1)[0]}-v{version}", version=version, session_policy=request.session_policy, activation_status="DISABLED")
+    updated = replace(
+        config,
+        id=f"{config.id.rsplit('-v', 1)[0]}-v{version}",
+        version=version,
+        session_policy=request.session_policy,
+        activation_status="DISABLED",
+    )
     strategy_configs[account_id] = configs + (updated,)
-    return {"account_id": account_id, "id": updated.id, "version": updated.version, "session_policy": updated.session_policy, "activation_status": updated.activation_status}
+    return {
+        "account_id": account_id,
+        "id": updated.id,
+        "version": updated.version,
+        "session_policy": updated.session_policy,
+        "activation_status": updated.activation_status,
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/strategy-configs/{config_id}/activate", tags=["strategies"])
-def activate_strategy_config(account_id: str, config_id: str, request: ActivationRequest = ActivationRequest()) -> dict[str, Any]:
+def activate_strategy_config(
+    account_id: str,
+    config_id: str,
+    request: ActivationRequest = ActivationRequest(),
+) -> dict[str, Any]:
     _require_account(account_id)
     configs = _strategy_configs_for(account_id)
-    config = next((item for item in configs if item.id == config_id), None)
-    if config is None:
-        raise HTTPException(status_code=404, detail="StrategyConfig version not found")
+    config = _strategy_config_for(account_id, config_id)
     mapping = market_data.pairs.get(account_id, {}).get(config.pair)
     decision = activation_gate.evaluate(
         account_id=account_id,
@@ -350,10 +401,22 @@ def activate_strategy_config(account_id: str, config_id: str, request: Activatio
         wti_gate=request.wti_gate,
     )
     if not decision.allowed:
-        return {"account_id": account_id, "config_id": config_id, "activation_status": "DISABLED", "outcome": "ACTIVATION_BLOCKED", "reason_codes": list(decision.reason_codes)}
+        return {
+            "account_id": account_id,
+            "config_id": config_id,
+            "activation_status": "DISABLED",
+            "outcome": "ACTIVATION_BLOCKED",
+            "reason_codes": list(decision.reason_codes),
+        }
     updated = replace(config, activation_status="ACTIVE")
     strategy_configs[account_id] = tuple(updated if item.id == config_id else item for item in configs)
-    return {"account_id": account_id, "config_id": config_id, "activation_status": "ACTIVE", "outcome": "ACTIVATION_ALLOWED", "reason_codes": []}
+    return {
+        "account_id": account_id,
+        "config_id": config_id,
+        "activation_status": "ACTIVE",
+        "outcome": "ACTIVATION_ALLOWED",
+        "reason_codes": [],
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/strategy-evaluations", tags=["strategies"])

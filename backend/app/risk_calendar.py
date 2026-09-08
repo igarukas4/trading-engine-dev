@@ -11,7 +11,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
-from uuid import uuid4
 
 
 def _now() -> datetime:
@@ -155,7 +154,17 @@ class RiskAssessment:
 class RiskEngine:
     """Small deterministic gate used before a Signal can become executable."""
 
-    def assess(self, account_id: str, limits: RiskLimits | None, *, baseline_samples: int = 0, daily_loss: Decimal = Decimal("0"), open_positions: int = 0, open_risk: Decimal = Decimal("0"), requested_risk: Decimal = Decimal("0")) -> RiskAssessment:
+    def assess(
+        self,
+        account_id: str,
+        limits: RiskLimits | None,
+        *,
+        baseline_samples: int = 0,
+        daily_loss: Decimal = Decimal("0"),
+        open_positions: int = 0,
+        open_risk: Decimal = Decimal("0"),
+        requested_risk: Decimal = Decimal("0"),
+    ) -> RiskAssessment:
         reasons: list[str] = []
         if limits is None:
             reasons.append("RISK_LIMITS_MISSING")
@@ -170,7 +179,14 @@ class RiskEngine:
                 reasons.append("TOTAL_OPEN_RISK_EXCEEDED")
             if requested_risk > limits.max_risk_per_trade:
                 reasons.append("MAX_RISK_PER_TRADE_EXCEEDED")
-        return RiskAssessment(account_id, limits.version if limits else None, not reasons, tuple(reasons), _now() + timedelta(seconds=30) if not reasons else None)
+        valid_until = _now() + timedelta(seconds=30) if not reasons else None
+        return RiskAssessment(
+            account_id,
+            limits.version if limits else None,
+            not reasons,
+            tuple(reasons),
+            valid_until,
+        )
 
 
 class ActivationGate:
@@ -192,7 +208,12 @@ class ActivationGate:
         reasons: list[str] = []
         if mapping is None or not getattr(mapping, "broker_symbol", None):
             reasons.append("PAIR_MAPPING_MISSING")
-        if not connector_capabilities or not connector_capabilities.get("native_stop_loss") or not connector_capabilities.get("native_take_profit"):
+        connector_is_safe = bool(
+            connector_capabilities
+            and connector_capabilities.get("native_stop_loss")
+            and connector_capabilities.get("native_take_profit")
+        )
+        if not connector_is_safe:
             reasons.append("CONNECTOR_CAPABILITY_UNSAFE")
         if risk_limits is None:
             reasons.append("RISK_LIMITS_MISSING")
@@ -203,9 +224,17 @@ class ActivationGate:
                 health = calendar_health.get(currency)
                 ttl = policy.freshness_ttl_seconds.get("calendar", 3600)
                 if health is None or not health.is_fresh(ttl_seconds=ttl):
-                    reasons.append("CALENDAR_COVERAGE_MISSING" if health is None or not health.covered else "CALENDAR_HEALTH_STALE")
+                    if health is None or not health.covered:
+                        reasons.append("CALENDAR_COVERAGE_MISSING")
+                    else:
+                        reasons.append("CALENDAR_HEALTH_STALE")
         if not session_allowed:
             reasons.append("SESSION_POLICY_UNSAFE")
         if pair == "WTI" and wti_gate != "OPEN":
-            reasons.append({"ROLL_GUARD": "WTI_ROLL_GUARD_ACTIVE", "REOPEN_COOLDOWN": "WTI_REOPEN_COOLDOWN_ACTIVE"}.get(wti_gate, "WTI_ENTRY_GATE_CLOSED"))
+            if wti_gate == "ROLL_GUARD":
+                reasons.append("WTI_ROLL_GUARD_ACTIVE")
+            elif wti_gate == "REOPEN_COOLDOWN":
+                reasons.append("WTI_REOPEN_COOLDOWN_ACTIVE")
+            else:
+                reasons.append("WTI_ENTRY_GATE_CLOSED")
         return ActivationDecision(not reasons, tuple(dict.fromkeys(reasons)))
