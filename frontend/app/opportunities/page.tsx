@@ -54,15 +54,42 @@ export default function OpportunitiesPage() {
       setMessage("Konfirmasi dan alasan wajib diisi.");
       return;
     }
+    const payload: {
+      idempotency_key: string;
+      reason: string;
+      confirmed: boolean;
+      signal_revision: number;
+      order_payload?: { stop_loss: string; take_profit: string[] };
+    } = {
+      idempotency_key: `${operation}-${signal.id}-${signal.revision ?? 1}`,
+      reason,
+      confirmed,
+      signal_revision: signal.revision ?? 1,
+    };
+    if (operation === "execute") {
+      payload.order_payload = { stop_loss: "native", take_profit: ["native"] };
+    }
+
     const response = await fetch(`${apiBase}/api/v1/broker-accounts/${account}/signals/${signal.id}/${operation}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: `${operation}-${signal.id}-${signal.revision ?? 1}`, reason, confirmed, signal_revision: signal.revision ?? 1,
-        ...(operation === "execute" ? { order_payload: { stop_loss: "native", take_profit: ["native"] } } : {}) }),
+      body: JSON.stringify(payload),
     });
     const value = await response.json();
-    setMessage(response.ok ? `Perintah ${operation} diterima.` : `Perintah ditolak: ${value.detail?.code ?? "tidak aman"}`);
-    if (response.ok) setOpportunities((current) => current.map((item) => ({ ...item, signals: item.signals?.map((entry) => entry.id === signal.id ? { ...entry, ...(value.signal ?? {}), status: operation === "approve" ? "APPROVED" : entry.status } : entry) }))));
+    if (response.ok) {
+      setMessage(`Perintah ${operation} diterima.`);
+      setOpportunities((current) => current.map((item) => ({
+        ...item,
+        signals: item.signals?.map((entry) => {
+          if (entry.id !== signal.id) return entry;
+          const updatedSignal = { ...entry, ...(value.signal ?? {}) };
+          if (operation === "approve") updatedSignal.status = "APPROVED";
+          return updatedSignal;
+        }),
+      })));
+    } else {
+      setMessage(`Perintah ditolak: ${value.detail?.code ?? "tidak aman"}`);
+    }
   }
 
   return (

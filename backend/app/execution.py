@@ -134,6 +134,9 @@ class PreOrderResult:
     outbox_event: OutboxEvent
 
 
+OperatorCommandKind = Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
+
+
 @dataclass
 class OperatorCommand:
     """An auditable, idempotent operator action tied to one account."""
@@ -141,7 +144,7 @@ class OperatorCommand:
     id: str
     account_id: str
     signal_id: str | None
-    kind: Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
+    kind: OperatorCommandKind
     idempotency_key: str
     reason: str
     confirmed: bool
@@ -221,8 +224,14 @@ class ExecutionSubstrate:
             return PreOrderResult(reservation, order, event)
 
     def _command(
-        self, *, account_id: str, signal_id: str | None, kind: Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"],
-        idempotency_key: str, reason: str, confirmed: bool,
+        self,
+        *,
+        account_id: str,
+        signal_id: str | None,
+        kind: OperatorCommandKind,
+        idempotency_key: str,
+        reason: str,
+        confirmed: bool,
     ) -> OperatorCommand:
         if not reason.strip():
             raise ExecutionError("OPERATOR_REASON_REQUIRED")
@@ -231,8 +240,16 @@ class ExecutionSubstrate:
         prior_id = self._command_keys.get((account_id, idempotency_key))
         if prior_id:
             return self.commands[prior_id]
-        command = OperatorCommand(str(uuid4()), account_id, signal_id, kind,
-                                   idempotency_key, reason, confirmed, "ACCEPTED")
+        command = OperatorCommand(
+            str(uuid4()),
+            account_id,
+            signal_id,
+            kind,
+            idempotency_key,
+            reason,
+            confirmed,
+            "ACCEPTED",
+        )
         self.commands[command.id] = command
         self._command_keys[(account_id, idempotency_key)] = command.id
         return command
@@ -244,13 +261,19 @@ class ExecutionSubstrate:
     ) -> OperatorCommand:
         """Approve only; approval never dispatches a broker side effect."""
         with self._lock_for(account_id):
-            command = self._command(account_id=account_id, signal_id=signal_id,
-                                     kind="APPROVE_SIGNAL", idempotency_key=idempotency_key,
-                                     reason=reason, confirmed=confirmed)
+            command = self._command(
+                account_id=account_id,
+                signal_id=signal_id,
+                kind="APPROVE_SIGNAL",
+                idempotency_key=idempotency_key,
+                reason=reason,
+                confirmed=confirmed,
+            )
             if command.status != "ACCEPTED":
                 return command
             if not signal_eligible:
-                command.status, command.rejection_code = "REJECTED", "SIGNAL_NOT_ELIGIBLE"
+                command.status = "REJECTED"
+                command.rejection_code = "SIGNAL_NOT_ELIGIBLE"
                 return command
             self._approved_signals[(account_id, signal_id)] = command.id
             command.reason = f"{reason} [revision:{signal_revision}]"
@@ -276,14 +299,24 @@ class ExecutionSubstrate:
                 raise ExecutionError("SIGNAL_REVISION_CHANGED")
             if not order_payload.get("stop_loss") or not order_payload.get("take_profit"):
                 raise ExecutionError("NATIVE_PROTECTION_REQUIRED")
-            command = self._command(account_id=account_id, signal_id=signal_id,
-                                    kind="EXECUTE_SIGNAL", idempotency_key=idempotency_key,
-                                    reason=reason, confirmed=confirmed)
-            result = self.pre_order(account_id=account_id, signal_id=signal_id,
-                                    idempotency_key=idempotency_key,
-                                    canonical_hash=json.dumps(order_payload, sort_keys=True),
-                                    risk_approved=True, execution_epoch=execution_epoch,
-                                    order_payload=order_payload, risk_amount=risk_amount)
+            command = self._command(
+                account_id=account_id,
+                signal_id=signal_id,
+                kind="EXECUTE_SIGNAL",
+                idempotency_key=idempotency_key,
+                reason=reason,
+                confirmed=confirmed,
+            )
+            result = self.pre_order(
+                account_id=account_id,
+                signal_id=signal_id,
+                idempotency_key=idempotency_key,
+                canonical_hash=json.dumps(order_payload, sort_keys=True),
+                risk_approved=True,
+                execution_epoch=execution_epoch,
+                order_payload=order_payload,
+                risk_amount=risk_amount,
+            )
             command.status, command.order_id = "EXECUTED", result.order.id
             return result
 
@@ -293,15 +326,23 @@ class ExecutionSubstrate:
     ) -> OperatorCommand:
         """Explicitly close positions; emergency stop itself never closes them."""
         with self._lock_for(account_id):
-            command = self._command(account_id=account_id, signal_id=None, kind="CLOSE_ALL",
-                                    idempotency_key=idempotency_key, reason=reason,
-                                    confirmed=confirmed)
+            command = self._command(
+                account_id=account_id,
+                signal_id=None,
+                kind="CLOSE_ALL",
+                idempotency_key=idempotency_key,
+                reason=reason,
+                confirmed=confirmed,
+            )
             if command.status == "ACCEPTED" and connector is not None:
                 try:
                     response = connector.close_all(account_id)
                 except Exception:
                     response = None
-                if response is None or (isinstance(response, dict) and response.get("status") == "UNKNOWN"):
+                response_is_ambiguous = response is None or (
+                    isinstance(response, dict) and response.get("status") == "UNKNOWN"
+                )
+                if response_is_ambiguous:
                     command.rejection_code = "RECONCILIATION_PENDING"
                 else:
                     command.status = "EXECUTED"
