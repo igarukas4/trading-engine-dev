@@ -15,6 +15,7 @@ from psycopg import connect
 
 from .broker_accounts import AccountError, AccountRegistry
 from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
+from .strategies import StrategyConfig, canonical_configs, evaluate_snapshot
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ app.add_middleware(
 )
 
 accounts = AccountRegistry()
+strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
+opportunities: dict[str, list[dict[str, Any]]] = {}
 
 
 class BrokerAccountRegistration(BaseModel):
@@ -110,6 +113,13 @@ class PairMappingRequest(BaseModel):
     broker_symbol: str = Field(min_length=1, max_length=80)
     base_currency: str = Field(default="", max_length=3)
     quote_currency: str = Field(default="", max_length=3)
+
+
+class StrategyEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_version_id: str = Field(min_length=1, max_length=200)
+    snapshot: dict[str, Any]
 
 
 def _account_error(error: AccountError) -> HTTPException:
@@ -171,6 +181,7 @@ def system_status() -> SystemStatus:
 def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any]:
     try:
         account = accounts.register(**request.model_dump())
+        strategy_configs[account.id] = canonical_configs(account.id)
     except AccountError as error:
         raise _account_error(error) from error
     return {
@@ -184,6 +195,51 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
         "bot_state": account.bot_state,
         "execution_mode": account.execution_mode,
         "live_execution_enabled": account.live_execution_enabled,
+    }
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/strategy-configs", tags=["strategies"])
+def list_strategy_configs(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    configs = strategy_configs.setdefault(account_id, canonical_configs(account_id))
+    return {
+        "account_id": account_id,
+        "configs": [
+            {
+                "id": config.id,
+                "template_key": config.template_key,
+                "pair": config.pair,
+                "strategy": config.strategy,
+                "version": config.version,
+                "activation_status": config.activation_status,
+            }
+            for config in configs
+        ],
+        "has_more": False,
+    }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/strategy-evaluations", tags=["strategies"])
+def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    configs = strategy_configs.setdefault(account_id, canonical_configs(account_id))
+    config = next((item for item in configs if item.id == request.config_version_id), None)
+    if config is None:
+        raise HTTPException(status_code=404, detail="StrategyConfig version not found")
+    result = evaluate_snapshot({**request.snapshot, "account_id": account_id}, config)
+    payload = result.as_dict()
+    if result.opportunity:
+        opportunities.setdefault(account_id, []).append(payload["opportunity"])
+    return payload
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
+def list_opportunities(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    return {
+        "account_id": account_id,
+        "opportunities": opportunities.get(account_id, []),
+        "has_more": False,
     }
 
 
