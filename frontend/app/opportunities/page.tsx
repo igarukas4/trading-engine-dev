@@ -5,16 +5,28 @@ import { useEffect, useState } from "react";
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 type RiskAssessment = { approved: boolean; reason_codes: string[] };
-type Signal = {
-  id: string;
+type SignalOpportunity = {
   pair: string;
   direction: string;
+  confidence: string;
+  reason_codes: string[];
+};
+type Signal = {
+  id: string;
+  opportunity: SignalOpportunity;
   status: string;
   expires_at: string;
   reason_codes: string[];
   risk_assessment: RiskAssessment;
 };
-type Opportunity = { id?: string; pair: string; direction: string; confidence: string; reason_codes: string[]; signals?: Signal[] };
+type Opportunity = {
+  id?: string;
+  pair: string;
+  direction: string;
+  confidence: string;
+  reason_codes: string[];
+  signals?: Signal[];
+};
 
 export default function OpportunitiesPage() {
   const [account, setAccount] = useState("");

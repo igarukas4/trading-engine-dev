@@ -467,36 +467,57 @@ def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> di
 
 
 def _signals_for_account(account_id: str) -> list[dict[str, Any]]:
-    return sorted([
+    account_signals = [
         signal.as_dict()
         for signal in signals.signals.values()
         if signal.account_id == account_id
-    ], key=lambda signal: signal["created_at"], reverse=True)
+    ]
+    return sorted(
+        account_signals,
+        key=lambda signal: signal["created_at"],
+        reverse=True,
+    )
 
 
 def _signals_for_opportunity(account_id: str, opportunity_id: Any) -> list[dict[str, Any]]:
-    return sorted([
+    opportunity_signals = [
         signal.as_dict()
         for signal in signals.signals.values()
         if signal.account_id == account_id
         and signal.opportunity.get("id") == opportunity_id
-    ], key=lambda signal: signal["created_at"], reverse=True)
+    ]
+    return sorted(
+        opportunity_signals,
+        key=lambda signal: signal["created_at"],
+        reverse=True,
+    )
 
 
-def _risk_kwargs(request: SignalEnrichmentRequest, account_state: str,
-                 policy: EnrichmentPolicy | None, account_id: str) -> dict[str, Any]:
-    # Risk inputs are observations owned by the backend.  Browser-supplied
-    # booleans and measurements are intentionally ignored.
-    policy_healthy = bool(policy)
-    if policy:
-        for currency in policy.required_currencies:
-            health = calendar_health.get(account_id, {}).get(currency)
-            ttl = policy.freshness_ttl_seconds.get("calendar", 3600)
-            if health is None or not health.is_fresh(ttl_seconds=ttl):
-                policy_healthy = False
-                break
-    return {"baseline_samples": 0, "account_state": account_state,
-            "policy_healthy": policy_healthy, "calendar_blackout": False}
+def _policy_is_healthy(account_id: str, policy: EnrichmentPolicy | None) -> bool:
+    if policy is None:
+        return False
+
+    ttl = policy.freshness_ttl_seconds.get("calendar", 3600)
+    account_health = calendar_health.get(account_id, {})
+    for currency in policy.required_currencies:
+        health = account_health.get(currency)
+        if health is None or not health.is_fresh(ttl_seconds=ttl):
+            return False
+    return True
+
+
+def _backend_risk_context(
+    account_state: str,
+    policy: EnrichmentPolicy | None,
+    account_id: str,
+) -> dict[str, Any]:
+    # Risk context is derived from backend-owned account and policy state.
+    return {
+        "baseline_samples": 0,
+        "account_state": account_state,
+        "policy_healthy": _policy_is_healthy(account_id, policy),
+        "calendar_blackout": False,
+    }
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
@@ -509,8 +530,11 @@ def list_opportunities(account_id: str) -> dict[str, Any]:
                 **item,
                 "signals": _signals_for_opportunity(account_id, item.get("id")),
             }
-            for item in sorted(opportunities.get(account_id, []),
-                               key=lambda item: item.get("created_at", ""), reverse=True)
+            for item in sorted(
+                opportunities.get(account_id, []),
+                key=lambda item: item.get("created_at", ""),
+                reverse=True,
+            )
         ],
         "has_more": False,
     }
@@ -533,7 +557,7 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
         raise HTTPException(status_code=409, detail="EnrichmentPolicy version is not account-scoped/current")
     limits = risk_limits.active(account_id)
     account = accounts.accounts[account_id]
-    risk_kwargs = _risk_kwargs(request, account.bot_state, policy, account_id)
+    risk_kwargs = _backend_risk_context(account.bot_state, policy, account_id)
     try:
         signal = signals.create(
             account_id=account_id,
