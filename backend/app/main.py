@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal, TypedDict
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -12,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from psycopg import connect
 
 from .broker_accounts import AccountError, AccountRegistry
+from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,41 @@ class ConnectorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     secret: str = Field(min_length=32, max_length=512)
+
+
+class CandleIngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pair: str = Field(min_length=1, max_length=40)
+    open_time: datetime
+    close_time: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    tick_volume: int = 0
+    real_volume: int = 0
+    spread: Decimal = Decimal("0")
+    source_revision: str = Field(min_length=1, max_length=80)
+    is_closed: bool
+
+
+class QuoteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pair: str = Field(min_length=1, max_length=40)
+    bid: Decimal
+    ask: Decimal
+    observed_at: datetime
+
+
+class PairMappingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    canonical_code: str = Field(min_length=1, max_length=40)
+    broker_symbol: str = Field(min_length=1, max_length=80)
+    base_currency: str = Field(default="", max_length=3)
+    quote_currency: str = Field(default="", max_length=3)
 
 
 def _account_error(error: AccountError) -> HTTPException:
@@ -167,6 +205,77 @@ def broker_account_snapshot(account_id: str) -> dict[str, Any]:
         return accounts.read_only_snapshot(account_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="BrokerAccount not found") from error
+
+
+def _require_account(account_id: str) -> None:
+    if account_id not in accounts.accounts:
+        raise HTTPException(status_code=404, detail="BrokerAccount not found")
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/candles", status_code=status.HTTP_202_ACCEPTED, tags=["markets"])
+def ingest_closed_m1(account_id: str, request: CandleIngestRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        candle = market_data.ingest_candle(account_id, Candle(account_id, request.pair, "M1", request.open_time, request.close_time,
+            request.open, request.high, request.low, request.close, request.tick_volume, request.real_volume,
+            request.spread, request.source_revision, request.is_closed))
+    except AccountError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from error
+    return {"account_id": account_id, "pair": candle.pair, "timeframe": candle.timeframe, "accepted": True}
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/pairs", tags=["markets"])
+def market_pairs(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    pairs = [mapping.__dict__ for mapping in market_data.pairs.get(account_id, {}).values()]
+    return {"account_id": account_id, "pairs": pairs, "has_more": False}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/pairs", status_code=status.HTTP_201_CREATED, tags=["markets"])
+def register_pair_mapping(account_id: str, request: PairMappingRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        mapping = market_data.register_pair(account_id, PairMapping(account_id, **request.model_dump()))
+    except AccountError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code, "message": str(error)}) from error
+    return mapping.__dict__
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/candles", tags=["markets"])
+def market_candles(account_id: str, pair: str, timeframe: str = "M15") -> dict[str, Any]:
+    _require_account(account_id)
+    if timeframe not in {"M1", "M5", "M15", "H1", "H4", "D1"}:
+        raise HTTPException(status_code=422, detail="unsupported timeframe")
+    candles = market_data.aggregate(account_id, pair, timeframe)  # type: ignore[arg-type]
+    return {"account_id": account_id, "pair": pair, "timeframe": timeframe, "candles": [c.__dict__ for c in candles], "has_more": False}
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/market-state", tags=["markets"])
+def market_state(account_id: str, pair: str, timeframe: str = "M15") -> dict[str, Any]:
+    _require_account(account_id)
+    snapshot = market_data.build_snapshot(account_id, pair, timeframe)  # type: ignore[arg-type]
+    return {"account_id": account_id, "pair": pair, "timeframe": timeframe, "snapshot": snapshot.__dict__}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/market-data/resync", tags=["markets"])
+def resync_market_data(account_id: str, stream: str = "markets") -> dict[str, Any]:
+    _require_account(account_id)
+    return market_data.resync(account_id, stream)
+
+
+@app.websocket("/ws/v1/quotes")
+async def quote_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        while True:
+            message = await websocket.receive_json()
+            account_id = message.get("account_id")
+            _require_account(account_id)
+            quote = QuoteTelemetry(account_id, message["pair"], Decimal(str(message["bid"])), Decimal(str(message["ask"])), datetime.now(timezone.utc))
+            market_data.ingest_quote(account_id, quote)
+            await websocket.send_json({"type": "quote", "account_id": account_id, "pair": quote.pair, "bid": str(quote.bid), "ask": str(quote.ask), "non_canonical": True})
+    except (WebSocketDisconnect, KeyError, HTTPException):
+        return
 
 
 @app.websocket("/ws/v1/connector")

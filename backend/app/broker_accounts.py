@@ -21,6 +21,8 @@ AccountErrorCode = Literal[
     "WRONG_ACCOUNT",
     "NOT_READY",
     "INVALID_KEY",
+    "INCOMPLETE_MARKET_DATA",
+    "OPEN_CANDLE_INPUT",
 ]
 
 
