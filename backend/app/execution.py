@@ -165,6 +165,24 @@ OperatorCommandKind = Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
 
 
 @dataclass
+class GlobalEmergencyTarget:
+    operation_id: str
+    account_id: str
+    requested_kind: Literal["STOP_ONLY", "CLOSE_ALL"]
+    status: Literal["PENDING", "CONVERGED", "UNRESOLVED"] = "PENDING"
+    detail: str | None = None
+
+
+@dataclass
+class GlobalEmergencyOperation:
+    id: str
+    requested_kind: Literal["STOP_ONLY", "CLOSE_ALL"]
+    target_account_ids: tuple[str, ...]
+    status: Literal["INCOMPLETE", "COMPLETE"] = "INCOMPLETE"
+    targets: dict[str, GlobalEmergencyTarget] = field(default_factory=dict)
+
+
+@dataclass
 class OperatorCommand:
     """An auditable, idempotent operator action tied to one account."""
 
@@ -202,6 +220,7 @@ class ExecutionSubstrate:
         self.commands: dict[str, OperatorCommand] = {}
         self._command_keys: dict[tuple[str, str], str] = {}
         self._approved_signals: dict[tuple[str, str], str] = {}
+        self.global_emergencies: dict[str, GlobalEmergencyOperation] = {}
 
     def _lock_for(self, account_id: str) -> threading.RLock:
         return self._locks.setdefault(account_id, threading.RLock())
@@ -347,6 +366,74 @@ class ExecutionSubstrate:
             )
             command.status, command.order_id = "EXECUTED", result.order.id
             return result
+
+    def schedule_automated_signal(
+        self, *, account_id: str, signal_id: str, idempotency_key: str,
+        mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"],
+        signal_created_at: datetime, signal_revision: int, signal_eligible: bool,
+        signal_approved: bool, mode_changed_at: datetime,
+        risk_approved: bool, signal_fresh: bool, fence_safe: bool,
+        account_state: str, live_lock: bool, execution_epoch: int,
+        order_payload: dict[str, Any], risk_amount: str = "0",
+    ) -> PreOrderResult:
+        """Schedule exactly one account-local order for an eligible Signal."""
+        with self._lock_for(account_id):
+            if mode == "MANUAL":
+                raise ExecutionError("AUTOMATION_DISABLED")
+            if signal_created_at < mode_changed_at:
+                raise ExecutionError("SIGNAL_PRECEDES_MODE_CHANGE")
+            if not signal_eligible or signal_revision < 1:
+                raise ExecutionError("SIGNAL_NOT_ELIGIBLE")
+            if mode == "SEMI_AUTO" and not signal_approved:
+                raise ExecutionError("SIGNAL_APPROVAL_REQUIRED")
+            if not all((risk_approved, signal_fresh, fence_safe, live_lock)):
+                raise ExecutionError("EXECUTION_GATE_UNSAFE")
+            if account_state != "RUNNING":
+                raise ExecutionError("ACCOUNT_STATE_UNSAFE")
+            if order_payload.get("signal_revision") not in (None, signal_revision):
+                raise ExecutionError("SIGNAL_REVISION_CHANGED")
+            if not order_payload.get("stop_loss") or not order_payload.get("take_profit"):
+                raise ExecutionError("NATIVE_PROTECTION_REQUIRED")
+            return self.pre_order(
+                account_id=account_id, signal_id=signal_id,
+                idempotency_key=idempotency_key,
+                canonical_hash=json.dumps(order_payload, sort_keys=True),
+                risk_approved=True, execution_epoch=execution_epoch,
+                order_payload=order_payload, risk_amount=risk_amount,
+            )
+
+    def begin_global_emergency(
+        self, account_ids: list[str] | tuple[str, ...], *,
+        kind: Literal["STOP_ONLY", "CLOSE_ALL"] = "STOP_ONLY",
+    ) -> GlobalEmergencyOperation:
+        """Freeze target membership at acceptance; convergence is explicit per account."""
+        targets = tuple(dict.fromkeys(account_ids))
+        if not targets:
+            raise ExecutionError("GLOBAL_TARGETS_REQUIRED")
+        operation = GlobalEmergencyOperation(str(uuid4()), kind, targets)
+        operation.targets = {
+            account_id: GlobalEmergencyTarget(operation.id, account_id, kind)
+            for account_id in targets
+        }
+        self.global_emergencies[operation.id] = operation
+        for account_id in targets:
+            self.emergency_stop(account_id)
+        return operation
+
+    def converge_global_target(
+        self, operation_id: str, account_id: str, *,
+        resolved: bool, detail: str | None = None,
+    ) -> GlobalEmergencyOperation:
+        operation = self.global_emergencies.get(operation_id)
+        if operation is None or account_id not in operation.targets:
+            raise ExecutionError("GLOBAL_TARGET_NOT_FOUND")
+        target = operation.targets[account_id]
+        target.status = "CONVERGED" if resolved else "UNRESOLVED"
+        target.detail = detail
+        operation.status = "COMPLETE" if all(
+            item.status == "CONVERGED" for item in operation.targets.values()
+        ) else "INCOMPLETE"
+        return operation
 
     def close_all(
         self, *, account_id: str, idempotency_key: str, reason: str,

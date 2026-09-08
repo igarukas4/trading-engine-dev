@@ -97,6 +97,17 @@ class BrokerAccountRegistration(BaseModel):
     environment: Literal["DEMO", "LIVE"]
 
 
+class ExecutionModeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"]
+
+
+class GlobalEmergencyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_ids: tuple[str, ...] = Field(min_length=1)
+    kind: Literal["STOP_ONLY", "CLOSE_ALL"] = "STOP_ONLY"
+
+
 class ConnectorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -320,6 +331,54 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
         "bot_state": account.bot_state,
         "execution_mode": account.execution_mode,
         "live_execution_enabled": account.live_execution_enabled,
+    }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/execution-mode", tags=["execution"])
+def set_execution_mode(account_id: str, request: ExecutionModeRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    account = accounts.set_execution_mode(account_id, request.mode)
+    return {
+        "account_id": account_id,
+        "execution_mode": account.execution_mode,
+        "execution_mode_revision": account.execution_mode_revision,
+        "mode_changed_at": account.mode_changed_at.isoformat(),
+    }
+
+
+@app.post("/api/v1/emergency", tags=["execution"])
+def begin_global_emergency(request: GlobalEmergencyRequest) -> dict[str, Any]:
+    unknown = [account_id for account_id in request.account_ids if account_id not in accounts.accounts]
+    if unknown:
+        raise HTTPException(status_code=404, detail={"code": "WRONG_ACCOUNT", "account_ids": unknown})
+    try:
+        operation = execution.begin_global_emergency(list(request.account_ids), kind=request.kind)
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    return {
+        "id": operation.id,
+        "kind": operation.requested_kind,
+        "status": operation.status,
+        "target_account_ids": list(operation.target_account_ids),
+        "targets": {account_id: target.__dict__ for account_id, target in operation.targets.items()},
+    }
+
+
+@app.post("/api/v1/emergency/{operation_id}/targets/{account_id}/converge", tags=["execution"])
+def converge_global_emergency_target(
+    operation_id: str, account_id: str, resolved: bool = True, detail: str | None = None,
+) -> dict[str, Any]:
+    try:
+        operation = execution.converge_global_target(
+            operation_id, account_id, resolved=resolved, detail=detail,
+        )
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    return {
+        "id": operation.id,
+        "status": operation.status,
+        "target_account_ids": list(operation.target_account_ids),
+        "targets": {target_id: target.__dict__ for target_id, target in operation.targets.items()},
     }
 
 

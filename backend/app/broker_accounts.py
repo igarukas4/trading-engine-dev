@@ -84,6 +84,8 @@ class BrokerAccount:
     risk_limits_active: bool = False
     mappings_valid: bool = False
     version: int = 1
+    execution_mode_revision: int = 1
+    mode_changed_at: datetime = field(default_factory=_utcnow)
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -107,6 +109,35 @@ class BrokerAccount:
             raise AccountError("NOT_READY", "account readiness gates are not healthy")
         self.lifecycle_status = "ENABLED"
         self.version += 1
+
+    def set_execution_mode(self, mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"], *, now: datetime | None = None) -> None:
+        """Change automation only for this account and fence old Signals."""
+        if mode == self.execution_mode:
+            return
+        self.execution_mode = mode
+        self.execution_mode_revision += 1
+        self.mode_changed_at = now or _utcnow()
+        self.version += 1
+
+    def automation_eligible(
+        self,
+        *,
+        signal_created_at: datetime,
+        signal_revision: int,
+        eligible: bool,
+        approved: bool,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return whether this account may schedule one Signal automatically."""
+        current = now or _utcnow()
+        if not eligible or signal_revision < 1 or signal_created_at > current:
+            return False
+        # A mode change is an explicit fence: it can never wake an older Signal.
+        if signal_created_at < self.mode_changed_at:
+            return False
+        if self.execution_mode == "FULL_AUTO":
+            return True
+        return self.execution_mode == "SEMI_AUTO" and approved
 
 
 @dataclass
@@ -186,6 +217,19 @@ class AccountRegistry:
         account.last_heartbeat_at = now
         return account
 
+    def set_execution_mode(
+        self,
+        account_id: str,
+        mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"],
+        *,
+        now: datetime | None = None,
+    ) -> BrokerAccount:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
+        account.set_execution_mode(mode, now=now)
+        return account
+
     def read_only_snapshot(self, account_id: str) -> dict[str, Any]:
         account = self.accounts[account_id]
         return {
@@ -198,6 +242,8 @@ class AccountRegistry:
             "lifecycle_status": account.lifecycle_status,
             "bot_state": account.bot_state,
             "execution_mode": account.execution_mode,
+            "execution_mode_revision": account.execution_mode_revision,
+            "mode_changed_at": account.mode_changed_at.isoformat(),
             "live_execution_enabled": account.live_execution_enabled,
             "connector": {
                 "bound": account.connector_bound,
