@@ -13,11 +13,14 @@ test("Sandcastle only plans ready agent tickets serially", () => {
 
 test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {
   assert.match(main, /process\.loadEnvFile\("\.sandcastle\/\.env"\)/);
-  assert.match(main, /const sandboxEnv = \{ GH_TOKEN: ghToken \}/);
+  assert.match(main, /const sandboxEnv = \{ GH_TOKEN: ghToken, CODEX_HOME: "\/tmp\/codex" \}/);
+  assert.match(main, /sandboxPath: "\/home\/agent\/\.codex-source"/);
+  assert.match(main, /readonly: true/);
 });
 
 test("Sandcastle uses the approved Codex model and effort", () => {
-  assert.match(main, /codex\("gpt-5\.6-luna", \{ effort: "medium" \}\)/);
+  assert.match(main, /codex\("gpt-5\.6-luna", \{\s+effort: "medium",/);
+  assert.match(main, /captureSessions: false/);
 });
 
 test("sandbox installs the committed Node dependency graph", () => {

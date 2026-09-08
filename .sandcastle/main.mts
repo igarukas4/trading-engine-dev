@@ -36,7 +36,7 @@ if (!ghToken) {
   throw new Error("GH_TOKEN must be set in .sandcastle/.env or the environment.");
 }
 
-const sandboxEnv = { GH_TOKEN: ghToken };
+const sandboxEnv = { GH_TOKEN: ghToken, CODEX_HOME: "/tmp/codex" };
 
 // The planner emits its plan as JSON inside <plan> tags; Output.object extracts
 // and validates it against this schema. We use Zod here, but any Standard
@@ -66,29 +66,42 @@ const MAX_ITERATIONS = 100;
 // Keep Codex usage predictable for the ChatGPT Plus rate limit. The planner
 // returns exactly one ready, unblocked issue, so this provider is never used
 // concurrently by this workflow.
-const codeAgent = sandcastle.codex("gpt-5.6-luna", { effort: "medium" });
+const codeAgent = sandcastle.codex("gpt-5.6-luna", {
+  effort: "medium",
+  captureSessions: false,
+});
 
 // Hooks run inside the sandbox before the agent starts each iteration.
 // npm ci installs the exact versions recorded in the committed lockfile.
 const hooks = {
-  sandbox: { onSandboxReady: [{ command: "npm ci" }] },
+  sandbox: {
+    onSandboxReady: [
+      {
+        command:
+          'mkdir -p "$CODEX_HOME" && cp /home/agent/.codex-source/auth.json "$CODEX_HOME"/ && if [ -f /home/agent/.codex-source/config.toml ]; then cp /home/agent/.codex-source/config.toml "$CODEX_HOME"/; fi',
+      },
+      { command: "npm ci" },
+    ],
+  },
 };
 
-// Copy node_modules from the host into the worktree before each sandbox
-// starts. The hook above re-installs platform-specific binaries from the lockfile.
-const copyToWorktree = ["node_modules"];
+const authHooks = {
+  sandbox: { onSandboxReady: [hooks.sandbox.onSandboxReady[0]] },
+};
 
 // Reuse the host's Codex CLI login inside this trusted local sandbox. This
 // lets Codex authenticate through the active ChatGPT subscription instead of
-// requiring an OpenAI API key. The mount must remain writable so Codex can
-// refresh its session. Do not use this setup with an untrusted container.
+// requiring an OpenAI API key. Runtime state is copied to native container
+// storage, so the credential source mount stays read-only. Do not use this
+// setup with an untrusted container.
 const sandboxProvider = docker({
   imageName: "sandcastle:trading-engine-v0",
   env: sandboxEnv,
   mounts: [
     {
       hostPath: "~/.codex",
-      sandboxPath: "/home/agent/.codex",
+      sandboxPath: "/home/agent/.codex-source",
+      readonly: true,
     },
   ],
 });
@@ -110,8 +123,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // It outputs a <plan> JSON block — Output.object parses and validates it.
   // -------------------------------------------------------------------------
   const plan = await sandcastle.run({
-    hooks,
+    hooks: authHooks,
     sandbox: sandboxProvider,
+    branchStrategy: { type: "merge-to-head" },
     name: "planner",
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
@@ -157,7 +171,6 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         branch: issue.branch,
         sandbox: sandboxProvider,
         hooks,
-        copyToWorktree,
       });
 
       try {
@@ -257,6 +270,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   await sandcastle.run({
     hooks,
     sandbox: sandboxProvider,
+    branchStrategy: { type: "merge-to-head" },
     name: "merger",
     maxIterations: 1,
     agent: codeAgent,
