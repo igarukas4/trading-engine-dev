@@ -410,11 +410,17 @@ class ExecutionSubstrate:
         targets = tuple(dict.fromkeys(account_ids))
         if not targets:
             raise ExecutionError("GLOBAL_TARGETS_REQUIRED")
-        operation = GlobalEmergencyOperation(str(uuid4()), kind, targets)
-        operation.targets = {
-            account_id: GlobalEmergencyTarget(operation.id, account_id, kind)
+        operation_id = str(uuid4())
+        target_records = {
+            account_id: GlobalEmergencyTarget(operation_id, account_id, kind)
             for account_id in targets
         }
+        operation = GlobalEmergencyOperation(
+            id=operation_id,
+            requested_kind=kind,
+            target_account_ids=targets,
+            targets=target_records,
+        )
         self.global_emergencies[operation.id] = operation
         for account_id in targets:
             self.emergency_stop(account_id)

@@ -27,7 +27,7 @@ from .risk_calendar import (
     RiskLimitsStore,
 )
 from .signals import SignalStore
-from .execution import ExecutionError, ExecutionSubstrate
+from .execution import ExecutionError, ExecutionSubstrate, GlobalEmergencyOperation
 
 
 @dataclass(frozen=True)
@@ -334,6 +334,25 @@ def register_broker_account(request: BrokerAccountRegistration) -> dict[str, Any
     }
 
 
+def _global_emergency_payload(
+    operation: GlobalEmergencyOperation, *, include_kind: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"id": operation.id}
+    if include_kind:
+        payload["kind"] = operation.requested_kind
+    payload.update(
+        {
+            "status": operation.status,
+            "target_account_ids": list(operation.target_account_ids),
+            "targets": {
+                account_id: target.__dict__
+                for account_id, target in operation.targets.items()
+            },
+        }
+    )
+    return payload
+
+
 @app.post("/api/v1/broker-accounts/{account_id}/execution-mode", tags=["execution"])
 def set_execution_mode(account_id: str, request: ExecutionModeRequest) -> dict[str, Any]:
     _require_account(account_id)
@@ -355,13 +374,7 @@ def begin_global_emergency(request: GlobalEmergencyRequest) -> dict[str, Any]:
         operation = execution.begin_global_emergency(list(request.account_ids), kind=request.kind)
     except ExecutionError as error:
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
-    return {
-        "id": operation.id,
-        "kind": operation.requested_kind,
-        "status": operation.status,
-        "target_account_ids": list(operation.target_account_ids),
-        "targets": {account_id: target.__dict__ for account_id, target in operation.targets.items()},
-    }
+    return _global_emergency_payload(operation, include_kind=True)
 
 
 @app.post("/api/v1/emergency/{operation_id}/targets/{account_id}/converge", tags=["execution"])
@@ -374,12 +387,7 @@ def converge_global_emergency_target(
         )
     except ExecutionError as error:
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
-    return {
-        "id": operation.id,
-        "status": operation.status,
-        "target_account_ids": list(operation.target_account_ids),
-        "targets": {target_id: target.__dict__ for target_id, target in operation.targets.items()},
-    }
+    return _global_emergency_payload(operation)
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/strategy-configs", tags=["strategies"])
