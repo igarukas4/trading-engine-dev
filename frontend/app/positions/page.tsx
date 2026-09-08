@@ -1,4 +1,38 @@
 "use client";
 import { useEffect, useState } from "react";
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-export default function PositionsPage() { const [positions, setPositions] = useState<Array<Record<string, string>>>([]); useEffect(() => { const account = new URLSearchParams(window.location.search).get("account"); if (account) fetch(`${apiBase}/api/v1/broker-accounts/${account}/dashboard-snapshot`).then((response) => response.json()).then((value) => setPositions(value.positions ?? [])).catch(() => setPositions([])); }, []); return <main><h1>Positions</h1>{positions.length ? positions.map((position) => <article key={`${position.account_id}-${position.order_id}`}><h2>Position {position.order_id}</h2><p>Volume: {position.remaining_volume} · Protection: {position.protection_status} · Stage: {position.stage}</p></article>) : <p>Tidak ada Position pada account ini.</p>}</main>; }
+
+type Position = Record<string, string>;
+
+export default function PositionsPage() {
+  const [positions, setPositions] = useState<Position[]>([]);
+
+  useEffect(() => {
+    const account = new URLSearchParams(window.location.search).get("account");
+    if (account) {
+      fetch(`${apiBase}/api/v1/broker-accounts/${account}/dashboard-snapshot`)
+        .then((response) => response.json())
+        .then((value) => setPositions(value.positions ?? []))
+        .catch(() => setPositions([]));
+    }
+  }, []);
+
+  return (
+    <main>
+      <h1>Positions</h1>
+      {positions.length ? (
+        positions.map((position) => (
+          <article key={`${position.account_id}-${position.order_id}`}>
+            <h2>Position {position.order_id}</h2>
+            <p>
+              Volume: {position.remaining_volume} · Protection: {position.protection_status} · Stage: {position.stage}
+            </p>
+          </article>
+        ))
+      ) : (
+        <p>Tidak ada Position pada account ini.</p>
+      )}
+    </main>
+  );
+}

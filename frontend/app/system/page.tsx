@@ -1,5 +1,69 @@
 "use client";
 import { useEffect, useState } from "react";
+
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-type Status = { status: string; version: string; services: Record<string, string>; execution_available: boolean; trading_enabled: boolean; message: string };
-export default function SystemPage() { const [status, setStatus] = useState<Status | null>(null); const [audit, setAudit] = useState<Array<{ id: string; event_type: string; reason: string }>>([]); useEffect(() => { fetch(`${apiBase}/api/v1/system/status`).then((response) => response.json()).then(setStatus).catch(() => setStatus(null)); }, []); useEffect(() => { const account = new URLSearchParams(window.location.search).get("account"); if (account) fetch(`${apiBase}/api/v1/broker-accounts/${account}/audit-events`).then((response) => response.json()).then((value) => setAudit(value.audit_events ?? [])).catch(() => setAudit([])); }, []); return <main><h1>System</h1>{!status && <p role="alert">Backend: Tidak tersedia</p>}{status && <section aria-label="Status sistem"><p>Status: {status.status}</p><p>Versi: {status.version}</p>{Object.entries(status.services).map(([name, value]) => <p key={name}>{name}: {value === "unavailable" ? "Tidak tersedia" : value}</p>)}<p>Execution available: {status.execution_available ? "Ya" : "Tidak"}</p><p>{status.message}</p></section>}<section aria-label="Audit timeline"><h2>AuditEvent / command timeline</h2>{audit.length ? audit.map((event) => <p key={event.id}>{event.event_type}: {event.reason}</p>) : <p>Pilih account untuk melihat audit kronologis.</p>}</section></main>; }
+
+type Status = {
+  status: string;
+  version: string;
+  services: Record<string, string>;
+  execution_available: boolean;
+  trading_enabled: boolean;
+  message: string;
+};
+
+type AuditEvent = { id: string; event_type: string; reason: string };
+
+export default function SystemPage() {
+  const [status, setStatus] = useState<Status | null>(null);
+  const [audit, setAudit] = useState<AuditEvent[]>([]);
+
+  useEffect(() => {
+    fetch(`${apiBase}/api/v1/system/status`)
+      .then((response) => response.json())
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  }, []);
+
+  useEffect(() => {
+    const account = new URLSearchParams(window.location.search).get("account");
+    if (account) {
+      fetch(`${apiBase}/api/v1/broker-accounts/${account}/audit-events`)
+        .then((response) => response.json())
+        .then((value) => setAudit(value.audit_events ?? []))
+        .catch(() => setAudit([]));
+    }
+  }, []);
+
+  return (
+    <main>
+      <h1>System</h1>
+      {!status && <p role="alert">Backend: Tidak tersedia</p>}
+      {status && (
+        <section aria-label="Status sistem">
+          <p>Status: {status.status}</p>
+          <p>Versi: {status.version}</p>
+          {Object.entries(status.services).map(([name, value]) => (
+            <p key={name}>
+              {name}: {value === "unavailable" ? "Tidak tersedia" : value}
+            </p>
+          ))}
+          <p>Execution available: {status.execution_available ? "Ya" : "Tidak"}</p>
+          <p>{status.message}</p>
+        </section>
+      )}
+      <section aria-label="Audit timeline">
+        <h2>AuditEvent / command timeline</h2>
+        {audit.length ? (
+          audit.map((event) => (
+            <p key={event.id}>
+              {event.event_type}: {event.reason}
+            </p>
+          ))
+        ) : (
+          <p>Pilih account untuk melihat audit kronologis.</p>
+        )}
+      </section>
+    </main>
+  );
+}

@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg import connect
 
-from .broker_accounts import AccountError, AccountRegistry
+from .broker_accounts import AccountError, AccountRegistry, BrokerAccount
 from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
 from .strategies import StrategyConfig, canonical_configs, evaluate_snapshot
 from .risk_calendar import (
@@ -87,6 +87,14 @@ activation_gate = ActivationGate()
 def _audit(account_id: str, event_type: str, reason: str = "", payload: dict[str, Any] | None = None) -> None:
     audit_hub.record(account_id, event_type, reason, payload)
     dashboard_hub.publish("account", account_id, event_type, payload or {})
+
+
+def _available_accounts() -> list[BrokerAccount]:
+    return [
+        account
+        for account in accounts.accounts.values()
+        if account.lifecycle_status != "ARCHIVED"
+    ]
 
 
 def _strategy_configs_for(account_id: str) -> tuple[StrategyConfig, ...]:
@@ -334,8 +342,7 @@ def list_broker_accounts() -> dict[str, Any]:
                 "execution_mode": account.execution_mode,
                 "version": account.version,
             }
-            for account in accounts.accounts.values()
-            if account.lifecycle_status != "ARCHIVED"
+            for account in _available_accounts()
         ],
         "has_more": False,
     }
@@ -343,38 +350,72 @@ def list_broker_accounts() -> dict[str, Any]:
 
 def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
     account = accounts.accounts[account_id]
-    stream_key = ("account", account_id)
     return {
         "account_id": account_id,
         "account": accounts.read_only_snapshot(account_id),
-        "watchlist": [mapping.__dict__ for mapping in market_data.pairs.get(account_id, {}).values()],
-        "opportunities": sorted(opportunities.get(account_id, []), key=lambda item: item.get("created_at", ""), reverse=True),
+        "watchlist": [
+            mapping.__dict__
+            for mapping in market_data.pairs.get(account_id, {}).values()
+        ],
+        "opportunities": sorted(
+            opportunities.get(account_id, []),
+            key=lambda item: item.get("created_at", ""),
+            reverse=True,
+        ),
         "signals": _signals_for_account(account_id),
-        "orders": [order.__dict__ for order in execution.orders.values() if order.account_id == account_id],
-        "fills": [fill.__dict__ for fill in execution.fills.values() if fill.account_id == account_id],
-        "positions": [position.__dict__ for position in execution.positions.values() if position.account_id == account_id],
+        "orders": [
+            order.__dict__
+            for order in execution.orders.values()
+            if order.account_id == account_id
+        ],
+        "fills": [
+            fill.__dict__
+            for fill in execution.fills.values()
+            if fill.account_id == account_id
+        ],
+        "positions": [
+            position.__dict__
+            for position in execution.positions.values()
+            if position.account_id == account_id
+        ],
         "audit_events": audit_hub.list(account_id, limit=50)["audit_events"],
-        "stream_watermark": dashboard_hub._sequences[stream_key],
+        "stream_watermark": dashboard_hub.watermark("account", account_id),
     }
 
 
 @app.get("/api/v1/dashboard-summary-snapshot", tags=["dashboard"])
 def dashboard_summary_snapshot() -> dict[str, Any]:
-    available = [account for account in accounts.accounts.values() if account.lifecycle_status != "ARCHIVED"]
+    available = _available_accounts()
     return {
         "accounts": [
             {
-                "account_id": account.id, "display_name": account.display_name,
-                "environment": account.environment, "lifecycle_status": account.lifecycle_status,
-                "bot_state": account.bot_state, "execution_mode": account.execution_mode,
-                "open_positions": sum(1 for position in execution.positions.values() if position.account_id == account.id and position.stage != "CLOSED"),
+                "account_id": account.id,
+                "display_name": account.display_name,
+                "environment": account.environment,
+                "lifecycle_status": account.lifecycle_status,
+                "bot_state": account.bot_state,
+                "execution_mode": account.execution_mode,
+                "open_positions": sum(
+                    1
+                    for position in execution.positions.values()
+                    if position.account_id == account.id
+                    and position.stage != "CLOSED"
+                ),
             }
             for account in available
         ],
-        "critical_alerts": [event for account_id in (account.id for account in available) for event in audit_hub.events.get(account_id, []) if event["event_type"].startswith("critical")],
+        "critical_alerts": [
+            event
+            for account in available
+            for event in audit_hub.events.get(account.id, [])
+            if event["event_type"].startswith("critical")
+        ],
         "global_emergency": [_global_emergency_payload(operation) for operation in execution.global_emergencies.values()],
-        "account_watermarks": {account.id: dashboard_hub._sequences[("account", account.id)] for account in available},
-        "system_watermark": dashboard_hub._sequences[("system", None)],
+        "account_watermarks": {
+            account.id: dashboard_hub.watermark("account", account.id)
+            for account in available
+        },
+        "system_watermark": dashboard_hub.watermark("system"),
         "execution_available": False,
         "cross_stream_total_order": False,
     }
