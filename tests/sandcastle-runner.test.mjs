@@ -20,6 +20,11 @@ test("Sandcastle uses the approved Codex model and effort", () => {
   assert.match(main, /codex\("gpt-5\.6-luna", \{ effort: "medium" \}\)/);
 });
 
+test("sandbox installs the committed Node dependency graph", () => {
+  assert.match(main, /command: "npm ci"/);
+  assert.doesNotMatch(main, /command: "npm install"/);
+});
+
 test("supervisor retries detected rate limits with bounded backoff", () => {
   assert.match(supervisor, /MaxRetries = 12/);
   assert.match(supervisor, /rate\[ -\]\?limit\|rate_limit/);

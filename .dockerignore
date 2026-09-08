@@ -1,0 +1,7 @@
+.git/
+node_modules/
+.agents/
+.sandcastle/.env
+.sandcastle/logs/
+.sandcastle/worktrees/
+HANDOFF.md

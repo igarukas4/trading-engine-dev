@@ -69,14 +69,13 @@ const MAX_ITERATIONS = 100;
 const codeAgent = sandcastle.codex("gpt-5.6-luna", { effort: "medium" });
 
 // Hooks run inside the sandbox before the agent starts each iteration.
-// npm install ensures the sandbox always has fresh dependencies.
+// npm ci installs the exact versions recorded in the committed lockfile.
 const hooks = {
-  sandbox: { onSandboxReady: [{ command: "npm install" }] },
+  sandbox: { onSandboxReady: [{ command: "npm ci" }] },
 };
 
 // Copy node_modules from the host into the worktree before each sandbox
-// starts. Avoids a full npm install from scratch; the hook above handles
-// platform-specific binaries and any packages added since the last copy.
+// starts. The hook above re-installs platform-specific binaries from the lockfile.
 const copyToWorktree = ["node_modules"];
 
 // Reuse the host's Codex CLI login inside this trusted local sandbox. This
