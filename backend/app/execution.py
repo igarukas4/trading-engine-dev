@@ -8,7 +8,6 @@ the journal/broker for truth before any further side effect.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 from dataclasses import dataclass, field
@@ -32,7 +31,9 @@ class AccountExecutionState:
     account_id: str
     next_dispatch_sequence: int = 1
     execution_epoch: int = 1
-    exposure_gate: Literal["OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"] = "OPEN"
+    exposure_gate: Literal[
+        "OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"
+    ] = "OPEN"
     fence_sequence: int = 0
 
 
@@ -55,7 +56,15 @@ class OrderIntent:
     execution_epoch: int
     dispatch_sequence: int
     payload: dict[str, Any]
-    status: Literal["INTENT", "DISPATCHING", "SUBMITTED", "REJECTED", "UNKNOWN", "FILLED", "CANCELLED"] = "INTENT"
+    status: Literal[
+        "INTENT",
+        "DISPATCHING",
+        "SUBMITTED",
+        "REJECTED",
+        "UNKNOWN",
+        "FILLED",
+        "CANCELLED",
+    ] = "INTENT"
     external_id: str | None = None
 
 
@@ -74,7 +83,13 @@ class ConnectorJournalEntry:
     account_id: str
     order_id: str
     dispatch_sequence: int
-    state: Literal["PREPARED", "DISPATCHING", "ACCEPTED", "REJECTED", "ABORTED_NOT_INVOKED"] = "PREPARED"
+    state: Literal[
+        "PREPARED",
+        "DISPATCHING",
+        "ACCEPTED",
+        "REJECTED",
+        "ABORTED_NOT_INVOKED",
+    ] = "PREPARED"
     external_id: str | None = None
     observed_at: datetime = field(default_factory=_now)
 
@@ -157,9 +172,9 @@ class ExecutionSubstrate:
                 if prior_hash != canonical_hash:
                     raise ExecutionError("IDEMPOTENCY_KEY_REUSED")
                 order = self.orders[prior_order_id]
-                return PreOrderResult(self._reservation_for(order.id), order, next(
-                    event for event in self.events.values() if event.order_id == order.id
-                ))
+                return PreOrderResult(
+                    self._reservation_for(order.id), order, self._event_for(order.id)
+                )
             if not risk_approved:
                 raise ExecutionError("PRE_ORDER_RISK_REJECTED")
             if account.exposure_gate != "OPEN":
@@ -168,9 +183,13 @@ class ExecutionSubstrate:
                 raise ExecutionError("STALE_EXECUTION_EPOCH")
             reservation = RiskReservation(str(uuid4()), account_id, signal_id, risk_amount)
             order = OrderIntent(
-                id=str(uuid4()), account_id=account_id, signal_id=signal_id,
-                idempotency_key=idempotency_key, canonical_hash=canonical_hash,
-                execution_epoch=execution_epoch, dispatch_sequence=account.next_dispatch_sequence,
+                id=str(uuid4()),
+                account_id=account_id,
+                signal_id=signal_id,
+                idempotency_key=idempotency_key,
+                canonical_hash=canonical_hash,
+                execution_epoch=execution_epoch,
+                dispatch_sequence=account.next_dispatch_sequence,
                 payload=json.loads(json.dumps(order_payload)),
             )
             account.next_dispatch_sequence += 1
@@ -183,10 +202,32 @@ class ExecutionSubstrate:
             return PreOrderResult(reservation, order, event)
 
     def outbox(self, account_id: str) -> list[OutboxEvent]:
-        return sorted((event for event in self.events.values() if event.account_id == account_id and event.status == "PENDING"), key=lambda event: event.dispatch_sequence)
+        pending = (
+            event
+            for event in self.events.values()
+            if event.account_id == account_id and event.status == "PENDING"
+        )
+        return sorted(pending, key=lambda event: event.dispatch_sequence)
 
     def _reservation_for(self, order_id: str) -> RiskReservation:
         return self.reservations[self._order_reservations[order_id]]
+
+    def _event_for(self, order_id: str) -> OutboxEvent:
+        return next(event for event in self.events.values() if event.order_id == order_id)
+
+    def _reject_dispatch(
+        self,
+        event: OutboxEvent,
+        order: OrderIntent,
+        reservation: RiskReservation,
+        journal: ConnectorJournalEntry,
+        reason: str,
+    ) -> DispatchResult:
+        journal.state = "REJECTED"
+        event.status = "ABORTED"
+        order.status = "REJECTED"
+        reservation.status = "RELEASED"
+        return DispatchResult(order.id, "REJECTED", reason)
 
     def dispatch_next(self, account_id: str, connector: Any) -> DispatchResult:
         with self._lock_for(account_id):
@@ -197,7 +238,13 @@ class ExecutionSubstrate:
             order = self.orders[event.order_id]
             reservation = self._reservation_for(order.id)
             event.status = "DISPATCHING"
-            journal = ConnectorJournalEntry(str(uuid4()), account_id, order.id, order.dispatch_sequence, "DISPATCHING")
+            journal = ConnectorJournalEntry(
+                str(uuid4()),
+                account_id,
+                order.id,
+                order.dispatch_sequence,
+                "DISPATCHING",
+            )
             self.journal[order.id] = journal
             order.status = "DISPATCHING"
             try:
@@ -205,11 +252,9 @@ class ExecutionSubstrate:
             except Exception:
                 checked = False
             if not checked:
-                journal.state = "REJECTED"
-                event.status = "ABORTED"
-                order.status = "REJECTED"
-                reservation.status = "RELEASED"
-                return DispatchResult(order.id, "REJECTED", "ORDER_CHECK_FAILED")
+                return self._reject_dispatch(
+                    event, order, reservation, journal, "ORDER_CHECK_FAILED"
+                )
             try:
                 response = connector.order_send(order)
             except Exception:
@@ -219,12 +264,13 @@ class ExecutionSubstrate:
                 return DispatchResult(order.id, "UNKNOWN", "CONNECTOR_RESULT_AMBIGUOUS")
             accepted = response if isinstance(response, dict) else {"status": str(response)}
             if accepted.get("status") not in {"ACCEPTED", "SUBMITTED", "FILLED"}:
-                journal.state = "REJECTED"
-                event.status = "ABORTED"
-                order.status = "REJECTED"
-                reservation.status = "RELEASED"
-                return DispatchResult(order.id, "REJECTED", "CONNECTOR_REJECTED")
-            order.status = "FILLED" if accepted.get("status") == "FILLED" else "SUBMITTED"
+                return self._reject_dispatch(
+                    event, order, reservation, journal, "CONNECTOR_REJECTED"
+                )
+            if accepted.get("status") == "FILLED":
+                order.status = "FILLED"
+            else:
+                order.status = "SUBMITTED"
             order.external_id = accepted.get("external_id")
             journal.state = "ACCEPTED"
             journal.external_id = order.external_id
@@ -250,10 +296,15 @@ class ExecutionSubstrate:
                 observed = connector.broker_state(order)
             if not observed:
                 return DispatchResult(order.id, "UNKNOWN", "RECONCILIATION_PENDING")
-            status = observed.get("status") if isinstance(observed, dict) else str(observed)
+            if isinstance(observed, dict):
+                status = observed.get("status")
+                external_id = observed.get("external_id")
+            else:
+                status = str(observed)
+                external_id = None
             if status == "FILLED":
                 order.status = "FILLED"
-                order.external_id = observed.get("external_id") if isinstance(observed, dict) else None
+                order.external_id = external_id
                 journal.state = "ACCEPTED"
                 self._reservation_for(order.id).status = "CONSUMED"
             elif status in {"REJECTED", "NOT_FOUND"}:
@@ -262,14 +313,37 @@ class ExecutionSubstrate:
                 self._reservation_for(order.id).status = "RELEASED"
             return DispatchResult(order.id, order.status)
 
-    def record_fill(self, account_id: str, order_id: str, external_deal_id: str, volume: str, *, native_protection_confirmed: bool) -> Fill:
+    def record_fill(
+        self,
+        account_id: str,
+        order_id: str,
+        external_deal_id: str,
+        volume: str,
+        *,
+        native_protection_confirmed: bool,
+    ) -> Fill:
         with self._lock_for(account_id):
             order = self.orders.get(order_id)
             if order is None or order.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            if any(fill.external_deal_id == external_deal_id for fill in self.fills.values()):
-                return next(fill for fill in self.fills.values() if fill.external_deal_id == external_deal_id)
-            fill = Fill(str(uuid4()), account_id, order_id, external_deal_id, str(volume), native_protection_confirmed)
+            existing_fill = next(
+                (
+                    fill
+                    for fill in self.fills.values()
+                    if fill.external_deal_id == external_deal_id
+                ),
+                None,
+            )
+            if existing_fill is not None:
+                return existing_fill
+            fill = Fill(
+                str(uuid4()),
+                account_id,
+                order_id,
+                external_deal_id,
+                str(volume),
+                native_protection_confirmed,
+            )
             self.fills[fill.id] = fill
             order.status = "FILLED"
             self._reservation_for(order_id).status = "CONSUMED"
