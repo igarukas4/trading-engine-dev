@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal, TypedDict
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +25,7 @@ from .risk_calendar import (
     RiskLimits,
     RiskLimitsStore,
 )
+from .signals import SignalStore
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ app.add_middleware(
 accounts = AccountRegistry()
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
+signals = SignalStore()
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[str, EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
@@ -184,6 +187,27 @@ class SessionChoiceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_policy: Literal["ALL_BROKER_OPEN", "LONDON", "NEW_YORK", "LONDON_NEW_YORK_OVERLAP"]
     reason: str = Field(min_length=1, max_length=500)
+
+
+class SignalEnrichmentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    opportunity_id: str = Field(min_length=1, max_length=200)
+    market_snapshot_id: str = Field(min_length=1, max_length=200)
+    policy_version: int = Field(ge=1)
+    entry_zone: dict[str, Any] = Field(default_factory=dict)
+    stop_loss: Decimal = Decimal("0")
+    take_profit: tuple[Decimal, ...] = ()
+    ttl_seconds: int = Field(default=1800, ge=1, le=86400)
+    baseline_samples: int = Field(default=0, ge=0)
+    daily_loss: Decimal = Decimal("0")
+    open_positions: int = Field(default=0, ge=0)
+    open_risk: Decimal = Decimal("0")
+    requested_risk: Decimal = Decimal("0")
+    spread_multiple: Decimal | None = None
+    volatility_multiple: Decimal | None = None
+    policy_healthy: bool = True
+    calendar_blackout: bool = False
 
 
 def _account_error(error: AccountError) -> HTTPException:
@@ -430,6 +454,9 @@ def evaluate_strategy(account_id: str, request: StrategyEvaluationRequest) -> di
     payload = result.as_dict()
     if result.opportunity:
         opportunities.setdefault(account_id, []).append(payload["opportunity"])
+        opportunity = opportunities[account_id][-1]
+        opportunity["id"] = f"opportunity-{uuid4()}"
+        opportunity["market_snapshot_id"] = str(request.snapshot.get("snapshot_id", ""))
     return payload
 
 
@@ -438,9 +465,61 @@ def list_opportunities(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return {
         "account_id": account_id,
-        "opportunities": opportunities.get(account_id, []),
+        "opportunities": [
+            {
+                **item,
+                "signals": [signal.as_dict() for signal in signals.signals.values()
+                            if signal.account_id == account_id and signal.opportunity.get("id") == item.get("id")],
+            }
+            for item in opportunities.get(account_id, [])
+        ],
         "has_more": False,
     }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/signals", status_code=status.HTTP_201_CREATED, tags=["signals"])
+def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    opportunity = next(
+        (item for item in opportunities.get(account_id, []) if item.get("id") == request.opportunity_id),
+        None,
+    )
+    if opportunity is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    limits = risk_limits.active(account_id)
+    account = accounts.accounts[account_id]
+    risk_kwargs = request.model_dump(exclude={"opportunity_id", "market_snapshot_id", "policy_version", "entry_zone", "stop_loss", "take_profit", "ttl_seconds", "policy_healthy", "calendar_blackout"})
+    risk_kwargs.update({"policy_healthy": request.policy_healthy, "calendar_blackout": request.calendar_blackout, "account_state": account.bot_state})
+    signal = signals.create(
+        account_id=account_id, opportunity=opportunity,
+        market_snapshot_id=request.market_snapshot_id or opportunity.get("market_snapshot_id", ""),
+        policy_version=request.policy_version, ttl=timedelta(seconds=request.ttl_seconds),
+        entry_zone=request.entry_zone, stop_loss=request.stop_loss, take_profit=request.take_profit,
+        limits=limits, risk_kwargs=risk_kwargs,
+    )
+    return signal.as_dict()
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/signals", tags=["signals"])
+def list_signals(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    return {
+        "account_id": account_id,
+        "signals": [signal.as_dict() for signal in signals.signals.values() if signal.account_id == account_id],
+        "has_more": False,
+    }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/revise", status_code=status.HTTP_201_CREATED, tags=["signals"])
+def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        signal = signals.get(signal_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Signal not found") from error
+    if signal.account_id != account_id:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    return signals.create_revision(signal_id, policy_version=policy_version).as_dict()
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/connector-binding", tags=["broker-accounts"])

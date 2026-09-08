@@ -149,6 +149,9 @@ class RiskAssessment:
     approved: bool
     reason_codes: tuple[str, ...] = ()
     valid_until: datetime | None = None
+    purpose: Literal["INITIAL", "PRE_ORDER"] = "INITIAL"
+    signal_revision: int | None = None
+    assessed_at: datetime | None = None
 
 
 class RiskEngine:
@@ -164,8 +167,23 @@ class RiskEngine:
         open_positions: int = 0,
         open_risk: Decimal = Decimal("0"),
         requested_risk: Decimal = Decimal("0"),
+        purpose: Literal["INITIAL", "PRE_ORDER"] = "INITIAL",
+        now: datetime | None = None,
+        signal_expires_at: datetime | None = None,
+        policy_healthy: bool = True,
+        calendar_blackout: bool = False,
+        spread_multiple: Decimal | None = None,
+        volatility_multiple: Decimal | None = None,
+        account_state: str = "RUNNING",
+        signal_revision: int | None = None,
+        approved_revision: int | None = None,
     ) -> RiskAssessment:
         reasons: list[str] = []
+        assessed_at = now or _now()
+        if signal_revision is not None and approved_revision is not None and signal_revision != approved_revision:
+            reasons.append("SIGNAL_REVISION_CHANGED")
+        if signal_expires_at is not None and assessed_at >= signal_expires_at:
+            reasons.append("SIGNAL_EXPIRED")
         if limits is None:
             reasons.append("RISK_LIMITS_MISSING")
         else:
@@ -179,13 +197,27 @@ class RiskEngine:
                 reasons.append("TOTAL_OPEN_RISK_EXCEEDED")
             if requested_risk > limits.max_risk_per_trade:
                 reasons.append("MAX_RISK_PER_TRADE_EXCEEDED")
-        valid_until = _now() + timedelta(seconds=30) if not reasons else None
+        if not policy_healthy:
+            reasons.append("POLICY_HEALTH_UNSAFE")
+        if calendar_blackout:
+            reasons.append("CALENDAR_BLACKOUT_ACTIVE")
+        if limits is not None:
+            if spread_multiple is not None and spread_multiple > limits.max_spread_multiple:
+                reasons.append("SPREAD_LIMIT_EXCEEDED")
+            if volatility_multiple is not None and volatility_multiple > limits.max_volatility_atr_multiple:
+                reasons.append("VOLATILITY_LIMIT_EXCEEDED")
+        if account_state != "RUNNING":
+            reasons.append("ACCOUNT_STATE_UNSAFE")
+        valid_until = assessed_at + timedelta(seconds=30) if not reasons else None
         return RiskAssessment(
             account_id,
             limits.version if limits else None,
             not reasons,
-            tuple(reasons),
+            tuple(dict.fromkeys(reasons)),
             valid_until,
+            purpose,
+            signal_revision,
+            assessed_at,
         )
 
 
