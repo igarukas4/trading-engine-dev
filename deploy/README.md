@@ -6,6 +6,12 @@ This directory has two deployment modes. `compose.production.yml` is the origina
 
 For shared-host mode, copy `release.shared-host-caddy.env.example` to the protected release path. Create only `app_secret_key`, `postgres_password`, and `redis_password` under `deploy/secrets`; the Basic Auth username and bcrypt hash belong solely to a root-readable host-Caddy EnvironmentFile outside this repository. Do not start `compose.production.yml`, run a second public Caddy, or reload host Caddy until the DNS record, host-Caddy diff, environment file, and validation/reload plan have been explicitly approved.
 
+## Backend image publishing
+
+`.github/workflows/publish-backend-image.yml` builds the existing `backend/Dockerfile`, starts it temporarily, verifies unauthenticated `GET /health/live`, then publishes it to GitHub Container Registry (GHCR). It is manually dispatched from the Actions page so publishing an image is an intentional operator action. It uses the repository-scoped `GITHUB_TOKEN`; do not create or paste a registry password into this repository or chat.
+
+After a successful run, copy the `BACKEND_IMAGE=...@sha256:...` line from the workflow summary into the VPS-local shared-host release file. The digest, unlike the `latest` or commit tag, identifies the exact tested image that `scripts/release.sh` will accept.
+
 ## VPS preparation
 
 Install Docker Engine plus the Compose plugin, point the dashboard DNS record at the VPS, and allow only SSH, HTTP, and HTTPS at the cloud firewall and host firewall. For example, after ensuring an existing SSH session works:

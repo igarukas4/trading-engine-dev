@@ -1,0 +1,79 @@
+name: Publish backend image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: backend-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/trading-engine-v0-backend
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for health check
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          load: true
+          push: false
+          tags: trading-engine-v0-backend:ci
+
+      - name: Verify unauthenticated liveness endpoint
+        run: |
+          set -euo pipefail
+          container_id=$(docker run --detach --publish 127.0.0.1:18000:8000 trading-engine-v0-backend:ci)
+          trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
+          for attempt in {1..20}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18000/health/live; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Publish immutable image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Report deployable digest
+        run: |
+          set -euo pipefail
+          printf 'BACKEND_IMAGE=%s@%s\n' "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" "${{ steps.publish.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
