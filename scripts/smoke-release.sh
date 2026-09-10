@@ -62,7 +62,12 @@ case "$deployment_mode" in
 esac
 curl --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/healthz" | grep -qx 'ok'
 
-unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
+unauthenticated_status=''
+for _ in {1..20}; do
+  unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
+  [[ "$unauthenticated_status" == '401' ]] && break
+  sleep 1
+done
 [[ "$unauthenticated_status" == '401' ]] || { printf 'expected unauthenticated backend request to return 401, got %s\n' "$unauthenticated_status" >&2; exit 1; }
 
 forged_header_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
