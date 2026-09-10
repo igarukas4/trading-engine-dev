@@ -87,6 +87,24 @@ PATH="$test_directory/bin:$PATH" \
   SMOKE_SCRIPT="$test_directory/smoke" \
   "$repository_root/scripts/release.sh" deploy "$release_file"
 
+shared_release_file="$test_directory/shared-release.env"
+printf '%s\n' \
+  'DEPLOYMENT_MODE=shared-host-caddy' \
+  'BACKEND_IMAGE=example.invalid/backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'TIMESCALEDB_IMAGE=timescale/timescaledb:2.17.2-pg16@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'REDIS_IMAGE=redis:7.4.2-alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'DOMAIN=trading.example.com' 'CADDY_BASIC_AUTH_USER=operator' >"$shared_release_file"
+
+PATH="$test_directory/bin:$PATH" \
+  DOCKER_LOG="$docker_log" \
+  REPOSITORY_ROOT="$test_directory" \
+  SMOKE_SCRIPT="$test_directory/smoke" \
+  "$repository_root/scripts/release.sh" deploy "$shared_release_file"
+grep -Fq -- '-f '"$test_directory"'/deploy/compose.shared-host-caddy.yml' "$docker_log" || {
+  printf 'shared-host deployment did not select its isolated Compose file\n' >&2
+  exit 1
+}
+
 password_file="$test_directory/basic-auth-password"
 printf 'safe-smoke-password\n' >"$password_file"
 chmod 600 "$password_file"

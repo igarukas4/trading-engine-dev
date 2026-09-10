@@ -1,0 +1,31 @@
+# Install this site block into the existing host Caddyfile only after DNS,
+# VPS-local Basic Auth configuration, and this rendered configuration have
+# been reviewed and approved. Do not run a second public Caddy container.
+#
+# The two environment variables must be supplied to the host caddy.service
+# from a root-readable, mode-0600 EnvironmentFile outside this repository.
+# They are intentionally not Docker/Compose secrets in this deployment mode.
+trading.optitek.xyz {
+	encode zstd gzip
+
+	@health path /healthz
+	handle @health {
+		respond "ok" 200
+	}
+
+	handle {
+		basic_auth {
+			{$TRADING_CADDY_BASIC_AUTH_USER} {$TRADING_CADDY_BASIC_AUTH_HASH}
+		}
+
+		reverse_proxy 127.0.0.1:18000 {
+			health_uri /health/live
+			health_interval 15s
+			health_timeout 3s
+			header_up X-Authenticated-User {http.auth.user.id}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

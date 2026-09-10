@@ -2,12 +2,12 @@
 set -euo pipefail
 
 repository_root=${REPOSITORY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-compose_file="$repository_root/deploy/compose.production.yml"
 release_directory="$repository_root/deploy/releases"
 release_metadata="$release_directory/state"
 smoke_script=${SMOKE_SCRIPT:-"$repository_root/scripts/smoke-release.sh"}
 command=${1:-}
 release_environment_keys=(
+  DEPLOYMENT_MODE
   BACKEND_IMAGE
   CADDY_IMAGE
   TIMESCALEDB_IMAGE
@@ -17,13 +17,34 @@ release_environment_keys=(
   CADDY_BASIC_AUTH_USER
 )
 
+deployment_mode_for_release() {
+  local release_file=$1 mode
+  mode=$(sed -n 's/^DEPLOYMENT_MODE=//p' "$release_file")
+  [[ $(printf '%s\n' "$mode" | sed '/^$/d' | wc -l) == 1 || -z "$mode" ]] || {
+    printf 'DEPLOYMENT_MODE must appear at most once\n' >&2
+    exit 1
+  }
+  case "$mode" in
+    '') printf 'dedicated-caddy\n' ;;
+    dedicated-caddy|shared-host-caddy) printf '%s\n' "$mode" ;;
+    *) printf 'unsupported DEPLOYMENT_MODE: %s\n' "$mode" >&2; exit 1 ;;
+  esac
+}
+
+compose_file_for_release() {
+  case "$(deployment_mode_for_release "$1")" in
+    dedicated-caddy) printf '%s\n' "$repository_root/deploy/compose.production.yml" ;;
+    shared-host-caddy) printf '%s\n' "$repository_root/deploy/compose.shared-host-caddy.yml" ;;
+  esac
+}
+
 usage() {
   printf 'usage: %s deploy RELEASE_ENV_FILE | rollback\n' "${0##*/}" >&2
   exit 2
 }
 
 validate_release() {
-  local release_file=$1
+  local release_file=$1 mode
   local image_key line key
   declare -A release_keys_seen=()
   [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
@@ -43,16 +64,27 @@ validate_release() {
     release_keys_seen[$key]=1
   done <"$release_file"
 
-  for image_key in BACKEND_IMAGE CADDY_IMAGE TIMESCALEDB_IMAGE REDIS_IMAGE; do
+  mode=$(deployment_mode_for_release "$release_file")
+  for image_key in BACKEND_IMAGE TIMESCALEDB_IMAGE REDIS_IMAGE; do
     grep -Eq "^${image_key}=[^[:space:]]+@sha256:[a-f0-9]{64}$" "$release_file" || {
       printf '%s must be pinned to a sha256 digest\n' "$image_key" >&2
       exit 1
     }
   done
-  for key in DOMAIN ACME_EMAIL CADDY_BASIC_AUTH_USER; do
+  for key in DOMAIN; do
     grep -Eq "^${key}=.+" "$release_file" || { printf '%s is required\n' "$key" >&2; exit 1; }
   done
-  for secret in app_secret_key caddy_basic_auth_hash postgres_password redis_password; do
+  if [[ "$mode" == dedicated-caddy ]]; then
+    grep -Eq '^CADDY_IMAGE=[^[:space:]]+@sha256:[a-f0-9]{64}$' "$release_file" || { printf 'CADDY_IMAGE must be pinned to a sha256 digest\n' >&2; exit 1; }
+    for key in ACME_EMAIL CADDY_BASIC_AUTH_USER; do
+      grep -Eq "^${key}=.+" "$release_file" || { printf '%s is required\n' "$key" >&2; exit 1; }
+    done
+  else
+    grep -Eq '^CADDY_BASIC_AUTH_USER=.+' "$release_file" || { printf 'CADDY_BASIC_AUTH_USER is required for the authenticated smoke check\n' >&2; exit 1; }
+  fi
+  local secrets=(app_secret_key postgres_password redis_password)
+  [[ "$mode" == dedicated-caddy ]] && secrets+=(caddy_basic_auth_hash)
+  for secret in "${secrets[@]}"; do
     local secret_file="$repository_root/deploy/secrets/$secret"
     [[ -s "$secret_file" ]] || { printf 'missing or empty secret: %s\n' "$secret_file" >&2; exit 1; }
     [[ $(stat -c '%a' "$secret_file") == '600' ]] || { printf 'secret must have mode 600: %s\n' "$secret_file" >&2; exit 1; }
@@ -72,7 +104,7 @@ run_sanitized() {
 run_compose() {
   local release_file=$1
   shift
-  run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" "$@"
+  run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$(compose_file_for_release "$release_file")" "$@"
 }
 
 run_smoke() {

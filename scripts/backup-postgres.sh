@@ -2,7 +2,6 @@
 set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-compose_file="$repository_root/deploy/compose.production.yml"
 release_file=${1:?"usage: backup-postgres.sh RELEASE_ENV_FILE [BACKUP_DIRECTORY]"}
 backup_directory=${2:-/var/backups/trading-engine}
 release_environment_keys=(
@@ -25,6 +24,12 @@ run_sanitized() {
 }
 
 [[ -f "$release_file" ]] || { printf 'release environment not found: %s\n' "$release_file" >&2; exit 1; }
+deployment_mode=$(sed -n 's/^DEPLOYMENT_MODE=//p' "$release_file")
+case "$deployment_mode" in
+  '') compose_file="$repository_root/deploy/compose.production.yml" ;;
+  shared-host-caddy) compose_file="$repository_root/deploy/compose.shared-host-caddy.yml" ;;
+  *) printf 'unsupported DEPLOYMENT_MODE: %s\n' "$deployment_mode" >&2; exit 1 ;;
+esac
 install -d -m 700 "$backup_directory"
 backup_file="$backup_directory/postgres-$(date -u +%Y%m%dT%H%M%SZ).dump"
 

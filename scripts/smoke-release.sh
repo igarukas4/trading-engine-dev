@@ -2,10 +2,10 @@
 set -euo pipefail
 
 repository_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-compose_file="$repository_root/deploy/compose.production.yml"
 release_file=${1:?"usage: smoke-release.sh RELEASE_ENV_FILE"}
 smoke_password_file=${SMOKE_BASIC_AUTH_PASSWORD_FILE:?set SMOKE_BASIC_AUTH_PASSWORD_FILE to a protected Basic Auth password file}
 release_environment_keys=(
+  DEPLOYMENT_MODE
   BACKEND_IMAGE
   CADDY_IMAGE
   TIMESCALEDB_IMAGE
@@ -14,6 +14,8 @@ release_environment_keys=(
   ACME_EMAIL
   CADDY_BASIC_AUTH_USER
 )
+
+deployment_mode=dedicated-caddy
 
 run_sanitized() {
   local key
@@ -43,6 +45,7 @@ read_release_env() {
       value=${BASH_REMATCH[1]}
     fi
     case "$key" in
+      DEPLOYMENT_MODE) deployment_mode=$value ;;
       DOMAIN) DOMAIN=$value ;;
       CADDY_BASIC_AUTH_USER) CADDY_BASIC_AUTH_USER=$value ;;
     esac
@@ -52,7 +55,11 @@ read_release_env() {
 read_release_env
 
 : "${DOMAIN:?DOMAIN is required}"
-: "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required}"
+case "$deployment_mode" in
+  dedicated-caddy) : "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required}" ;;
+  shared-host-caddy) : "${CADDY_BASIC_AUTH_USER:?CADDY_BASIC_AUTH_USER is required}" ;;
+  *) printf 'unsupported DEPLOYMENT_MODE: %s\n' "$deployment_mode" >&2; exit 1 ;;
+esac
 curl --fail --silent --show-error --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/healthz" | grep -qx 'ok'
 
 unauthenticated_status=$(curl --silent --output /dev/null --write-out '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
@@ -81,9 +88,16 @@ printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(cu
     --header 'X-Forwarded-Proto: http' \
     --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
 
-if run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
-  printf 'backend port is directly published\n' >&2
-  exit 1
+if [[ "$deployment_mode" == dedicated-caddy ]]; then
+  compose_file="$repository_root/deploy/compose.production.yml"
+  if run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000 >/dev/null 2>&1; then
+    printf 'backend port is directly published\n' >&2
+    exit 1
+  fi
+else
+  compose_file="$repository_root/deploy/compose.shared-host-caddy.yml"
+  backend_port=$(run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000)
+  [[ "$backend_port" == 127.0.0.1:* ]] || { printf 'backend must publish only to loopback, got %s\n' "$backend_port" >&2; exit 1; }
 fi
 
 printf 'smoke release passed for %s\n' "$DOMAIN"

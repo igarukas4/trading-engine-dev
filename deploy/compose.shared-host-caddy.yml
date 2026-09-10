@@ -1,0 +1,116 @@
+name: trading-engine
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# This mode deliberately has no Caddy container.  The host Caddy owns TLS and
+# the public ports; only its loopback upstream can reach the backend.
+services:
+  backend:
+    image: ${BACKEND_IMAGE:?set BACKEND_IMAGE to an immutable image digest in the release environment}
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:18000:8000"
+    environment:
+      APP_SECRET_KEY_FILE: /run/secrets/app_secret_key
+      DATABASE_HOST: postgres
+      DATABASE_NAME: trading_engine
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      DATABASE_PORT: "5432"
+      DATABASE_USER: trading_engine
+      PUBLIC_ORIGIN: https://${DOMAIN:?set DOMAIN in the release environment}
+      REDIS_HOST: redis
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      REDIS_PORT: "6379"
+      TRUSTED_ACTOR_HEADER: X-Authenticated-User
+      # Docker forwards a host-loopback connection to the gateway of this
+      # fixed private network; no external client can originate from it.
+      TRUSTED_PROXY_IPS: 172.30.0.1
+    secrets:
+      - app_secret_key
+      - postgres_password
+      - redis_password
+    networks:
+      - private
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: ${TIMESCALEDB_IMAGE:?set TIMESCALEDB_IMAGE to an immutable image digest in the release environment}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_DB: trading_engine
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_USER: trading_engine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    secrets:
+      - postgres_password
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading_engine -d trading_engine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE to an immutable image digest in the release environment}
+    restart: unless-stopped
+    logging: *default-logging
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        {
+          printf '%s\n' 'appendonly yes'
+          printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)"
+        } > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf
+    volumes:
+      - redis_data:/data
+    secrets:
+      - redis_password
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli --no-auth-warning ping | grep -qx PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  private:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  postgres_data: {}
+  redis_data: {}
+
+secrets:
+  app_secret_key:
+    file: ./secrets/app_secret_key
+  postgres_password:
+    file: ./secrets/postgres_password
+  redis_password:
+    file: ./secrets/redis_password
