@@ -27,14 +27,15 @@ services:
       REDIS_PASSWORD_FILE: /run/secrets/redis_password
       REDIS_PORT: "6379"
       TRUSTED_ACTOR_HEADER: X-Authenticated-User
-      # Docker forwards a host-loopback connection to the gateway of this
-      # fixed private network; no external client can originate from it.
-      TRUSTED_PROXY_IPS: 172.30.0.1
+      # Docker forwards the host-loopback Caddy connection through the fixed
+      # ingress-network gateway; no external client can originate from it.
+      TRUSTED_PROXY_IPS: 172.31.0.1
     secrets:
       - app_secret_key
       - postgres_password
       - redis_password
     networks:
+      - ingress
       - private
     depends_on:
       postgres:
@@ -97,6 +98,12 @@ services:
       start_period: 10s
 
 networks:
+  # This network exists only to make the loopback-published backend reachable
+  # from the host Caddy. Postgres and Redis are never attached to it.
+  ingress:
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
   private:
     internal: true
     ipam:

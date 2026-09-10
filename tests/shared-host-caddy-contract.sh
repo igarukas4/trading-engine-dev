@@ -12,8 +12,15 @@ grep -Fq -- '"127.0.0.1:18000:8000"' "$compose_file"
 ! grep -Eq '^  caddy:' "$compose_file"
 ! grep -Fq -- '"80:80"' "$compose_file"
 ! grep -Fq -- '"443:443"' "$compose_file"
-grep -Fq 'TRUSTED_PROXY_IPS: 172.30.0.1' "$compose_file"
+grep -Fq 'TRUSTED_PROXY_IPS: 172.31.0.1' "$compose_file"
 grep -Fq 'internal: true' "$compose_file"
+grep -Fq '  ingress:' "$compose_file"
+grep -Fq 'subnet: 172.31.0.0/24' "$compose_file"
+backend_block=$(sed -n '/^  backend:$/,/^  postgres:$/p' "$compose_file")
+postgres_block=$(sed -n '/^  postgres:$/,/^  redis:$/p' "$compose_file")
+redis_block=$(sed -n '/^  redis:$/,/^networks:$/p' "$compose_file")
+[[ "$backend_block" == *'      - ingress'* ]] || { printf 'backend must use the loopback ingress network\n' >&2; exit 1; }
+[[ "$postgres_block" != *'ingress'* && "$redis_block" != *'ingress'* ]] || { printf 'database services must not use the ingress network\n' >&2; exit 1; }
 grep -Fq 'basic_auth' "$caddyfile"
 grep -Fq 'respond "ok" 200' "$caddyfile"
 grep -Fq 'health_uri /health/live' "$caddyfile"
