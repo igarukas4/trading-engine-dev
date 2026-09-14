@@ -112,6 +112,18 @@ Do not absorb these user-owned/unrelated changes into UI work:
   lifecycle feedback.
 - Minor branding copy update is included in the next frontend release:
   sidebar subtitle `By O-O` and Dashboard greeting `Good morning, Chief`.
-- The minor branding copy release was rolled back on operator request. Current
-  production and source return to the pre-branding Markets release; do not
-  reintroduce `By O-O` or `Good morning, Chief` unless requested again.
+- The minor branding copy release was rolled back after the operator reported
+  the website looked broken. Current production and source return to the
+  pre-branding Markets release. Preserve the Dashboard/Markets implementation
+  itself; the rollback was about the branding change, not a request to remove
+  the UI work.
+
+## Preserved pending operator request
+
+- Re-apply only these two small copy changes when the operator is ready:
+  `By O-O` as a small subtitle directly below `TRADING ENGINE` in the upper
+  left brand area, and `Good morning, Chief` in the Dashboard greeting.
+- Do not redesign, restructure, or alter the existing Dashboard/Markets UI for
+  this request. Build and verify the two-copy change locally first, then use
+  the established frontend image and shared-host release workflow if it is
+  explicitly deployed.
