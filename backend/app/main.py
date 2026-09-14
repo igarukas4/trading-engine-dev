@@ -27,7 +27,7 @@ from .risk_calendar import (
     RiskLimitsStore,
 )
 from .signals import SignalStore
-from .execution import ExecutionError, ExecutionSubstrate, GlobalEmergencyOperation
+from .execution import ExecutionError, ExecutionSubstrate, GlobalEmergencyOperation, OperatorCommand
 from .dashboard import audit_hub, dashboard_hub
 
 
@@ -777,12 +777,43 @@ def _account_data_status(account_id: str) -> dict[str, Any]:
     """Expose the conservative dashboard gate for account-owned broker data."""
     account = accounts.accounts[account_id]
     if any(key.startswith(f"{account_id}:") for key in market_data.resyncing):
-        return {"status": "RESYNCING", "can_approve": False, "reason_code": "ACCOUNT_DATA_RESYNCING"}
+        return {
+            "status": "RESYNCING",
+            "can_approve": False,
+            "reason_code": "ACCOUNT_DATA_RESYNCING",
+        }
     if not account.connector_bound or not account.connector_healthy:
-        return {"status": "UNAVAILABLE", "can_approve": False, "reason_code": "ACCOUNT_DATA_UNAVAILABLE"}
-    if not account.last_heartbeat_at or datetime.now(timezone.utc) - account.last_heartbeat_at > timedelta(seconds=60):
-        return {"status": "STALE", "can_approve": False, "reason_code": "ACCOUNT_DATA_STALE"}
+        return {
+            "status": "UNAVAILABLE",
+            "can_approve": False,
+            "reason_code": "ACCOUNT_DATA_UNAVAILABLE",
+        }
+    if (
+        not account.last_heartbeat_at
+        or datetime.now(timezone.utc) - account.last_heartbeat_at > timedelta(seconds=60)
+    ):
+        return {
+            "status": "STALE",
+            "can_approve": False,
+            "reason_code": "ACCOUNT_DATA_STALE",
+        }
     return {"status": "HEALTHY", "can_approve": True, "reason_code": None}
+
+
+def _accepted_command_response(
+    account_id: str,
+    command: OperatorCommand,
+    **resources: Any,
+) -> dict[str, Any]:
+    """Build the common response for an accepted operator command."""
+    return {
+        "account_id": account_id,
+        "command_id": command.id,
+        "status": command.status,
+        "resource_url": f"/api/v1/commands/{command.id}",
+        **resources,
+        "command": command.__dict__,
+    }
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
@@ -890,14 +921,7 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    return {
-        "account_id": account_id,
-        "command_id": command.id,
-        "status": command.status,
-        "resource_url": f"/api/v1/commands/{command.id}",
-        "signal": signal.as_dict(),
-        "command": command.__dict__,
-    }
+    return _accepted_command_response(account_id, command, signal=signal.as_dict())
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/execute", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
@@ -926,14 +950,7 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
         and command.signal_id == signal_id
         and command.idempotency_key == request.idempotency_key
     )
-    return {
-        "account_id": account_id,
-        "command_id": command.id,
-        "status": command.status,
-        "resource_url": f"/api/v1/commands/{command.id}",
-        "order": result.order.__dict__,
-        "command": command.__dict__,
-    }
+    return _accepted_command_response(account_id, command, order=result.order.__dict__)
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/emergency-stop", tags=["execution"])
