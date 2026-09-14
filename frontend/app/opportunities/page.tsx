@@ -10,6 +10,8 @@ type DataStatus = {
 };
 type RiskAssessment = { approved: boolean; reason_codes: string[] };
 type Evidence = Record<string, unknown>;
+type EvidenceSections = Partial<Record<"technical" | "fundamental" | "ai", Evidence>>;
+type ExecutionMode = "MANUAL" | "SEMI_AUTO" | "FULL_AUTO";
 type Signal = {
   id: string;
   revision: number;
@@ -23,7 +25,7 @@ type Signal = {
   policy_version: number;
   context_revision?: number;
   supersedes_signal_id?: string | null;
-  evidence?: { technical?: Evidence; fundamental?: Evidence; ai?: Evidence };
+  evidence?: EvidenceSections;
 };
 type Opportunity = {
   id?: string;
@@ -32,10 +34,10 @@ type Opportunity = {
   confidence: string;
   reason_codes: string[];
   market_snapshot_id?: string;
-  evidence?: { technical?: Evidence; fundamental?: Evidence; ai?: Evidence };
+  evidence?: EvidenceSections;
   signals?: Signal[];
 };
-type Account = { display_name: string; execution_mode: string; bot_state: string };
+type Account = { display_name: string; execution_mode: ExecutionMode; bot_state: string };
 type Action = "approve" | "execute";
 type SignalBucket = "Perlu tindakan" | "Diblokir / expired" | "Riwayat";
 
@@ -51,6 +53,12 @@ function removePending(pending: Record<string, string>, signalId: string) {
   const next = { ...pending };
   delete next[signalId];
   return next;
+}
+
+function confirmationDescription(mode: ExecutionMode) {
+  if (mode === "SEMI_AUTO") return " — menjadwalkan tepat satu Order";
+  if (mode === "MANUAL") return " — Approve dan Execute adalah Command terpisah";
+  return "";
 }
 
 export default function OpportunitiesPage() {
@@ -160,8 +168,9 @@ export default function OpportunitiesPage() {
     }
   }
 
-  const canAct = Boolean(dataStatus?.can_approve && account?.execution_mode === "MANUAL");
-  const mode = account?.execution_mode ?? "MANUAL";
+  const mode: ExecutionMode = account?.execution_mode ?? "MANUAL";
+  const canApprove = Boolean(dataStatus?.can_approve);
+  const canAct = canApprove && mode === "MANUAL";
 
   function safeNextAction(signal: Signal) {
     if (signal.status === "EXPIRED") return "Muat ulang atau tunggu Signal baru; tidak ada entry yang aman.";
@@ -262,7 +271,11 @@ export default function OpportunitiesPage() {
                       </button>
                     )}
                     {mode === "SEMI_AUTO" && !pending[signal.id] && signal.status === "ELIGIBLE" && (
-                      <button type="button" disabled={!dataStatus?.can_approve} onClick={() => openConfirmation(signal, "approve")}>
+                      <button
+                        type="button"
+                        disabled={!canApprove}
+                        onClick={() => openConfirmation(signal, "approve")}
+                      >
                         Approve · jadwalkan tepat satu Order
                       </button>
                     )}
@@ -300,12 +313,12 @@ export default function OpportunitiesPage() {
       )}
 
       {dialog && (
-        <aside className="dialog" role="dialog" aria-label="Konfirmasi MANUAL">
+        <aside className="dialog" role="dialog" aria-label="Konfirmasi tindakan">
           <h2>Konfirmasi {dialog.action === "approve" ? "persetujuan" : "eksekusi"}</h2>
           <p>
             Akun: {account?.display_name ?? accountId}<br />
             Pair: {dialog.signal.opportunity.pair}<br />
-            Tindakan: {dialog.action}{mode === "SEMI_AUTO" ? " — menjadwalkan tepat satu Order" : mode === "MANUAL" ? " — Approve dan Execute adalah Command terpisah" : ""}<br />
+            Tindakan: {dialog.action}{confirmationDescription(mode)}<br />
             Alasan wajib diisi sebelum perintah dikirim.
           </p>
           <label>

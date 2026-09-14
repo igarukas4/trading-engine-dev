@@ -1079,6 +1079,7 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
 @app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
 def approve_signal(account_id: str, signal_id: str, request: OperatorActionRequest) -> dict[str, Any]:
     _require_account(account_id)
+    account = accounts.accounts[account_id]
     try:
         signal = signals.get(signal_id)
         if signal.account_id != account_id:
@@ -1096,8 +1097,7 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    if accounts.accounts[account_id].execution_mode == "SEMI_AUTO":
-        account = accounts.accounts[account_id]
+    if account.execution_mode == "SEMI_AUTO":
         try:
             scheduled = execution.schedule_automated_signal(
                 account_id=account_id,
