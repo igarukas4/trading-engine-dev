@@ -773,11 +773,25 @@ def _backend_risk_context(
     }
 
 
+def _account_data_status(account_id: str) -> dict[str, Any]:
+    """Expose the conservative dashboard gate for account-owned broker data."""
+    account = accounts.accounts[account_id]
+    if any(key.startswith(f"{account_id}:") for key in market_data.resyncing):
+        return {"status": "RESYNCING", "can_approve": False, "reason_code": "ACCOUNT_DATA_RESYNCING"}
+    if not account.connector_bound or not account.connector_healthy:
+        return {"status": "UNAVAILABLE", "can_approve": False, "reason_code": "ACCOUNT_DATA_UNAVAILABLE"}
+    if not account.last_heartbeat_at or datetime.now(timezone.utc) - account.last_heartbeat_at > timedelta(seconds=60):
+        return {"status": "STALE", "can_approve": False, "reason_code": "ACCOUNT_DATA_STALE"}
+    return {"status": "HEALTHY", "can_approve": True, "reason_code": None}
+
+
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
 def list_opportunities(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return {
         "account_id": account_id,
+        "account": accounts.read_only_snapshot(account_id),
+        "account_data_status": _account_data_status(account_id),
         "opportunities": [
             {
                 **item,
@@ -856,13 +870,15 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
                                    limits=limits).as_dict()
 
 
-@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", tags=["execution"])
+@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
 def approve_signal(account_id: str, signal_id: str, request: OperatorActionRequest) -> dict[str, Any]:
     _require_account(account_id)
     try:
         signal = signals.get(signal_id)
         if signal.account_id != account_id:
             raise ValueError("SIGNAL_NOT_FOUND")
+        if not _account_data_status(account_id)["can_approve"]:
+            raise ExecutionError("ACCOUNT_DATA_UNSAFE")
         command = execution.approve_signal(
             account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
             reason=request.reason, confirmed=request.confirmed, signal_revision=signal.revision,
@@ -874,10 +890,17 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    return {"account_id": account_id, "signal": signal.as_dict(), "command": command.__dict__}
+    return {
+        "account_id": account_id,
+        "command_id": command.id,
+        "status": command.status,
+        "resource_url": f"/api/v1/commands/{command.id}",
+        "signal": signal.as_dict(),
+        "command": command.__dict__,
+    }
 
 
-@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/execute", tags=["execution"])
+@app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/execute", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
 def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalRequest) -> dict[str, Any]:
     _require_account(account_id)
     try:
@@ -897,7 +920,20 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    return {"account_id": account_id, "order": result.order.__dict__, "status": result.order.status}
+    command = next(
+        command for command in execution.commands.values()
+        if command.account_id == account_id
+        and command.signal_id == signal_id
+        and command.idempotency_key == request.idempotency_key
+    )
+    return {
+        "account_id": account_id,
+        "command_id": command.id,
+        "status": command.status,
+        "resource_url": f"/api/v1/commands/{command.id}",
+        "order": result.order.__dict__,
+        "command": command.__dict__,
+    }
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/emergency-stop", tags=["execution"])

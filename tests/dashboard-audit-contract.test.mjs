@@ -7,6 +7,7 @@ const backend = readFileSync("backend/app/main.py", "utf8");
 const dashboard = readFileSync("frontend/app/page.tsx", "utf8");
 const layout = readFileSync("frontend/app/layout.tsx", "utf8");
 const shell = readFileSync("frontend/app/components/operator-shell.tsx", "utf8");
+const opportunities = readFileSync("frontend/app/opportunities/page.tsx", "utf8");
 
 test("backend exposes account-scoped dashboard snapshots and audit hub", () => {
   for (const route of [
@@ -49,4 +50,18 @@ assert any(item["type"] == "snapshot.required" and item["broker_account_id"] == 
 print("ok")
 `], { encoding: "utf8" });
   assert.match(output, /ok/);
+});
+
+test("Opportunities uses an account-scoped fail-closed MANUAL command flow", () => {
+  assert.match(opportunities, /Perlu tindakan/);
+  assert.match(opportunities, /Diblokir \/ expired/);
+  assert.match(opportunities, /Riwayat/);
+  assert.match(opportunities, /confirmation|Konfirmasi/i);
+  assert.match(opportunities, /Diproses/);
+  assert.match(opportunities, /command_id/);
+  assert.match(opportunities, /disabled/);
+  assert.match(opportunities, /Idempotency-Key/);
+  assert.doesNotMatch(opportunities, /updatedSignal\.status = "APPROVED"/);
+  assert.match(backend, /account_data_status/);
+  assert.match(backend, /ACCOUNT_DATA_UNSAFE/);
 });
