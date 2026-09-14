@@ -17,6 +17,7 @@ cat >"$test_directory/bin/curl" <<'EOF'
 printf '%s\n' "$*" >>"$CURL_LOG"
 if [[ " $* " == *' --config - '* ]]; then
   cat >"$CURL_CONFIG"
+  printf 'Dashboard\n'
 elif [[ " $* " == *' --write-out '* ]]; then
   if [[ -s ${CURL_STATUS_SEQUENCE:-} ]]; then
     status=$(head -n 1 "$CURL_STATUS_SEQUENCE")

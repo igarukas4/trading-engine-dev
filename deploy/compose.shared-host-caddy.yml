@@ -9,6 +9,21 @@ x-default-logging: &default-logging
 # This mode deliberately has no Caddy container.  The host Caddy owns TLS and
 # the public ports; only its loopback upstream can reach the backend.
 services:
+  frontend:
+    image: ${FRONTEND_IMAGE:?set FRONTEND_IMAGE to an immutable image digest in the release environment}
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:13000:3000"
+    networks:
+      - ingress
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
   backend:
     image: ${BACKEND_IMAGE:?set BACKEND_IMAGE to an immutable image digest in the release environment}
     restart: unless-stopped

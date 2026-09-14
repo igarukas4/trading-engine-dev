@@ -9,6 +9,7 @@ command=${1:-}
 release_environment_keys=(
   DEPLOYMENT_MODE
   BACKEND_IMAGE
+  FRONTEND_IMAGE
   CADDY_IMAGE
   TIMESCALEDB_IMAGE
   REDIS_IMAGE
@@ -80,6 +81,7 @@ validate_release() {
       grep -Eq "^${key}=.+" "$release_file" || { printf '%s is required\n' "$key" >&2; exit 1; }
     done
   else
+    grep -Eq '^FRONTEND_IMAGE=[^[:space:]]+@sha256:[a-f0-9]{64}$' "$release_file" || { printf 'FRONTEND_IMAGE must be pinned to a sha256 digest\n' >&2; exit 1; }
     grep -Eq '^CADDY_BASIC_AUTH_USER=.+' "$release_file" || { printf 'CADDY_BASIC_AUTH_USER is required for the authenticated smoke check\n' >&2; exit 1; }
   fi
   local secrets=(app_secret_key postgres_password redis_password)

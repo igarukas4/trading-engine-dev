@@ -13,7 +13,8 @@ trading.optitek.xyz {
 		respond "ok" 200
 	}
 
-	handle {
+	@backend path /api/* /docs* /openapi.json /ws/* /health/live
+	handle @backend {
 		basic_auth {
 			{$TRADING_CADDY_BASIC_AUTH_USER} {$TRADING_CADDY_BASIC_AUTH_HASH}
 		}
@@ -27,5 +28,13 @@ trading.optitek.xyz {
 			header_up X-Forwarded-Host {host}
 			header_up X-Forwarded-Proto {scheme}
 		}
+	}
+
+	handle {
+		basic_auth {
+			{$TRADING_CADDY_BASIC_AUTH_USER} {$TRADING_CADDY_BASIC_AUTH_HASH}
+		}
+
+		reverse_proxy 127.0.0.1:13000
 	}
 }

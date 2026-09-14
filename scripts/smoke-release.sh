@@ -7,6 +7,7 @@ smoke_password_file=${SMOKE_BASIC_AUTH_PASSWORD_FILE:?set SMOKE_BASIC_AUTH_PASSW
 release_environment_keys=(
   DEPLOYMENT_MODE
   BACKEND_IMAGE
+  FRONTEND_IMAGE
   CADDY_IMAGE
   TIMESCALEDB_IMAGE
   REDIS_IMAGE
@@ -85,13 +86,18 @@ curl_config_escape() {
   printf '%s' "$value"
 }
 smoke_password=$(<"$smoke_password_file")
-printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$smoke_password")" | \
+curl_configuration=$(printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$smoke_password")")
+printf '%s' "$curl_configuration" | \
   curl --config - --fail --silent --show-error \
     --header 'X-Authenticated-User: forged-smoke-actor' \
     --header 'X-Forwarded-For: 198.51.100.23' \
     --header 'X-Forwarded-Host: forged.example' \
     --header 'X-Forwarded-Proto: http' \
     --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
+printf '%s' "$curl_configuration" | \
+  curl --config - --fail --silent --show-error \
+    --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" | grep -q 'Dashboard'
+unset curl_configuration smoke_password
 
 if [[ "$deployment_mode" == dedicated-caddy ]]; then
   compose_file="$repository_root/deploy/compose.production.yml"
@@ -103,6 +109,8 @@ else
   compose_file="$repository_root/deploy/compose.shared-host-caddy.yml"
   backend_port=$(run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port backend 8000)
   [[ "$backend_port" == 127.0.0.1:* ]] || { printf 'backend must publish only to loopback, got %s\n' "$backend_port" >&2; exit 1; }
+  frontend_port=$(run_sanitized docker compose -p trading-engine --env-file "$release_file" -f "$compose_file" port frontend 3000)
+  [[ "$frontend_port" == 127.0.0.1:* ]] || { printf 'frontend must publish only to loopback, got %s\n' "$frontend_port" >&2; exit 1; }
 fi
 
 printf 'smoke release passed for %s\n' "$DOMAIN"
