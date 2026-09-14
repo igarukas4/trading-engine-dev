@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { OperatorShell } from "./components/operator-shell";
+import "./globals.css";
 
 export const metadata = { title: "Trading Engine — Operator" };
 
