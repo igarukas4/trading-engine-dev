@@ -11,6 +11,8 @@ export type DashboardEvent = {
 export class DashboardStream {
   readonly seenEventIds = new Set<string>();
   readonly accountCursors = new Map<string, number>();
+  readonly resyncingAccounts = new Set<string>();
+  systemResyncing = false;
   systemCursor = 0;
 
   accept(event: DashboardEvent): boolean {
@@ -19,6 +21,18 @@ export class DashboardStream {
     }
     if (event.event_id) {
       this.seenEventIds.add(event.event_id);
+    }
+
+    if (event.type === "snapshot.required") {
+      if (event.stream === "system") this.systemResyncing = true;
+      else if (event.broker_account_id) this.resyncingAccounts.add(event.broker_account_id);
+      else this.systemResyncing = true;
+      return true;
+    }
+
+    if (event.type === "replay.complete") {
+      if (event.stream === "system") this.systemResyncing = false;
+      else if (event.broker_account_id) this.resyncingAccounts.delete(event.broker_account_id);
     }
 
     if (event.stream_sequence !== undefined) {
@@ -43,5 +57,9 @@ export class DashboardStream {
       account_cursors: Object.fromEntries(this.accountCursors),
       system_cursor: this.systemCursor,
     };
+  }
+
+  isResyncing(accountId?: string): boolean {
+    return this.systemResyncing || Boolean(accountId && this.resyncingAccounts.has(accountId));
   }
 }
