@@ -8,75 +8,13 @@ type Candle = { open_time: string; open: string; high: string; low: string; clos
 type QuoteTelemetry = { bid: string; ask: string; observed_at: string };
 
 export default function MarketsPage() {
-  const [selectedAccount, setSelectedAccount] = useState("");
-  const [pair, setPair] = useState("");
-  const [timeframe, setTimeframe] = useState("M15");
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [resyncing, setResyncing] = useState(false);
+  const [selectedAccount, setSelectedAccount] = useState(""); const [pair, setPair] = useState(""); const [timeframe, setTimeframe] = useState("M15"); const [pairs, setPairs] = useState<string[]>([]); const [candles, setCandles] = useState<Candle[]>([]); const [resyncing, setResyncing] = useState(false); const [loading, setLoading] = useState(false);
   const quoteTelemetry: QuoteTelemetry | null = null;
-
-  useEffect(() => {
-    const account = new URLSearchParams(window.location.search).get("account") ?? "";
-    setSelectedAccount(account);
-  }, []);
-
-  useEffect(() => {
-    if (!selectedAccount || !pair) return;
-    fetch(
-      `${apiBase}/api/v1/broker-accounts/${selectedAccount}/candles?pair=${encodeURIComponent(pair)}&timeframe=${timeframe}`,
-    )
-      .then((response) => response.json())
-      .then((value) => setCandles(value.candles ?? []))
-      .catch(() => setCandles([]));
-  }, [selectedAccount, pair, timeframe]);
-
-  async function resync() {
-    if (!selectedAccount) return;
-    setResyncing(true);
-    try {
-      await fetch(
-        `${apiBase}/api/v1/broker-accounts/${selectedAccount}/market-data/resync?stream=markets`,
-        { method: "POST" },
-      );
-    } finally {
-      setResyncing(false);
-    }
-  }
-
-  return (
-    <main>
-      <p>Trading Engine</p>
-      <h1>Markets</h1>
-      <label>
-        Account
-        <input
-          aria-label="selected account"
-          value={selectedAccount}
-          onChange={(event) => setSelectedAccount(event.target.value)}
-        />
-      </label>
-      <label>
-        Pair
-        <input
-          aria-label="pair"
-          value={pair}
-          onChange={(event) => setPair(event.target.value)}
-        />
-      </label>
-      <label>
-        Timeframe
-        <select value={timeframe} onChange={(event) => setTimeframe(event.target.value)}>
-          <option>M15</option>
-          <option>H1</option>
-          <option>H4</option>
-        </select>
-      </label>
-      <button type="button" onClick={resync} disabled={!selectedAccount || resyncing}>
-        {resyncing ? "Resyncing…" : "Resync stream"}
-      </button>
-      <p aria-live="polite">{selectedAccount ? `Akun terpilih: ${selectedAccount}` : "Pilih satu akun"}</p>
-      <MarketChart candles={candles} quoteTelemetry={quoteTelemetry} />
-      <p>Quote telemetry bersifat non-canonical dan tidak mengubah MarketState.</p>
-    </main>
-  );
+  useEffect(() => { setSelectedAccount(new URLSearchParams(window.location.search).get("account") ?? ""); }, []);
+  useEffect(() => { if (!selectedAccount) return; fetch(`${apiBase}/api/v1/broker-accounts/${selectedAccount}/pairs`).then(r => r.ok ? r.json() : Promise.reject()).then(value => { const next = (value.pairs ?? []).map((entry: string | { pair: string }) => typeof entry === "string" ? entry : entry.pair); setPairs(next); if (!pair && next[0]) setPair(next[0]); }).catch(() => setPairs([])); }, [selectedAccount, pair]);
+  useEffect(() => { if (!selectedAccount || !pair) return; setLoading(true); fetch(`${apiBase}/api/v1/broker-accounts/${selectedAccount}/candles?pair=${encodeURIComponent(pair)}&timeframe=${timeframe}`).then(r => r.json()).then(value => setCandles(value.candles ?? [])).catch(() => setCandles([])).finally(() => setLoading(false)); }, [selectedAccount, pair, timeframe]);
+  async function resync() { if (!selectedAccount) return; setResyncing(true); try { await fetch(`${apiBase}/api/v1/broker-accounts/${selectedAccount}/market-data/resync?stream=markets`, { method: "POST" }); } finally { setResyncing(false); } }
+  return <main><div className="eyebrow">Market intelligence · Account scoped</div><h1>Markets</h1><p>Observasi market real-time tanpa order entry dari chart.</p>
+    {!selectedAccount ? <section className="empty-state"><div className="empty-state-icon">⌁</div><h2>Pilih account terlebih dahulu</h2><p>Pair dan MarketState hanya tersedia setelah account dipilih dari header.</p></section> : <><section className="market-toolbar card"><div className="market-context"><span className="muted-label">ACCOUNT CONTEXT</span><strong>{selectedAccount}</strong><span className="freshness"><span className="status-dot"/> Stream healthy</span></div><label className="field"><span>Pair</span><select aria-label="pair" value={pair} onChange={e => setPair(e.target.value)}>{pairs.length ? pairs.map(value => <option key={value}>{value}</option>) : <option value="">No pair available</option>}</select></label><div className="timeframe"><span className="field-title">Timeframe</span><div>{["M15", "H1", "H4"].map(value => <button className={timeframe === value ? "selected" : ""} type="button" key={value} onClick={() => setTimeframe(value)}>{value}</button>)}</div></div><button className="resync-button" type="button" onClick={resync} disabled={resyncing}>{resyncing ? "Resyncing…" : "↻ Resync"}</button></section><section className="market-layout"><div className="card chart-card"><div className="section-heading"><div><div className="eyebrow">Primary chart</div><h2>{pair || "—"} <span className="chart-direction">· Candles</span></h2></div><span>{loading ? "LOADING" : `${candles.length} CANDLES`}</span></div><MarketChart candles={candles} quoteTelemetry={quoteTelemetry} /></div><aside className="card watchlist-card"><div className="section-heading"><h2>Watchlist</h2><span>{pairs.length} PAIRS</span></div>{pairs.length ? pairs.map((value, index) => <button className={`watch-row ${value === pair ? "active" : ""}`} type="button" key={value} onClick={() => setPair(value)}><span><i className={index % 3 === 1 ? "amber-dot" : "green-dot"}/>{value}</span><small>{value === pair ? "SELECTED" : "—"}</small></button>) : <p className="empty">Tidak ada pair pada account ini.</p>}<div className="chart-note"><span>ⓘ</span> Quote telemetry bersifat non-canonical dan tidak mengubah MarketState.</div></aside></section></>}
+  </main>;
 }
