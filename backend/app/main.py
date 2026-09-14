@@ -256,6 +256,16 @@ class ExecuteSignalRequest(OperatorActionRequest):
     risk_amount: Decimal = Decimal("0")
 
 
+class PositionExitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    volume: str | None = None
+    pair_confirmation: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=1, max_length=500)
+    confirmed: bool = False
+
+
 def _account_error(error: AccountError) -> HTTPException:
     return HTTPException(
         status_code=409,
@@ -374,7 +384,7 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
             if fill.account_id == account_id
         ],
         "positions": [
-            position.__dict__
+            execution.position_view(account_id, position.order_id)
             for position in execution.positions.values()
             if position.account_id == account_id
         ],
@@ -425,6 +435,65 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
 def dashboard_snapshot(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return _account_dashboard_payload(account_id)
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/positions/{position_id}", tags=["positions"])
+def position_detail(account_id: str, position_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        position = execution.position_view(account_id, position_id)
+    except ExecutionError as error:
+        code = getattr(error, "code", str(error))
+        raise HTTPException(status_code=404 if code == "POSITION_NOT_FOUND" else 409, detail={"code": code}) from error
+
+    account_orders = [
+        order for order in execution.orders.values()
+        if order.account_id == account_id and order.id == position_id
+    ]
+    account_fills = [
+        fill for fill in execution.fills.values()
+        if fill.account_id == account_id and fill.order_id == position_id
+    ]
+    account_commands = [
+        command for command in execution.position_commands
+        if command.account_id == account_id and command.order_id == position_id
+    ]
+    return {
+        "account_id": account_id,
+        "position": position,
+        "orders": [order.__dict__ for order in account_orders],
+        "fills": [fill.__dict__ for fill in account_fills],
+        "position_commands": [command.__dict__ for command in account_commands],
+        "audit_events": audit_hub.list(account_id, limit=50)["audit_events"],
+    }
+
+
+def _request_position_exit(account_id: str, position_id: str, request: PositionExitRequest) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        command = execution.request_position_close(
+            account_id, position_id, request.volume, request.pair_confirmation, request.reason,
+            confirmed=request.confirmed, idempotency_key=request.idempotency_key,
+        )
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    _audit(
+        account_id,
+        "position.exit.requested",
+        request.reason,
+        {"position_id": position_id, "command_id": command.id, "reduce_only": True},
+    )
+    return {"account_id": account_id, "position_id": position_id, "status": "ACCEPTED", "command": command.__dict__}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/positions/{position_id}/close", status_code=status.HTTP_202_ACCEPTED, tags=["positions"])
+def close_position(account_id: str, position_id: str, request: PositionExitRequest) -> dict[str, Any]:
+    return _request_position_exit(account_id, position_id, request)
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/positions/{position_id}/reduce", status_code=status.HTTP_202_ACCEPTED, tags=["positions"])
+def reduce_position(account_id: str, position_id: str, request: PositionExitRequest) -> dict[str, Any]:
+    return _request_position_exit(account_id, position_id, request)
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/audit-events", tags=["audit"])

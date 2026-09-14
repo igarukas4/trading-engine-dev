@@ -119,6 +119,11 @@ class Position:
     last_confirmed_stop: str | None = None
     accounting_mode: Literal["NETTING", "HEDGING"] = "NETTING"
     external_position_id: str | None = None
+    pair: str | None = None
+    direction: Literal["LONG", "SHORT"] | None = None
+    entry_price: str | None = None
+    current_pnl: str | None = None
+    data_status: Literal["CONFIRMED", "UNKNOWN", "STALE"] = "UNKNOWN"
 
     def __post_init__(self) -> None:
         if self.remaining_volume is None:
@@ -137,6 +142,7 @@ class PositionCommand:
     requested_stop: str | None = None
     confirmed_stop: str | None = None
     reason: str | None = None
+    idempotency_key: str | None = None
 
 
 @dataclass
@@ -219,6 +225,7 @@ class ExecutionSubstrate:
         self._order_reservations: dict[str, str] = {}
         self.commands: dict[str, OperatorCommand] = {}
         self._command_keys: dict[tuple[str, str], str] = {}
+        self._position_command_keys: dict[tuple[str, str], str] = {}
         self._approved_signals: dict[tuple[str, str], str] = {}
         self.global_emergencies: dict[str, GlobalEmergencyOperation] = {}
 
@@ -627,13 +634,20 @@ class ExecutionSubstrate:
             position = self.positions.get((account_id, order_id))
             if position is None:
                 protection = "CONFIRMED" if native_protection_confirmed else "UNCONFIRMED"
+                side = str(payload.get("side", "BUY")).upper()
                 position = Position(
-                    account_id, order_id, str(volume), protection,
+                    account_id=account_id,
+                    order_id=order_id,
+                    volume=str(volume),
+                    protection_status=protection,
                     native_stop_loss=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
                     native_take_profit=str(payload.get("take_profit")) if payload.get("take_profit") is not None else None,
                     last_confirmed_stop=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
                     accounting_mode=accounting_mode,
                     external_position_id=external_position_id,
+                    pair=str(payload.get("symbol", payload.get("pair", "UNKNOWN"))),
+                    direction="LONG" if side in {"BUY", "LONG"} else "SHORT",
+                    entry_price=(str(payload["entry_price"]) if payload.get("entry_price") is not None else "UNKNOWN"),
                 )
                 self.positions[(account_id, order_id)] = position
             else:
@@ -811,6 +825,69 @@ class ExecutionSubstrate:
         if position is None:
             raise ExecutionError("POSITION_NOT_FOUND")
         return position
+
+    def position_view(self, account_id: str, order_id: str) -> dict[str, Any]:
+        """Return a fail-closed operational projection for one account."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, order_id)
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            view = {
+                **position.__dict__,
+                "position_id": order_id,
+                "order_status": order.status,
+                "protection_confirmed": position.protection_status == "CONFIRMED",
+            }
+            view["current_pnl"] = position.current_pnl or "UNKNOWN"
+            return view
+
+    def request_position_close(
+        self, account_id: str, order_id: str, volume: str | None,
+        confirmed_pair: str, reason: str, *, confirmed: bool = False,
+        idempotency_key: str | None = None,
+    ) -> PositionCommand:
+        """Accept an explicitly confirmed reduce-only close/reduction intent."""
+        with self._lock_for(account_id):
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            position = self.position(account_id, order_id)
+            expected_pair = position.pair or "UNKNOWN"
+            if confirmed_pair != expected_pair:
+                raise ExecutionError("POSITION_PAIR_MISMATCH")
+            if not confirmed:
+                raise ExecutionError("OPERATOR_CONFIRMATION_REQUIRED")
+            if idempotency_key:
+                prior_id = self._position_command_keys.get((account_id, idempotency_key))
+                if prior_id:
+                    return next(command for command in self.position_commands if command.id == prior_id)
+
+            requested = None if volume in (None, "", "ALL") else str(volume)
+            if requested is not None:
+                requested_volume = self._decimal(requested)
+                remaining_volume = self._decimal(position.remaining_volume or "0")
+                if requested_volume <= 0:
+                    raise ExecutionError("POSITION_VOLUME_INVALID")
+                if requested_volume > remaining_volume:
+                    raise ExecutionError("REDUCTION_EXCEEDS_EXPOSURE")
+            if not reason.strip():
+                raise ExecutionError("OPERATOR_REASON_REQUIRED")
+            command = PositionCommand(
+                id=str(uuid4()),
+                account_id=account_id,
+                order_id=order_id,
+                command_type="CLOSE",
+                requested_volume=requested,
+                reduce_only=True,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+            self.position_commands.append(command)
+            if idempotency_key:
+                self._position_command_keys[(account_id, idempotency_key)] = command.id
+            position.stage = "CLOSING"
+            return command
 
     def install_fence(self, account_id: str, kind: str = "SAFETY_FENCE") -> SafetyFence:
         account = self.account(account_id)

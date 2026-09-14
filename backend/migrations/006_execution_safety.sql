@@ -84,6 +84,12 @@ CREATE TABLE IF NOT EXISTS positions (
     native_take_profit NUMERIC,
     last_confirmed_stop NUMERIC,
     runner_volume NUMERIC,
+    pair TEXT,
+    direction TEXT CHECK (direction IN ('LONG', 'SHORT')),
+    entry_price NUMERIC,
+    current_pnl NUMERIC,
+    data_status TEXT NOT NULL DEFAULT 'UNKNOWN'
+        CHECK (data_status IN ('CONFIRMED', 'UNKNOWN', 'STALE')),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (broker_account_id, id),
     UNIQUE (broker_account_id, external_position_id)
