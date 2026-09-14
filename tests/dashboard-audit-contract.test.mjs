@@ -65,3 +65,18 @@ test("Opportunities uses an account-scoped fail-closed MANUAL command flow", () 
   assert.match(backend, /account_data_status/);
   assert.match(backend, /ACCOUNT_DATA_UNSAFE/);
 });
+
+test("Opportunities exposes signal evidence and backend-defined actions for every mode", () => {
+  for (const evidence of ["technical", "fundamental", "ai", "market_snapshot_id", "policy_version", "supersedes_signal_id"]) {
+    assert.match(opportunities, new RegExp(evidence));
+  }
+  assert.match(opportunities, /AuditEvent|audit-events/);
+  assert.match(opportunities, /SEMI_AUTO/);
+  assert.match(opportunities, /FULL_AUTO/);
+  assert.match(opportunities, /exactly one Order|satu Order/i);
+  assert.match(opportunities, /eligibility|kelayakan/i);
+  assert.match(opportunities, /safe next action|Tindakan aman/i);
+  assert.match(opportunities, /SIGNAL_EXPIRED|SIGNAL_REVISION_SUPERSEDED/);
+  assert.match(backend, /schedule_automated_signal/);
+  assert.match(backend, /execution_mode == "SEMI_AUTO"/);
+});

@@ -9,6 +9,7 @@ type DataStatus = {
   reason_code: string | null;
 };
 type RiskAssessment = { approved: boolean; reason_codes: string[] };
+type Evidence = Record<string, unknown>;
 type Signal = {
   id: string;
   revision: number;
@@ -17,6 +18,12 @@ type Signal = {
   expires_at: string;
   reason_codes: string[];
   risk_assessment: RiskAssessment;
+  market_snapshot_id: string;
+  strategy_config_version_id: string;
+  policy_version: number;
+  context_revision?: number;
+  supersedes_signal_id?: string | null;
+  evidence?: { technical?: Evidence; fundamental?: Evidence; ai?: Evidence };
 };
 type Opportunity = {
   id?: string;
@@ -24,6 +31,8 @@ type Opportunity = {
   direction: string;
   confidence: string;
   reason_codes: string[];
+  market_snapshot_id?: string;
+  evidence?: { technical?: Evidence; fundamental?: Evidence; ai?: Evidence };
   signals?: Signal[];
 };
 type Account = { display_name: string; execution_mode: string; bot_state: string };
@@ -51,6 +60,7 @@ export default function OpportunitiesPage() {
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [filter, setFilter] = useState<ReturnType<typeof signalBucket>>("Perlu tindakan");
   const [dialog, setDialog] = useState<{ signal: Signal; action: Action } | null>(null);
+  const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
   const [reason, setReason] = useState("");
   const [confirmed, setConfirmed] = useState(false);
   const [pending, setPending] = useState<Record<string, string>>({});
@@ -151,10 +161,22 @@ export default function OpportunitiesPage() {
   }
 
   const canAct = Boolean(dataStatus?.can_approve && account?.execution_mode === "MANUAL");
+  const mode = account?.execution_mode ?? "MANUAL";
+
+  function safeNextAction(signal: Signal) {
+    if (signal.status === "EXPIRED") return "Muat ulang atau tunggu Signal baru; tidak ada entry yang aman.";
+    if (signal.status === "INVALIDATED") return "Gunakan Signal revisi yang menggantikan record ini.";
+    if (signal.status === "REJECTED") return "Jangan ulangi Command; periksa reason code backend dan audit.";
+    if (signal.status.startsWith("BLOCKED") || !signal.risk_assessment.approved) return "Jangan kirim Command; perbaiki gate backend yang tercantum.";
+    if (mode === "FULL_AUTO") return "Tidak ada approval per-Signal; pantau kelayakan dan Command backend.";
+    if (mode === "SEMI_AUTO") return "Konfirmasi Approve untuk menjadwalkan tepat satu Order.";
+    if (signal.status === "APPROVED") return "Konfirmasi Execute sebagai Command terpisah.";
+    return "Tinjau evidence lalu konfirmasi Approve.";
+  }
 
   return (
     <main>
-      <p>Account-scoped operator flow · Mode {account?.execution_mode ?? "MANUAL"}</p>
+      <p>Account-scoped operator flow · Mode {mode}</p>
       <h1>Opportunities</h1>
 
       {!accountId && <p>Pilih satu akun untuk melihat peluang.</p>}
@@ -210,13 +232,18 @@ export default function OpportunitiesPage() {
                       {" · Reason codes: "}
                       {signal.reason_codes.concat(signal.risk_assessment.reason_codes).join(", ") || "Lolos"}
                     </p>
+                    <p>Tindakan aman: {safeNextAction(signal)}</p>
+
+                    <button type="button" onClick={() => setSelectedSignal(signal)}>
+                      Lihat evidence dan audit
+                    </button>
 
                     {pending[signal.id] && (
                       <button type="button" disabled>
                         Diproses · {pending[signal.id]}
                       </button>
                     )}
-                    {!pending[signal.id] && signal.status === "ELIGIBLE" && (
+                    {mode === "MANUAL" && !pending[signal.id] && signal.status === "ELIGIBLE" && (
                       <button
                         type="button"
                         disabled={!canAct}
@@ -225,7 +252,7 @@ export default function OpportunitiesPage() {
                         Setujui
                       </button>
                     )}
-                    {!pending[signal.id] && signal.status === "APPROVED" && (
+                    {mode === "MANUAL" && !pending[signal.id] && signal.status === "APPROVED" && (
                       <button
                         type="button"
                         disabled={!canAct}
@@ -233,6 +260,14 @@ export default function OpportunitiesPage() {
                       >
                         Eksekusi
                       </button>
+                    )}
+                    {mode === "SEMI_AUTO" && !pending[signal.id] && signal.status === "ELIGIBLE" && (
+                      <button type="button" disabled={!dataStatus?.can_approve} onClick={() => openConfirmation(signal, "approve")}>
+                        Approve · jadwalkan tepat satu Order
+                      </button>
+                    )}
+                    {mode === "FULL_AUTO" && (
+                      <p>FULL_AUTO: eligibility dan alasan blocking ditentukan backend; approval per-Signal tidak tersedia.</p>
                     )}
                   </section>
                 ))}
@@ -243,13 +278,34 @@ export default function OpportunitiesPage() {
 
       {message && <p role="status">{message}</p>}
 
+      {selectedSignal && (
+        <aside className="dialog" role="dialog" aria-label={`Evidence Signal ${selectedSignal.id}`}>
+          <h2>Evidence Signal</h2>
+          <p>
+            Akun: {account?.display_name ?? accountId}<br />
+            Pair: {selectedSignal.opportunity.pair}<br />
+            MarketStateSnapshot: {selectedSignal.market_snapshot_id}<br />
+            Berakhir: {selectedSignal.expires_at}<br />
+            StrategyConfig: {selectedSignal.strategy_config_version_id} · Policy: v{selectedSignal.policy_version}<br />
+            Revision konteks: {selectedSignal.context_revision ?? 0}
+          </p>
+          <p>Technical: {JSON.stringify(selectedSignal.evidence?.technical ?? { pair: selectedSignal.opportunity.pair, direction: selectedSignal.opportunity.direction })}</p>
+          <p>Fundamental: {JSON.stringify(selectedSignal.evidence?.fundamental ?? "Tidak tersedia")}</p>
+          <p>AI: {JSON.stringify(selectedSignal.evidence?.ai ?? "Tidak tersedia")}</p>
+          <p>RiskAssessment: {selectedSignal.risk_assessment.approved ? "APPROVED" : "REJECTED"} · {selectedSignal.risk_assessment.reason_codes.join(", ") || "Lolos"}</p>
+          {selectedSignal.supersedes_signal_id && <p>Supersedes: {selectedSignal.supersedes_signal_id} · SIGNAL_REVISION_SUPERSEDED</p>}
+          <p><a href={`/audit-events?account=${encodeURIComponent(accountId)}&signal_id=${encodeURIComponent(selectedSignal.id)}`}>Buka AuditEvent</a></p>
+          <button type="button" onClick={() => setSelectedSignal(null)}>Tutup</button>
+        </aside>
+      )}
+
       {dialog && (
         <aside className="dialog" role="dialog" aria-label="Konfirmasi MANUAL">
           <h2>Konfirmasi {dialog.action === "approve" ? "persetujuan" : "eksekusi"}</h2>
           <p>
             Akun: {account?.display_name ?? accountId}<br />
             Pair: {dialog.signal.opportunity.pair}<br />
-            Tindakan: {dialog.action}<br />
+            Tindakan: {dialog.action}{mode === "SEMI_AUTO" ? " — menjadwalkan tepat satu Order" : mode === "MANUAL" ? " — Approve dan Execute adalah Command terpisah" : ""}<br />
             Alasan wajib diisi sebelum perintah dikirim.
           </p>
           <label>

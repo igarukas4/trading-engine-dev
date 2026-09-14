@@ -1096,6 +1096,34 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
+    if accounts.accounts[account_id].execution_mode == "SEMI_AUTO":
+        account = accounts.accounts[account_id]
+        try:
+            scheduled = execution.schedule_automated_signal(
+                account_id=account_id,
+                signal_id=signal_id,
+                idempotency_key=f"{request.idempotency_key}:order",
+                mode="SEMI_AUTO",
+                signal_created_at=signal.created_at,
+                signal_revision=signal.revision,
+                signal_eligible=True,
+                signal_approved=True,
+                mode_changed_at=account.mode_changed_at,
+                risk_approved=signal.risk_assessment.approved,
+                signal_fresh=signal.as_dict()["status"] == "APPROVED",
+                fence_safe=execution.account(account_id).exposure_gate == "OPEN",
+                account_state=account.bot_state,
+                live_lock=account.connector_healthy and account.connector_bound,
+                execution_epoch=execution.account(account_id).execution_epoch,
+                order_payload={
+                    "stop_loss": str(signal.stop_loss) or "native",
+                    "take_profit": [str(value) for value in signal.take_profit] or ["native"],
+                    "signal_revision": signal.revision,
+                },
+            )
+        except ExecutionError as error:
+            raise HTTPException(status_code=409, detail={"code": error.code}) from error
+        return _accepted_command_response(account_id, command, signal=signal.as_dict(), order=scheduled.order.__dict__)
     return _accepted_command_response(account_id, command, signal=signal.as_dict())
 
 
