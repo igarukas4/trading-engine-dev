@@ -4,9 +4,16 @@ import { useEffect, useState } from "react";
 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
 type Position = {
-  position_id: string; pair: string; direction: string; remaining_volume: string;
-  entry_price: string; current_pnl: string; protection_status: string;
-  protection_confirmed: boolean; order_status: string; data_status: string;
+  position_id: string;
+  pair: string;
+  direction: string;
+  remaining_volume: string;
+  entry_price: string;
+  current_pnl: string;
+  protection_status: string;
+  protection_confirmed: boolean;
+  order_status: string;
+  data_status: string;
 };
 
 export default function PositionsPage() {
@@ -23,7 +30,10 @@ export default function PositionsPage() {
     setAccount(selectedAccount);
     if (selectedAccount) {
       fetch(`${apiBase}/api/v1/broker-accounts/${selectedAccount}/dashboard-snapshot`)
-        .then((response) => response.ok ? response.json() : Promise.reject())
+        .then((response) => {
+          if (!response.ok) return Promise.reject();
+          return response.json();
+        })
         .then((value) => setPositions(value.positions ?? []))
         .catch(() => setPositions([]));
     }
@@ -34,13 +44,18 @@ export default function PositionsPage() {
       setMessage("Pilih volume, isi alasan, dan konfirmasi account/pair terlebih dahulu.");
       return;
     }
+    const requestedVolume = kind === "close" ? "ALL" : volume;
     const response = await fetch(`${apiBase}/api/v1/broker-accounts/${account}/positions/${selected.position_id}/${kind}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ idempotency_key: `${kind}-${selected.position_id}-${Date.now()}`, volume: kind === "close" ? "ALL" : volume, pair_confirmation: selected.pair, reason, confirmed }),
+      body: JSON.stringify({ idempotency_key: `${kind}-${selected.position_id}-${Date.now()}`, volume: requestedVolume, pair_confirmation: selected.pair, reason, confirmed }),
     });
     const value = await response.json();
-    setMessage(response.ok ? "Diproses — menunggu status final dari backend/broker." : `Perintah ditolak: ${value.detail?.code ?? "UNKNOWN"}`);
-    if (response.ok) setSelected({ ...selected, order_status: "SUBMITTED" });
+    if (response.ok) {
+      setMessage("Diproses — menunggu status final dari backend/broker.");
+      setSelected({ ...selected, order_status: "SUBMITTED" });
+    } else {
+      setMessage(`Perintah ditolak: ${value.detail?.code ?? "UNKNOWN"}`);
+    }
   }
 
   return (

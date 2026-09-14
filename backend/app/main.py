@@ -445,12 +445,25 @@ def position_detail(account_id: str, position_id: str) -> dict[str, Any]:
     except ExecutionError as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=404 if code == "POSITION_NOT_FOUND" else 409, detail={"code": code}) from error
+
+    account_orders = [
+        order for order in execution.orders.values()
+        if order.account_id == account_id and order.id == position_id
+    ]
+    account_fills = [
+        fill for fill in execution.fills.values()
+        if fill.account_id == account_id and fill.order_id == position_id
+    ]
+    account_commands = [
+        command for command in execution.position_commands
+        if command.account_id == account_id and command.order_id == position_id
+    ]
     return {
         "account_id": account_id,
         "position": position,
-        "orders": [order.__dict__ for order in execution.orders.values() if order.account_id == account_id and order.id == position_id],
-        "fills": [fill.__dict__ for fill in execution.fills.values() if fill.account_id == account_id and fill.order_id == position_id],
-        "position_commands": [command.__dict__ for command in execution.position_commands if command.account_id == account_id and command.order_id == position_id],
+        "orders": [order.__dict__ for order in account_orders],
+        "fills": [fill.__dict__ for fill in account_fills],
+        "position_commands": [command.__dict__ for command in account_commands],
         "audit_events": audit_hub.list(account_id, limit=50)["audit_events"],
     }
 
@@ -464,7 +477,12 @@ def _request_position_exit(account_id: str, position_id: str, request: PositionE
         )
     except ExecutionError as error:
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
-    _audit(account_id, "position.exit.requested", request.reason, {"position_id": position_id, "command_id": command.id, "reduce_only": True})
+    _audit(
+        account_id,
+        "position.exit.requested",
+        request.reason,
+        {"position_id": position_id, "command_id": command.id, "reduce_only": True},
+    )
     return {"account_id": account_id, "position_id": position_id, "status": "ACCEPTED", "command": command.__dict__}
 
 

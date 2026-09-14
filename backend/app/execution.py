@@ -636,7 +636,10 @@ class ExecutionSubstrate:
                 protection = "CONFIRMED" if native_protection_confirmed else "UNCONFIRMED"
                 side = str(payload.get("side", "BUY")).upper()
                 position = Position(
-                    account_id, order_id, str(volume), protection,
+                    account_id=account_id,
+                    order_id=order_id,
+                    volume=str(volume),
+                    protection_status=protection,
                     native_stop_loss=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
                     native_take_profit=str(payload.get("take_profit")) if payload.get("take_profit") is not None else None,
                     last_confirmed_stop=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
@@ -830,14 +833,14 @@ class ExecutionSubstrate:
             order = self.orders.get(order_id)
             if order is None or order.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            return {
+            view = {
                 **position.__dict__,
                 "position_id": order_id,
                 "order_status": order.status,
-                "current_pnl": position.current_pnl or "UNKNOWN",
-                "data_status": position.data_status,
                 "protection_confirmed": position.protection_status == "CONFIRMED",
             }
+            view["current_pnl"] = position.current_pnl or "UNKNOWN"
+            return view
 
     def request_position_close(
         self, account_id: str, order_id: str, volume: str | None,
@@ -859,17 +862,26 @@ class ExecutionSubstrate:
                 prior_id = self._position_command_keys.get((account_id, idempotency_key))
                 if prior_id:
                     return next(command for command in self.position_commands if command.id == prior_id)
+
             requested = None if volume in (None, "", "ALL") else str(volume)
             if requested is not None:
-                if self._decimal(requested) <= 0:
+                requested_volume = self._decimal(requested)
+                remaining_volume = self._decimal(position.remaining_volume or "0")
+                if requested_volume <= 0:
                     raise ExecutionError("POSITION_VOLUME_INVALID")
-                if self._decimal(requested) > self._decimal(position.remaining_volume or "0"):
+                if requested_volume > remaining_volume:
                     raise ExecutionError("REDUCTION_EXCEEDS_EXPOSURE")
             if not reason.strip():
                 raise ExecutionError("OPERATOR_REASON_REQUIRED")
             command = PositionCommand(
-                str(uuid4()), account_id, order_id, "CLOSE", requested,
-                reduce_only=True, reason=reason, idempotency_key=idempotency_key,
+                id=str(uuid4()),
+                account_id=account_id,
+                order_id=order_id,
+                command_type="CLOSE",
+                requested_volume=requested,
+                reduce_only=True,
+                reason=reason,
+                idempotency_key=idempotency_key,
             )
             self.position_commands.append(command)
             if idempotency_key:
