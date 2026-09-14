@@ -205,3 +205,31 @@ print("ok")
 `);
   assert.match(output, /ok/);
 });
+
+test("positions expose account-local operational facts and protected reduce commands", () => {
+  const output = run(`
+from backend.app.execution import ExecutionSubstrate, ExecutionError
+
+engine = ExecutionSubstrate()
+entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
+    risk_approved=True, execution_epoch=1,
+    order_payload={"symbol": "EURUSD", "volume": "1", "side": "BUY", "entry_price": "1.10"})
+engine.record_fill("a", entry.order.id, "deal", "1", native_protection_confirmed=False)
+view = engine.position_view("a", entry.order.id)
+assert view["pair"] == "EURUSD" and view["direction"] == "LONG"
+assert view["entry_price"] == "1.10" and view["current_pnl"] == "UNKNOWN"
+assert view["protection_status"] == "UNCONFIRMED" and view["order_status"] == "FILLED"
+assert view["data_status"] == "UNKNOWN"
+try:
+    engine.request_position_close("b", entry.order.id, "0.2", "wrong", "review", confirmed=True)
+except ExecutionError as error:
+    assert error.code == "WRONG_ACCOUNT"
+else:
+    raise AssertionError("position crossed account boundary")
+command = engine.request_position_close("a", entry.order.id, "0.2", "EURUSD", "reduce risk", confirmed=True, idempotency_key="exit-1")
+assert command.reduce_only and command.status == "RECEIVED"
+assert command.requested_volume == "0.2"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
