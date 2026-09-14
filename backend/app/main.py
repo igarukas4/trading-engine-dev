@@ -308,8 +308,22 @@ def _service_state(account_id: str | None = None) -> ServiceStates:
     connector = "unavailable"
     if account_id and account_id in accounts.accounts:
         account = accounts.accounts[account_id]
-        connector = "healthy" if account.connector_bound and account.connector_healthy else "unavailable"
-    return {"api": "healthy", "database": _database_state(), "connector": connector}
+        if account.connector_bound and account.connector_healthy:
+            connector = "healthy"
+    return {
+        "api": "healthy",
+        "database": _database_state(),
+        "connector": connector,
+    }
+
+
+def _calendar_freshness(account_id: str) -> str:
+    health = calendar_health.get(account_id, {})
+    return (
+        "healthy"
+        if health and all(item.healthy and item.covered for item in health.values())
+        else "unknown"
+    )
 
 
 @app.get("/health/live", tags=["health"])
@@ -328,13 +342,22 @@ def system_status(account_id: str | None = None) -> SystemStatus:
         _require_account(account_id)
     services = _service_state(account_id)
     account_payload = None
-    freshness: dict[str, Any] = {"dashboard_stream": "healthy", "calendar": "unknown", "connector": "unknown"}
-    if account_id:
+    freshness: dict[str, Any] = {
+        "dashboard_stream": "healthy",
+        "calendar": "unknown",
+        "connector": "unknown",
+    }
+    if account_id is not None:
         account = accounts.accounts[account_id]
-        account_payload = {"account_id": account.id, "state": account.bot_state, "mode": account.execution_mode, "lifecycle_status": account.lifecycle_status, "version": account.version}
+        account_payload = {
+            "account_id": account.id,
+            "state": account.bot_state,
+            "mode": account.execution_mode,
+            "lifecycle_status": account.lifecycle_status,
+            "version": account.version,
+        }
         freshness["connector"] = "healthy" if account.last_heartbeat_at else "unknown"
-        health = calendar_health.get(account_id, {})
-        freshness["calendar"] = "healthy" if health and all(item.healthy and item.covered for item in health.values()) else "unknown"
+        freshness["calendar"] = _calendar_freshness(account_id)
     return {
         "status": (
             "healthy"
@@ -584,7 +607,11 @@ def global_emergency_operation(operation_id: str) -> dict[str, Any]:
     return _global_emergency_payload(operation, include_kind=True)
 
 
-@app.post("/api/v1/global-emergency-operations/{operation_id}/resume-reconcile", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
+@app.post(
+    "/api/v1/global-emergency-operations/{operation_id}/resume-reconcile",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["execution"],
+)
 def resume_global_emergency_reconcile(operation_id: str, request: EmergencyRecoveryRequest) -> dict[str, Any]:
     """Accept reconciliation only while the durable operation is unresolved.
 
@@ -597,12 +624,28 @@ def resume_global_emergency_reconcile(operation_id: str, request: EmergencyRecov
     if operation.status == "COMPLETE":
         raise HTTPException(status_code=409, detail={"code": "OPERATION_ALREADY_COMPLETE"})
     if request.expected_version != operation.version:
-        raise HTTPException(status_code=409, detail={"code": "STALE_VERSION", "expected_version": operation.version})
-    unresolved = [target for target in operation.targets.values() if target.status != "CONVERGED"]
-    if not unresolved:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "STALE_VERSION", "expected_version": operation.version},
+        )
+    if all(target.status == "CONVERGED" for target in operation.targets.values()):
         raise HTTPException(status_code=409, detail={"code": "NO_RECOVERY_REQUIRED"})
-    dashboard_hub.publish("system", None, "global_emergency.reconcile.accepted", {"operation_id": operation.id, "version": operation.version, "reason": request.reason})
-    return {"operation_id": operation.id, "status": "DIPROSES", "operation": _global_emergency_payload(operation, include_kind=True), "recovery_legal": True}
+    dashboard_hub.publish(
+        "system",
+        None,
+        "global_emergency.reconcile.accepted",
+        {
+            "operation_id": operation.id,
+            "version": operation.version,
+            "reason": request.reason,
+        },
+    )
+    return {
+        "operation_id": operation.id,
+        "status": "DIPROSES",
+        "operation": _global_emergency_payload(operation, include_kind=True),
+        "recovery_legal": True,
+    }
 
 
 @app.post("/api/v1/emergency/{operation_id}/targets/{account_id}/converge", tags=["execution"])
