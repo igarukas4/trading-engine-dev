@@ -62,7 +62,7 @@ from backend.app.risk_calendar import RiskLimits
 from backend.app.signals import SignalStore
 
 signals = SignalStore()
-at = datetime(2026, 9, 8, tzinfo=timezone.utc)
+at = datetime(2030, 9, 8, tzinfo=timezone.utc)
 signal = signals.create(account_id="account-a", opportunity={"id": "opp", "account_id": "account-a", "pair": "EURUSD", "strategy_config_version_id": "config-account-a-v1"}, market_snapshot_id="snap", policy_version=1, created_at=at, ttl=timedelta(days=1), limits=RiskLimits(broker_account_id="account-a"), risk_kwargs={"baseline_samples": 20, "policy_healthy": True}, context_revision=1)
 signal = signals.approve(signal.id, account_id="account-a", revision=1)
 revised = NewsContextStore.revise_signal(signals, signal.id, account_id="account-a", context_revision=2, policy_version=1, limits=RiskLimits(broker_account_id="account-a"))
