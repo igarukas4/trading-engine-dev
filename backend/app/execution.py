@@ -179,6 +179,7 @@ class GlobalEmergencyOperation:
     requested_kind: Literal["STOP_ONLY", "CLOSE_ALL"]
     target_account_ids: tuple[str, ...]
     status: Literal["INCOMPLETE", "COMPLETE"] = "INCOMPLETE"
+    version: int = 1
     targets: dict[str, GlobalEmergencyTarget] = field(default_factory=dict)
 
 
@@ -439,6 +440,7 @@ class ExecutionSubstrate:
         operation.status = "COMPLETE" if all(
             item.status == "CONVERGED" for item in operation.targets.values()
         ) else "INCOMPLETE"
+        operation.version += 1
         return operation
 
     def close_all(
