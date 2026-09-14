@@ -112,3 +112,6 @@ Do not absorb these user-owned/unrelated changes into UI work:
   lifecycle feedback.
 - Minor branding copy update is included in the next frontend release:
   sidebar subtitle `By O-O` and Dashboard greeting `Good morning, Chief`.
+- The minor branding copy release was rolled back on operator request. Current
+  production and source return to the pre-branding Markets release; do not
+  reintroduce `By O-O` or `Good morning, Chief` unless requested again.
