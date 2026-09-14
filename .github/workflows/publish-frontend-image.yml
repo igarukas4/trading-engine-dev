@@ -40,10 +40,10 @@ jobs:
           set -euo pipefail
           container_id=$(docker run --detach --publish 127.0.0.1:13000:3000 trading-engine-v0-frontend:ci)
           trap 'docker logs "$container_id"; docker rm --force "$container_id"' EXIT
-          # Cold starts on GitHub-hosted runners have exceeded one minute;
-          # retain a bounded wait while allowing the dashboard to initialize.
-          for attempt in {1..120}; do
-            if curl --fail --silent --show-error http://127.0.0.1:13000/ | grep -q 'Dashboard'; then
+          # Verify the built dashboard serves its root document. UI copy is
+          # intentionally not a deployment health contract.
+          for attempt in {1..60}; do
+            if curl --fail --silent --show-error http://127.0.0.1:13000/ | grep -q '<!DOCTYPE html>'; then
               exit 0
             fi
             sleep 1
