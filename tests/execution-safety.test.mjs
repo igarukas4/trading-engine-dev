@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-const run = (script) => execFileSync("python3", ["-c", script], { encoding: "utf8" });
+const run = (script) => execFileSync(process.execPath, ["tests/python.mjs", "-c", script], { encoding: "utf8" });
 
 test("pre-order is atomic, account-scoped, idempotent, and ordered", () => {
   const output = run(`

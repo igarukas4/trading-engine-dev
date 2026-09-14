@@ -32,7 +32,7 @@ test("operator shell exposes six areas and keeps account context explicit", () =
 });
 
 test("dashboard stream model isolates cursors and deduplicates event IDs", () => {
-  const output = execFileSync("python3", ["-c", `
+  const output = execFileSync(process.execPath, ["tests/python.mjs", "-c", `
 from backend.app.dashboard import DashboardHub
 
 hub = DashboardHub(replay_limit=4)
