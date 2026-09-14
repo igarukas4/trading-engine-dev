@@ -96,10 +96,13 @@ Do not absorb these user-owned/unrelated changes into UI work:
 - Commit `8c3f1dd` added the account-scoped Markets slice: pair/timeframe
   controls, watchlist, read-only candle visualization through the `MarketChart`
   adapter, and market stream resync status.
-- Both frontend image workflows passed their dashboard entrypoint checks and
-  the corresponding releases passed the production smoke check. The latest
-  production frontend release is recorded on the VPS as
-  `/srv/trading-engine-v0/deploy/releases/release-20260914T085207Z-26741.env`.
+- Commit `51a772c` added the requested minimal branding copy: `By O-O` below
+  `TRADING ENGINE` and `Good morning, Chief` in the Dashboard greeting.
+- Commit `9412260` restored the shared shell CSS after a patch accidentally
+  replaced the CSS rule containing the sidebar/topbar layout. The sidebar
+  fix and branding are live. The latest production frontend release is
+  recorded on the VPS as
+  `/srv/trading-engine-v0/deploy/releases/release-20260914T093039Z-22825.env`.
 - No BrokerAccount has been configured or made active for the operator yet, so
   account-scoped Markets data cannot currently be demonstrated with live
   account context. This is expected and no broker/execution setup was done.
@@ -110,20 +113,3 @@ Do not absorb these user-owned/unrelated changes into UI work:
 - Do not start D2 until the remaining UI remediation has had an acceptance
   pass, especially Opportunities/Positions/System safety states and command
   lifecycle feedback.
-- Minor branding copy update is included in the next frontend release:
-  sidebar subtitle `By O-O` and Dashboard greeting `Good morning, Chief`.
-- The minor branding copy release was rolled back after the operator reported
-  the website looked broken. Current production and source return to the
-  pre-branding Markets release. Preserve the Dashboard/Markets implementation
-  itself; the rollback was about the branding change, not a request to remove
-  the UI work.
-
-## Preserved pending operator request
-
-- Re-apply only these two small copy changes when the operator is ready:
-  `By O-O` as a small subtitle directly below `TRADING ENGINE` in the upper
-  left brand area, and `Good morning, Chief` in the Dashboard greeting.
-- Do not redesign, restructure, or alter the existing Dashboard/Markets UI for
-  this request. Build and verify the two-copy change locally first, then use
-  the established frontend image and shared-host release workflow if it is
-  explicitly deployed.
