@@ -22,7 +22,7 @@ An issue B is **blocked by** issue A if:
 
 An issue is **unblocked** if it has zero blocking dependencies on other open issues.
 
-Choose exactly one highest-priority unblocked issue. Assign its branch name using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved. Serial execution deliberately keeps ChatGPT Plus usage within a single agent pipeline.
+Choose up to three highest-priority unblocked issues that can safely run in parallel. Do not choose tickets with overlapping migrations, schemas, APIs, infrastructure, or likely file/module conflicts. Assign every branch using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved.
 
 # OUTPUT
 
@@ -32,6 +32,6 @@ Output your plan as a JSON object wrapped in `<plan>` tags:
 {"issues": [{"id": "42", "title": "Fix auth bug", "branch": "sandcastle/issue-42"}]}
 </plan>
 
-Include only the chosen unblocked issue. If every issue is blocked, output an empty list; do not guess around an explicit blocker.
+Include only the chosen unblocked issues. If every issue is blocked, output an empty list; do not guess around an explicit blocker.
 
 Always emit the `<plan>` tags, even when there is nothing to do. If there are no issues to work on at all, output `<plan>{"issues": []}</plan>` so the run can exit cleanly.

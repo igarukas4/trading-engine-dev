@@ -12,16 +12,32 @@ function blockerNumbers(body: string): number[] {
   return [...section.matchAll(issueReference)].map((match) => Number(match[1]));
 }
 
-export function selectNextUnblockedIssue(
+export function selectUnblockedIssues(
   issues: ReadyIssue[],
-): ReadyIssue | undefined {
-  const openIssueNumbers = new Set(issues.map((issue) => issue.number));
-
+  openIssueNumbers = new Set(issues.map((issue) => issue.number)),
+): ReadyIssue[] {
   return issues
     .filter((issue) =>
       blockerNumbers(issue.body).every(
         (blocker) => !openIssueNumbers.has(blocker),
       ),
     )
-    .sort((left, right) => left.number - right.number)[0];
+    .sort((left, right) => left.number - right.number);
+}
+
+export function selectDispatchableIssues(
+  readyIssues: ReadyIssue[],
+  openIssueNumbers: Set<number>,
+  plannedIssueNumbers: Set<number>,
+  maxConcurrentIssues: number,
+): ReadyIssue[] {
+  return selectUnblockedIssues(readyIssues, openIssueNumbers)
+    .filter((issue) => plannedIssueNumbers.has(issue.number))
+    .slice(0, maxConcurrentIssues);
+}
+
+export function selectNextUnblockedIssue(
+  issues: ReadyIssue[],
+): ReadyIssue | undefined {
+  return selectUnblockedIssues(issues)[0];
 }

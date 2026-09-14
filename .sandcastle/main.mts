@@ -29,7 +29,7 @@ import { promisify } from "node:util";
 import type { SandboxRunResult } from "@ai-hero/sandcastle";
 import { z } from "zod";
 import {
-  selectNextUnblockedIssue,
+  selectDispatchableIssues,
   type ReadyIssue,
 } from "./issue-selection.mts";
 
@@ -62,42 +62,67 @@ type PlannedIssue = {
 
 const execFileAsync = promisify(execFile);
 
-async function nextUnblockedIssue(): Promise<PlannedIssue | undefined> {
-  const { stdout } = await execFileAsync("gh", [
-    "issue",
-    "list",
-    "--state",
-    "open",
-    "--label",
-    "ready-for-agent",
-    "--limit",
-    "100",
-    "--json",
-    "number,title,body",
+async function nextUnblockedIssues(
+  plannedIssues: PlannedIssue[],
+): Promise<PlannedIssue[]> {
+  const [readyResult, openResult] = await Promise.all([
+    execFileAsync("gh", [
+      "issue",
+      "list",
+      "--state",
+      "open",
+      "--label",
+      "ready-for-agent",
+      "--limit",
+      "100",
+      "--json",
+      "number,title,body",
+    ]),
+    execFileAsync("gh", [
+      "issue",
+      "list",
+      "--state",
+      "open",
+      "--limit",
+      "100",
+      "--json",
+      "number",
+    ]),
   ]);
-  const issue = selectNextUnblockedIssue(JSON.parse(stdout) as ReadyIssue[]);
+  const readyIssues = JSON.parse(readyResult.stdout) as ReadyIssue[];
+  const openIssueNumbers = new Set(
+    (JSON.parse(openResult.stdout) as Array<{ number: number }>).map(
+      (issue) => issue.number,
+    ),
+  );
+  const plannedIssueNumbers = new Set(
+    plannedIssues.map((issue) => Number(issue.id)),
+  );
 
-  return issue
-    ? {
-        id: String(issue.number),
-        title: issue.title,
-        branch: `sandcastle/issue-${issue.number}`,
-      }
-    : undefined;
+  return selectDispatchableIssues(
+    readyIssues,
+    openIssueNumbers,
+    plannedIssueNumbers,
+    MAX_CONCURRENT_ISSUES,
+  ).map((issue) => ({
+    id: String(issue.number),
+    title: issue.title,
+    branch: `sandcastle/issue-${issue.number}`,
+  }));
 }
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-// A run may progress through the whole code backlog, but always one issue at
-// a time. If an agent or provider fails (including a rate limit), the loop
-// stops cleanly; re-running resumes the deterministic issue branch.
+// A run may progress through the whole code backlog with a bounded number of
+// independent issues. If an agent or provider fails (including a rate limit),
+// the loop stops cleanly; re-running resumes deterministic ticket branches.
 const MAX_ITERATIONS = 100;
+const MAX_CONCURRENT_ISSUES = 3;
 
-// Keep Codex usage predictable for the ChatGPT Plus rate limit. The planner
-// returns exactly one ready, unblocked issue, so this provider is never used
-// concurrently by this workflow.
+// Keep Codex usage predictable for the ChatGPT Plus rate limit. Concurrent
+// issue pipelines are bounded by MAX_CONCURRENT_ISSUES.
 const codeAgent = sandcastle.codex("gpt-5.6-luna", {
   effort: "medium",
   captureSessions: false,
@@ -169,10 +194,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
   });
 
-  // Enforce the rate-limit budget even if a planner response exceeds its
-  // one-issue instruction.
-  const nextIssue = await nextUnblockedIssue();
-  const issues = nextIssue ? [nextIssue] : [];
+  // Planner selection excludes likely-overlapping work; host-side selection
+  // validates ready status and open blockers before enforcing the batch cap.
+  const issues = await nextUnblockedIssues(plan.output.issues);
 
   if (issues.length === 0) {
     // No unblocked work — either everything is done or everything is blocked.

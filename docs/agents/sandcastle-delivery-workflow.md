@@ -148,35 +148,37 @@ Sandcastle's close path and Git worktree cleanup scoped to the affected
 worktree; avoid broad host deletion. Once ACL inheritance is healthy, retry
 from the existing deterministic ticket branch.
 
-## Sequential delivery: default
+## Bounded parallel delivery
 
-Sequential delivery is mandatory for the current runner and is the correct
-mode for the V0 dependency chain, shared API/schema decisions, overlapping
-modules, and constrained ChatGPT quota.
+The runner dispatches at most three independent tickets per iteration. This
+is appropriate only when every selected ticket has no open declared blocker
+and no shared migration, schema, API, infrastructure, or likely file/module
+overlap. The host-side selector is authoritative; the planner provides
+context but cannot override that safety check.
 
 ```powershell
 npm run sandcastle
 ```
 
-One iteration has this lifecycle:
+One iteration has this lifecycle for each selected ticket:
 
 ```text
 planner (context only)
         |
-deterministic next unblocked ready issue
+bounded deterministic batch of unblocked ready issues
         |
-create sandbox + sandcastle/issue-<number>
+create one sandbox + sandcastle/issue-<number> per issue
         |
 implementer -> reviewer (same sandbox and branch)
         |
-merge + verification + GitHub issue close
+serial merge + verification + GitHub issue close
         |
 next iteration
 ```
 
-The planner's structured output is context, not authority for dispatch. The
-host-side selector in `.sandcastle/issue-selection.mts` enforces one eligible
-ticket, so a planner output cannot create parallel work accidentally.
+Each implementation/review pipeline runs in its own sandbox. The merger
+remains serial and verifies after every branch. Any failed pipeline stops the
+batch before merging so its evidence is preserved for recovery.
 
 For unattended rate-limit recovery, use:
 
@@ -188,6 +190,9 @@ The supervisor records logs in `.sandcastle/logs/`, retries only rate-limit or
 quota-shaped failures with bounded exponential backoff, and stops for other
 failures. A clean exit can mean either no runnable `ready-for-agent` ticket or
 completion; inspect the log and issue state before declaring the roadmap done.
+On Windows, it invokes `npm` through `cmd.exe` so routine npm stderr notices do
+not terminate the Stop-mode PowerShell supervisor before the run exit code and
+log are captured.
 
 ## Per-ticket completion contract
 
@@ -219,20 +224,10 @@ completion; inspect the log and issue state before declaring the roadmap done.
 - Close only an issue whose branch was merged successfully, with the configured
   completion comment.
 
-## Parallel delivery: exceptional mode
-
-Do not enable parallelism merely because several tickets are labelled
-`ready-for-agent`. It requires all of these to be true:
-
-- no open dependency between the tickets;
-- no shared migration, schema, API, infrastructure, or likely file/module
-  overlap;
-- separate branch and sandbox per complete ticket pipeline;
-- an explicit small concurrency cap compatible with model quota; and
-- a reviewed, tested, committed runner configuration change.
-
-Review each branch in its own sandbox after its implementer. Merge serially and
-verify each merge. Restore sequential mode after the independent batch.
+Do not add tickets to the same batch merely because they are labelled
+`ready-for-agent`; their declared blockers and likely overlap still govern
+dispatch. Lower the cap or restore a one-ticket batch when a run requires a
+shared API/schema decision or model quota becomes constrained.
 
 ## Recovery playbook
 

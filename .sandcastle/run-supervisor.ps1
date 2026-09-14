@@ -19,7 +19,9 @@ for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
   $logPath = Join-Path $logDirectory "sandcastle-$timestamp.log"
   Push-Location $repoRoot
   try {
-    npm run sandcastle 2>&1 | Tee-Object -FilePath $logPath
+    # npm emits routine notices on stderr; cmd keeps those notices from
+    # terminating this Stop-mode PowerShell script before exit capture.
+    cmd.exe /d /c "npm run sandcastle 2>&1" | Tee-Object -FilePath $logPath
     $exitCode = $LASTEXITCODE
   } finally {
     Pop-Location
