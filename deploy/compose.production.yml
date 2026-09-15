@@ -64,7 +64,11 @@ services:
       TRUSTED_PROXY_IPS: 172.30.0.2
     secrets:
       - app_secret_key
-      - postgres_password
+      - source: postgres_password
+        target: postgres_password
+        uid: "100"
+        gid: "101"
+        mode: 0400
       - redis_password
     networks:
       - private
@@ -93,7 +97,11 @@ services:
       DATABASE_USER: trading_engine
     command: ["python", "-m", "app.migrate"]
     secrets:
-      - postgres_password
+      - source: postgres_password
+        target: postgres_password
+        uid: "100"
+        gid: "101"
+        mode: 0400
     networks:
       - private
     depends_on:

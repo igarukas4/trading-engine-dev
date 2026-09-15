@@ -14,6 +14,9 @@ test("production applies ordered migrations before starting the backend", () => 
     assert.match(compose, /condition: service_completed_successfully/);
     assert.match(compose, /command: \["python", "-m", "app\.migrate"\]/);
     assert.match(compose, /DATABASE_PASSWORD_FILE: \/run\/secrets\/postgres_password/);
+    assert.match(compose, /uid: "100"/);
+    assert.match(compose, /gid: "101"/);
+    assert.match(compose, /mode: 0400/);
   }
   assert.match(migrator, /glob\("\*\.sql"\)/);
   assert.match(migrator, /cursor\.execute/);
