@@ -27,5 +27,5 @@ test("production applies ordered migrations before starting the backend", () => 
   assert.match(accounts, /INSERT INTO broker_accounts/);
   assert.match(accounts, /UPDATE broker_accounts/);
   assert.match(entrypoint, /install -o app -g app -m 0400/);
-  assert.match(entrypoint, /exec su app/);
+  assert.match(entrypoint, /exec su -s \/bin\/sh -c/);
 });
