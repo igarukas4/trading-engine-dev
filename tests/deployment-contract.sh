@@ -79,7 +79,11 @@ grep -Fqx '$2a$14$replace-with-a-bcrypt-hash' "$repository_root/deploy/secrets/c
 restore_script="$repository_root/scripts/verify-backup-restore.sh"
 grep -Fq 'sha256sum --check --status "$checksum_file"' "$restore_script" || fail 'restore verification must check the backup checksum'
 grep -Fq 'docker network create --internal "$network_name"' "$restore_script" || fail 'restore verification must create an isolated network'
-grep -Fq 'pg_restore -U postgres -d postgres --clean --if-exists --no-owner --exit-on-error' "$restore_script" || fail 'restore verification must ignore dump ownership while preserving restore errors'
+grep -Fq -- "-c 'CREATE EXTENSION IF NOT EXISTS timescaledb;'" "$restore_script" || fail 'restore verification must install TimescaleDB before restore'
+grep -Fq -- "-c 'SELECT timescaledb_pre_restore();'" "$restore_script" || fail 'restore verification must enter TimescaleDB restore mode before pg_restore'
+grep -Fq 'pg_restore -U postgres -d postgres --no-owner --exit-on-error' "$restore_script" || fail 'restore verification must ignore dump ownership while preserving restore errors'
+! grep -Fq 'pg_restore -U postgres -d postgres --clean --if-exists' "$restore_script" || fail 'restore verification must not drop the preloaded TimescaleDB extension'
+grep -Fq -- "-c 'SELECT timescaledb_post_restore();'" "$restore_script" || fail 'restore verification must exit TimescaleDB restore mode after pg_restore'
 ! grep -Fq 'trading-engine_private' "$restore_script" || fail 'restore verification must not use the live private network'
 grep -Fq 'POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password' "$restore_script" || fail 'restore verification must use the Postgres password file interface'
 grep -Fq -- '--mount "type=bind,src=$restore_password_file,dst=/run/secrets/postgres_password,readonly"' "$restore_script" || fail 'restore verification must mount a protected temporary password file'

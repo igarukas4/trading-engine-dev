@@ -23,7 +23,12 @@ network_name="trading-engine-restore-network-$RANDOM"
 umask 077
 restore_password_file=$(mktemp)
 openssl rand -base64 36 >"$restore_password_file"
+timescaledb_restore_started=false
 cleanup() {
+  if [[ "$timescaledb_restore_started" == true ]]; then
+    docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres \
+      -c 'SELECT timescaledb_post_restore();' >/dev/null 2>&1 || true
+  fi
   docker rm -f "$container_name" >/dev/null 2>&1 || true
   docker network rm "$network_name" >/dev/null 2>&1 || true
   rm -f "$restore_password_file"
@@ -36,10 +41,20 @@ docker run --detach --name "$container_name" --network "$network_name" \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   "$timescaledb_image" >/dev/null
 for _ in {1..30}; do
-  docker exec "$container_name" pg_isready -U postgres >/dev/null 2>&1 && break
+  if docker exec "$container_name" pg_isready -U postgres >/dev/null 2>&1; then
+    # The image briefly accepts connections during initialization, then
+    # restarts PostgreSQL before it is ready for a restore.
+    sleep 2
+    docker exec "$container_name" pg_isready -U postgres >/dev/null 2>&1 && break
+  fi
   sleep 1
 done
 docker exec "$container_name" pg_isready -U postgres >/dev/null
+docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;' >/dev/null
+docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c 'SELECT timescaledb_pre_restore();' >/dev/null
+timescaledb_restore_started=true
 docker cp "$backup_file" "$container_name:/tmp/backup.dump"
 docker exec "$container_name" sh -ec '
   set -eu
@@ -48,7 +63,12 @@ docker exec "$container_name" sh -ec '
   trap '\''rm -f "$pgpass_file"'\'' EXIT
   printf "*:*:*:postgres:%s\\n" "$(cat /run/secrets/postgres_password)" >"$pgpass_file"
   export PGPASSFILE="$pgpass_file"
-  pg_restore -U postgres -d postgres --clean --if-exists --no-owner --exit-on-error /tmp/backup.dump
-  psql -U postgres -d postgres -Atqc "select 1" | grep -qx "1"
+  # The target is a new ephemeral database. --clean would attempt to drop the
+  # preloaded TimescaleDB extension and terminate the restore session.
+  pg_restore -U postgres -d postgres --no-owner --exit-on-error /tmp/backup.dump
 '
+docker exec "$container_name" psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres \
+  -c 'SELECT timescaledb_post_restore();' >/dev/null
+timescaledb_restore_started=false
+docker exec "$container_name" psql -U postgres -d postgres -Atqc "select 1" | grep -qx "1"
 printf 'backup restore verification passed: %s\n' "$backup_file"
