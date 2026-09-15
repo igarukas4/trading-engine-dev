@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS signals (
     expires_at TIMESTAMPTZ NOT NULL,
     UNIQUE (broker_account_id, opportunity_id, revision)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS signals_account_id_key
+    ON signals (broker_account_id, id);
 ALTER TABLE signals ADD CONSTRAINT signals_opportunity_account_fk
     FOREIGN KEY (broker_account_id, opportunity_id)
     REFERENCES opportunities (broker_account_id, id);
