@@ -21,7 +21,7 @@ timescaledb_image=$(sed -n 's/^TIMESCALEDB_IMAGE=//p' "$release_file")
 container_name="trading-engine-restore-$RANDOM"
 network_name="trading-engine-restore-network-$RANDOM"
 umask 077
-restore_password_file=$(mktemp)
+restore_password_file=$(mktemp "$(dirname "$backup_file")/.restore-password.XXXXXX")
 openssl rand -base64 36 >"$restore_password_file"
 timescaledb_restore_started=false
 cleanup() {

@@ -87,6 +87,7 @@ grep -Fq 'pg_restore -U postgres -d postgres --no-owner --exit-on-error' "$resto
 grep -Fq -- "-c 'SELECT timescaledb_post_restore();'" "$restore_script" || fail 'restore verification must exit TimescaleDB restore mode after pg_restore'
 ! grep -Fq 'trading-engine_private' "$restore_script" || fail 'restore verification must not use the live private network'
 grep -Fq 'POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password' "$restore_script" || fail 'restore verification must use the Postgres password file interface'
+grep -Fq 'mktemp "$(dirname "$backup_file")/.restore-password.XXXXXX"' "$restore_script" || fail 'restore verification must create its temporary password beside the protected backup'
 grep -Fq -- '--mount "type=bind,src=$restore_password_file,dst=/run/secrets/postgres_password,readonly"' "$restore_script" || fail 'restore verification must mount a protected temporary password file'
 grep -Fq 'PGPASSFILE=' "$restore_script" || fail 'restore verification must authenticate from a container-local password file'
 ! grep -Fq 'PGPASSWORD="$POSTGRES_PASSWORD"' "$restore_script" || fail 'restore verification must not read an unset password environment variable'
