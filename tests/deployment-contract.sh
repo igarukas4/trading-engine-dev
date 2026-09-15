@@ -27,6 +27,7 @@ require_file "$repository_root/tests/trusted-header-contract.sh"
 require_file "$repository_root/tests/caddy-health-contract.sh"
 require_file "$repository_root/tests/shared-host-caddy-contract.sh"
 require_file "$repository_root/tests/backend-image-contract.sh"
+require_file "$repository_root/tests/backup-schedule-contract.sh"
 
 for secret in postgres_password redis_password app_secret_key caddy_basic_auth_hash; do
   require_file "$repository_root/deploy/secrets/${secret}.example"
@@ -117,6 +118,7 @@ grep -Fq 'docker run --rm -it caddy:2.10.2-alpine@sha256:' "$readme" || fail 'RE
 "$repository_root/tests/caddy-health-contract.sh" || fail 'Caddy health contract check failed'
 "$repository_root/tests/shared-host-caddy-contract.sh" || fail 'shared-host Caddy contract check failed'
 "$repository_root/tests/backend-image-contract.sh" || fail 'backend image contract check failed'
+"$repository_root/tests/backup-schedule-contract.sh" || fail 'backup schedule contract check failed'
 "$repository_root/tests/compose-project-regression.sh" || fail 'Compose project regression check failed'
 
 printf 'deployment contract passed\n'

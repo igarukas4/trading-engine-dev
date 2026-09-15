@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Trading Engine backup and restore verification
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=trading-engine-backup.service
+
+[Install]
+WantedBy=timers.target

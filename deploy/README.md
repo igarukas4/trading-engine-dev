@@ -84,3 +84,15 @@ scripts/verify-backup-restore.sh /etc/trading-engine/release.env "$backup"
 ```
 
 Run backup plus restore verification on a scheduled host timer, retain encrypted off-host copies according to the operator's recovery policy, and periodically rehearse `scripts/release.sh rollback` with a valid smoke check.
+
+For the shared-host VPS, the repository includes a daily `02:30 UTC` systemd timer with 14-day local retention. It creates a backup, verifies an isolated restore, then prunes only older verified artifacts. Install it after reviewing the schedule and retention against the operator recovery policy:
+
+```bash
+sudo install -m 644 deploy/systemd/trading-engine-backup.service /etc/systemd/system/trading-engine-backup.service
+sudo install -m 644 deploy/systemd/trading-engine-backup.timer /etc/systemd/system/trading-engine-backup.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now trading-engine-backup.timer
+systemctl list-timers trading-engine-backup.timer
+```
+
+The timer does not copy data off-host or send alerts. Configure and test encrypted off-host retention plus an alert route before treating the schedule as a recovery solution.
