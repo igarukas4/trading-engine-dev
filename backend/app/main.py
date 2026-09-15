@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from urllib.parse import quote
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -40,10 +42,23 @@ class Settings:
 
     @classmethod
     def from_environment(cls) -> "Settings":
+        database_url = os.getenv("DATABASE_URL", "")
+        if not database_url:
+            password_file = os.getenv("DATABASE_PASSWORD_FILE", "")
+            if password_file:
+                password = Path(password_file).read_text(encoding="utf-8").strip()
+                database_url = (
+                    "postgresql://"
+                    f"{quote(os.getenv('DATABASE_USER', 'trading_engine'), safe='')}:"
+                    f"{quote(password, safe='')}@"
+                    f"{os.getenv('DATABASE_HOST', 'postgres')}:"
+                    f"{os.getenv('DATABASE_PORT', '5432')}/"
+                    f"{os.getenv('DATABASE_NAME', 'trading_engine')}"
+                )
         return cls(
             version=os.getenv("APP_VERSION", cls.version),
             public_origin=os.getenv("PUBLIC_ORIGIN", cls.public_origin),
-            database_url=os.getenv("DATABASE_URL", ""),
+            database_url=database_url,
         )
 
 
@@ -74,7 +89,7 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
-accounts = AccountRegistry()
+accounts = AccountRegistry(settings.database_url)
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()

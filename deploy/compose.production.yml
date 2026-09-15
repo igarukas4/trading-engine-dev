@@ -69,6 +69,8 @@ services:
     networks:
       - private
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -79,6 +81,24 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  migrate:
+    image: ${BACKEND_IMAGE:?set BACKEND_IMAGE to an immutable image digest in the release environment}
+    restart: "no"
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_NAME: trading_engine
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      DATABASE_PORT: "5432"
+      DATABASE_USER: trading_engine
+    command: ["python", "-m", "app.migrate"]
+    secrets:
+      - postgres_password
+    networks:
+      - private
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: ${TIMESCALEDB_IMAGE:?set TIMESCALEDB_IMAGE to an immutable image digest in the release environment}

@@ -54,7 +54,7 @@ Copy `release.env.example` to a protected location and replace `BACKEND_IMAGE` w
 scripts/release.sh deploy /etc/trading-engine/release.env
 ```
 
-The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, waits for health checks, and runs an HTTPS smoke check. The authenticated proxy-to-backend check is mandatory: place the Basic Auth plaintext in a separate `0600` file outside the repository and provide its path without putting the password in an environment variable or command argument:
+The deploy script validates untracked `0600` secrets, validates the rendered Compose file, pulls images, runs the ordered database migrations, waits for health checks, and runs an HTTPS smoke check. The migration container reads the PostgreSQL password from its secret file. A migration failure prevents the backend from starting. The authenticated proxy-to-backend check is mandatory: place the Basic Auth plaintext in a separate `0600` file outside the repository and provide its path without putting the password in an environment variable or command argument:
 
 ```bash
 SMOKE_BASIC_AUTH_PASSWORD_FILE=/etc/trading-engine/smoke-basic-auth-password \

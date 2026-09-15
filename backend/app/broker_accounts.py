@@ -14,6 +14,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
+from psycopg import connect
+from psycopg.errors import UniqueViolation
+
 AccountErrorCode = Literal[
     "ACCOUNT_CONTEXT_MISMATCH",
     "DUPLICATE_IDENTITY",
@@ -153,9 +156,75 @@ class ConnectorBinding:
 
 
 class AccountRegistry:
-    def __init__(self) -> None:
+    def __init__(self, database_url: str = "") -> None:
         self.accounts: dict[str, BrokerAccount] = {}
         self.bindings: dict[str, ConnectorBinding] = {}
+        self.database_url = database_url
+        if database_url:
+            self._load()
+
+    def _load(self) -> None:
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT id, provider, broker_server, external_account_id, display_name,
+                              environment, lifecycle_status, bot_state, execution_mode,
+                              live_execution_enabled, execution_epoch, connector_generation,
+                              lease_owner, lease_expires_at, connector_status,
+                              reconciliation_status, version, execution_mode_revision, mode_changed_at
+                         FROM broker_accounts"""
+                )
+                for row in cursor.fetchall():
+                    account = BrokerAccount(
+                        id=str(row[0]), provider=row[1], broker_server=row[2],
+                        external_account_id=row[3], display_name=row[4], environment=row[5],
+                        lifecycle_status=row[6], bot_state=row[7], execution_mode=row[8],
+                        live_execution_enabled=row[9], execution_epoch=row[10],
+                        connector_generation=row[11], lease_owner=row[12], lease_expires_at=row[13],
+                        connector_bound=row[14] != "UNAVAILABLE",
+                        connector_healthy=row[14] == "HEALTHY",
+                        reconciliation_complete=row[15] == "COMPLETE", version=row[16],
+                        execution_mode_revision=row[17], mode_changed_at=row[18],
+                    )
+                    self.accounts[account.id] = account
+                cursor.execute(
+                    """SELECT broker_account_id, provider, broker_server, external_account_id,
+                              key_id, secret_salt, secret_hash, revoked_at
+                         FROM connector_bindings"""
+                )
+                for row in cursor.fetchall():
+                    self.bindings[str(row[0])] = ConnectorBinding(
+                        account_id=str(row[0]), provider=row[1], broker_server=row[2],
+                        external_account_id=row[3], key_id=row[4], salt_hex=row[5],
+                        secret_hash=row[6], revoked=row[7] is not None,
+                    )
+
+    def _persist_account(self, account: BrokerAccount) -> None:
+        if not self.database_url:
+            return
+        connector_status = "HEALTHY" if account.connector_healthy else (
+            "BOUND" if account.connector_bound else "UNAVAILABLE"
+        )
+        reconciliation_status = "COMPLETE" if account.reconciliation_complete else "INCOMPLETE"
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """UPDATE broker_accounts
+                          SET lifecycle_status = %s, bot_state = %s, execution_mode = %s,
+                              live_execution_enabled = %s, execution_epoch = %s,
+                              connector_generation = %s, lease_owner = %s,
+                              lease_expires_at = %s, connector_status = %s,
+                              reconciliation_status = %s, version = %s,
+                              execution_mode_revision = %s, mode_changed_at = %s,
+                              updated_at = now()
+                        WHERE id = %s""",
+                    (account.lifecycle_status, account.bot_state, account.execution_mode,
+                     account.live_execution_enabled, account.execution_epoch,
+                     account.connector_generation, account.lease_owner,
+                     account.lease_expires_at, connector_status, reconciliation_status,
+                     account.version, account.execution_mode_revision, account.mode_changed_at,
+                     account.id),
+                )
 
     def register(
         self,
@@ -176,6 +245,19 @@ class AccountRegistry:
             display_name=display_name,
             environment=environment,
         )
+        if self.database_url:
+            try:
+                with connect(self.database_url) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """INSERT INTO broker_accounts
+                               (id, provider, broker_server, external_account_id, display_name, environment)
+                               VALUES (%s, %s, %s, %s, %s, %s)""",
+                            (account.id, account.provider, account.broker_server,
+                             account.external_account_id, account.display_name, account.environment),
+                        )
+            except UniqueViolation as error:
+                raise AccountError("DUPLICATE_IDENTITY", "BrokerAccount identity already exists") from error
         self.accounts[account.id] = account
         return account
 
@@ -187,6 +269,25 @@ class AccountRegistry:
             account.id, *account.identity, key_id, salt_hex, digest
         )
         account.connector_bound = True
+        if self.database_url:
+            binding = self.bindings[account_id]
+            with connect(self.database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """INSERT INTO connector_bindings
+                           (id, broker_account_id, provider, broker_server, external_account_id,
+                            key_id, secret_salt, secret_hash)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                           ON CONFLICT (broker_account_id) DO UPDATE SET
+                             provider = EXCLUDED.provider, broker_server = EXCLUDED.broker_server,
+                             external_account_id = EXCLUDED.external_account_id, key_id = EXCLUDED.key_id,
+                             secret_salt = EXCLUDED.secret_salt, secret_hash = EXCLUDED.secret_hash,
+                             revoked_at = NULL""",
+                        (str(uuid4()), binding.account_id, binding.provider, binding.broker_server,
+                         binding.external_account_id, binding.key_id, binding.salt_hex,
+                         binding.secret_hash),
+                    )
+            self._persist_account(account)
         return key_id
 
     def authenticate(self, account_id: str, key_id: str, secret: str, generation: int) -> BrokerAccount:
@@ -215,6 +316,8 @@ class AccountRegistry:
         account.lease_owner = owner
         account.lease_expires_at = now + timedelta(seconds=lease_seconds)
         account.last_heartbeat_at = now
+        account.connector_healthy = True
+        self._persist_account(account)
         return account
 
     def set_execution_mode(
@@ -228,6 +331,7 @@ class AccountRegistry:
         if account is None:
             raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
         account.set_execution_mode(mode, now=now)
+        self._persist_account(account)
         return account
 
     def read_only_snapshot(self, account_id: str) -> dict[str, Any]:
