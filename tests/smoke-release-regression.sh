@@ -15,7 +15,17 @@ chmod 600 "$password_file"
 cat >"$test_directory/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CURL_LOG"
-if [[ " $* " == *' --config - '* ]]; then
+if [[ " $* " == *' --config - '* && " $* " == *' --write-out '* ]]; then
+  cat >"$CURL_CONFIG"
+  if [[ -s ${CURL_AUTH_STATUS_SEQUENCE:-} ]]; then
+    status=$(head -n 1 "$CURL_AUTH_STATUS_SEQUENCE")
+    tail -n +2 "$CURL_AUTH_STATUS_SEQUENCE" >"${CURL_AUTH_STATUS_SEQUENCE}.next"
+    mv "${CURL_AUTH_STATUS_SEQUENCE}.next" "$CURL_AUTH_STATUS_SEQUENCE"
+    printf '%s' "$status"
+  else
+    printf '200'
+  fi
+elif [[ " $* " == *' --config - '* ]]; then
   cat >"$CURL_CONFIG"
   printf 'Dashboard\n'
 elif [[ " $* " == *' --write-out '* ]]; then
@@ -41,16 +51,19 @@ chmod +x "$test_directory/bin/docker"
 
 status_sequence="$test_directory/status-sequence"
 printf '%s\n' 503 401 >"$status_sequence"
+authenticated_status_sequence="$test_directory/authenticated-status-sequence"
+printf '%s\n' 503 200 >"$authenticated_status_sequence"
 
 if PATH="$test_directory/bin:$PATH" CURL_LOG="$test_directory/curl.log" CURL_CONFIG="$test_directory/curl.config" "$repository_root/scripts/smoke-release.sh" "$release_file"; then
   printf 'expected smoke check without protected password file to fail\n' >&2
   exit 1
 fi
 
-PATH="$test_directory/bin:$PATH" CURL_LOG="$test_directory/curl.log" CURL_CONFIG="$test_directory/curl.config" CURL_STATUS_SEQUENCE="$status_sequence" SMOKE_BASIC_AUTH_PASSWORD_FILE="$password_file" "$repository_root/scripts/smoke-release.sh" "$release_file"
+PATH="$test_directory/bin:$PATH" CURL_LOG="$test_directory/curl.log" CURL_CONFIG="$test_directory/curl.config" CURL_STATUS_SEQUENCE="$status_sequence" CURL_AUTH_STATUS_SEQUENCE="$authenticated_status_sequence" SMOKE_BASIC_AUTH_PASSWORD_FILE="$password_file" "$repository_root/scripts/smoke-release.sh" "$release_file"
 ! grep -Fq 'safe-smoke-password' "$test_directory/curl.log" || { printf 'smoke password appeared in curl arguments\n' >&2; exit 1; }
 grep -Fxq 'user = "operator:safe-smoke-password"' "$test_directory/curl.config" || { printf 'smoke password was not supplied through curl stdin configuration\n' >&2; exit 1; }
 [[ ! -s "$status_sequence" ]] || { printf 'smoke check did not retry Caddy readiness after a 503\n' >&2; exit 1; }
+[[ ! -s "$authenticated_status_sequence" ]] || { printf 'smoke check did not retry the authenticated request after a 503\n' >&2; exit 1; }
 for header in \
   'X-Authenticated-User: forged-smoke-actor' \
   'X-Forwarded-For: 198.51.100.23' \

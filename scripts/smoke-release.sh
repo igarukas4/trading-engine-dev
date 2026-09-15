@@ -87,13 +87,19 @@ curl_config_escape() {
 }
 smoke_password=$(<"$smoke_password_file")
 curl_configuration=$(printf 'user = "%s:%s"\n' "$(curl_config_escape "$CADDY_BASIC_AUTH_USER")" "$(curl_config_escape "$smoke_password")")
-printf '%s' "$curl_configuration" | \
-  curl --config - --fail --silent --show-error \
-    --header 'X-Authenticated-User: forged-smoke-actor' \
-    --header 'X-Forwarded-For: 198.51.100.23' \
-    --header 'X-Forwarded-Host: forged.example' \
-    --header 'X-Forwarded-Proto: http' \
-    --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live" >/dev/null
+authenticated_status=''
+for _ in {1..20}; do
+  authenticated_status=$(printf '%s' "$curl_configuration" | \
+    curl --config - --silent --output /dev/null --write-out '%{http_code}' \
+      --header 'X-Authenticated-User: forged-smoke-actor' \
+      --header 'X-Forwarded-For: 198.51.100.23' \
+      --header 'X-Forwarded-Host: forged.example' \
+      --header 'X-Forwarded-Proto: http' \
+      --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/health/live")
+  [[ "$authenticated_status" == '200' ]] && break
+  sleep 1
+done
+[[ "$authenticated_status" == '200' ]] || { printf 'expected authenticated backend request to return 200, got %s\n' "$authenticated_status" >&2; exit 1; }
 printf '%s' "$curl_configuration" | \
   curl --config - --fail --silent --show-error \
     --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" | grep -q 'Dashboard'
