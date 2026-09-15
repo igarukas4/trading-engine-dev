@@ -101,8 +101,9 @@ for _ in {1..20}; do
 done
 [[ "$authenticated_status" == '200' ]] || { printf 'expected authenticated backend request to return 200, got %s\n' "$authenticated_status" >&2; exit 1; }
 printf '%s' "$curl_configuration" | \
-  curl --config - --fail --silent --show-error \
-    --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" | grep -q 'Dashboard'
+  curl --config - --silent --output /dev/null --write-out '%{http_code} %{content_type}' \
+    --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" | \
+  grep -Eq '^200 .*text/html'
 unset curl_configuration smoke_password
 
 if [[ "$deployment_mode" == dedicated-caddy ]]; then

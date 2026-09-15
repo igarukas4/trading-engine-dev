@@ -15,7 +15,7 @@ chmod 600 "$password_file"
 cat >"$test_directory/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$CURL_LOG"
-if [[ " $* " == *' --config - '* && " $* " == *' --write-out '* ]]; then
+if [[ " $* " == *' --config - '* && " $* " == *' --write-out '* && " $* " == *health/live* ]]; then
   cat >"$CURL_CONFIG"
   if [[ -s ${CURL_AUTH_STATUS_SEQUENCE:-} ]]; then
     status=$(head -n 1 "$CURL_AUTH_STATUS_SEQUENCE")
@@ -25,9 +25,9 @@ if [[ " $* " == *' --config - '* && " $* " == *' --write-out '* ]]; then
   else
     printf '200'
   fi
-elif [[ " $* " == *' --config - '* ]]; then
+elif [[ " $* " == *' --config - '* && " $* " == *' --write-out '* ]]; then
   cat >"$CURL_CONFIG"
-  printf 'Dashboard\n'
+  printf '200 text/html; charset=utf-8'
 elif [[ " $* " == *' --write-out '* ]]; then
   if [[ -s ${CURL_STATUS_SEQUENCE:-} ]]; then
     status=$(head -n 1 "$CURL_STATUS_SEQUENCE")
