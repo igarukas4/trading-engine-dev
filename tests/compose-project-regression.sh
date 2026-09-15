@@ -91,6 +91,7 @@ shared_release_file="$test_directory/shared-release.env"
 printf '%s\n' \
   'DEPLOYMENT_MODE=shared-host-caddy' \
   'BACKEND_IMAGE=example.invalid/backend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'FRONTEND_IMAGE=example.invalid/frontend@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'TIMESCALEDB_IMAGE=timescale/timescaledb:2.17.2-pg16@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'REDIS_IMAGE=redis:7.4.2-alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
   'DOMAIN=trading.example.com' 'CADDY_BASIC_AUTH_USER=operator' >"$shared_release_file"
