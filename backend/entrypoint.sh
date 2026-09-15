@@ -6,4 +6,4 @@ if [ -n "${DATABASE_PASSWORD_FILE:-}" ] && [ -r "$DATABASE_PASSWORD_FILE" ]; the
   export DATABASE_PASSWORD_FILE=/tmp/postgres_password
 fi
 
-exec su -s /bin/sh app -c 'exec "$@"' sh "$@"
+exec su -s /bin/sh -c 'exec "$@"' -- app sh "$@"
