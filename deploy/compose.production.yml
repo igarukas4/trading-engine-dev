@@ -66,9 +66,6 @@ services:
       - app_secret_key
       - source: postgres_password
         target: postgres_password
-        uid: "100"
-        gid: "101"
-        mode: 0400
       - redis_password
     networks:
       - private
@@ -99,9 +96,6 @@ services:
     secrets:
       - source: postgres_password
         target: postgres_password
-        uid: "100"
-        gid: "101"
-        mode: 0400
     networks:
       - private
     depends_on:
