@@ -18,6 +18,8 @@ test("production applies ordered migrations before starting the backend", () => 
   }
   assert.match(migrator, /glob\("\*\.sql"\)/);
   assert.match(migrator, /cursor\.execute/);
+  assert.match(migrator, /SELECT version FROM schema_migrations/);
+  assert.match(migrator, /if migration\.stem in applied_versions/);
   assert.doesNotMatch(migrator, /from \.main import/);
   assert.match(backend, /DATABASE_PASSWORD_FILE/);
   assert.match(backend, /AccountRegistry\(settings\.database_url\)/);

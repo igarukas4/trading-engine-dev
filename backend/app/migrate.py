@@ -35,10 +35,21 @@ def main() -> None:
     if not migrations:
         raise RuntimeError("no migration files found")
     with connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.schema_migrations')")
+            migration_table_exists = cursor.fetchone()[0] is not None
+            if migration_table_exists:
+                cursor.execute("SELECT version FROM schema_migrations")
+                applied_versions = {row[0] for row in cursor.fetchall()}
+            else:
+                applied_versions = set()
         for migration in migrations:
+            if migration.stem in applied_versions:
+                continue
             with connection.cursor() as cursor:
                 cursor.execute(migration.read_text(encoding="utf-8"))
             connection.commit()
+            applied_versions.add(migration.stem)
 
 
 if __name__ == "__main__":
