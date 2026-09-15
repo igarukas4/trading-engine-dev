@@ -20,6 +20,7 @@ grep -Fq -- '-mtime +"$retention_days" -print -delete' "$backup_script" || fail 
 grep -Fq 'RETENTION_DAYS must be a positive integer' "$backup_script" || fail 'scheduled backup must validate retention'
 grep -Fq 'UMask=0077' "$service_file" || fail 'scheduled backup service must use a restrictive umask'
 grep -Fq 'NoNewPrivileges=true' "$service_file" || fail 'scheduled backup service must not gain privileges'
+grep -Fq 'ProtectHome=read-only' "$service_file" || fail 'scheduled backup service must allow read-only access to Docker Compose plugins'
 grep -Fq 'ReadWritePaths=/var/backups/trading-engine' "$service_file" || fail 'scheduled backup service must limit write paths'
 grep -Fq 'OnCalendar=*-*-* 02:30:00 UTC' "$timer_file" || fail 'scheduled backup must run at a documented UTC time'
 grep -Fq 'Persistent=true' "$timer_file" || fail 'scheduled backup must catch up after downtime'
