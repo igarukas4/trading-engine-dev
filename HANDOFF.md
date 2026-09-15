@@ -1,115 +1,44 @@
-# Trading Engine V0 — handoff (2026-09-14)
+# Trading Engine V0 — handoff (2026-09-15)
 
-## Next-session focus
+## Next-session objective
 
-Prioritise a UI/dashboard remediation plan and implementation before D2. The
-deployed UI is functional but visibly bare: the source uses mostly unstyled
-HTML, despite the canonical frontend decision calling for
-Next.js/TypeScript/Tailwind/shadcn. Do not begin D2, D3, MT5 setup, DEMO/LIVE
-operations, SEMI_AUTO/FULL_AUTO, or any broker order as part of UI work.
+Start with GitHub issue [#38, D2 DEMO rollout](https://github.com/igarukas4/trading-engine-dev/issues/38). It is open and labeled `ready-for-human`; all issues listed as its blockers are closed. D2 requires an operator to run real DEMO drills. Read `docs/operations/D2-human-prerequisites.md` and `docs/operations/D2-operator-drill-runbook.md` first.
 
-The relevant backlog references are:
+Issue [#39, D3 LIVE/FULL_AUTO rollout](https://github.com/igarukas4/trading-engine-dev/issues/39) is also open, but it is blocked by D2 and issues #34-#37. Do not start D3 until D2 has complete evidence and the operator gives separate approval. No connector credential, BrokerAccount activation, execution-mode change, or broker Order is authorized by this handoff.
 
-- D1 deployment: [#26](https://github.com/igarukas4/trading-engine-dev/issues/26)
-- Dashboard implementation: [#37](https://github.com/igarukas4/trading-engine-dev/issues/37)
-  (closed, but UI quality should be reassessed)
-- DEMO rollout: [#38](https://github.com/igarukas4/trading-engine-dev/issues/38)
-- LIVE/FULL_AUTO rollout: [#39](https://github.com/igarukas4/trading-engine-dev/issues/39)
-- Canonical specification: [#24](https://github.com/igarukas4/trading-engine-dev/issues/24)
-- Frontend contract: `docs/spec/frontend-v0.md`
+The canonical specification is [#24](https://github.com/igarukas4/trading-engine-dev/issues/24).
+Read `docs/agents/sandcastle-delivery-workflow.md` before any Sandcastle/Sentra
+operation, and `deploy/README.md` before any release-related action.
 
-Do not create, close, or comment on an issue unless the operator asks.
+## Durable implementation state
 
-## Current deployed state
+- Branch `main` is synchronized with `origin/main` at `b2c453d`.
+- Issue #48 is closed. Its final acceptance record is `docs/operations/issue-48-acceptance.md`.
+- Production runs frontend commit `6ca74c1`, image digest `sha256:412252f9d438611792579ef8da2dc1b49d7e3c0b6d6d85f9ecd34972efc03ade`, release `/srv/trading-engine-v0/deploy/releases/release-20260915T011630Z-19244.env`. The shared-host release smoke passed.
+- No BrokerAccount is active in production. Strategies displays an account-selection empty state until an account exists.
+- Issues #38 and #39 are open. D2 is the next work item; D3 follows D2 and still needs its own operator approval.
+- Backend/frontend test and image details are recorded in the issue acceptance record and GitHub Actions runs. Refer there instead of copying the release history here.
 
-- Public application: `https://trading.optitek.xyz/`.
-- The shared host Caddy is the only process serving public 80/443. No second
-  Caddy container is permitted.
-- Basic Auth protects the dashboard and API; `/healthz` intentionally remains
-  public and returns `ok`. Do not request, read, print, or accept its password
-  in chat.
-- Dashboard frontend is deployed through host Caddy to loopback-only
-  `127.0.0.1:13000`; backend is loopback-only `127.0.0.1:18000`.
-  PostgreSQL and Redis have no host ports and remain on the private network.
-- The deployed backend reports `execution_available=false` and
-  `trading_enabled=false`. No BrokerAccount, MT5 connector, execution mode,
-  or broker order was configured or invoked during this deployment.
-- The active release is the frontend-enabled shared-host-Caddy release made on
-  2026-09-14. Use the documented release/rollback workflow in
-  `deploy/README.md`; do not edit production secret files or print their
-  contents.
+## Worktree ownership — preserve
 
-## Deployment implementation references
+Do not reset, clean, stage, or absorb these user-owned/generated changes:
 
-- Commit `895a9d7` (`Deploy dashboard through shared host Caddy`) added the
-  frontend production image, shared-host Compose service, Caddy routing, and
-  release/smoke checks. It is pushed to `main`.
-- The frontend GHCR build/runtime workflow passed:
-  <https://github.com/igarukas4/trading-engine-dev/actions/runs/34820814124>.
-- Shared-host architecture and operations: `deploy/README.md`,
-  `deploy/compose.shared-host-caddy.yml`, and
-  `deploy/caddy/Caddyfile.shared-host.example`.
-- Production checkout is `/srv/trading-engine-v0` via SSH alias `hermes-vps`.
-  Never alter `/home/ubuntu/trading-engine-dev`.
-- Host Caddy site and protected local environment files are VPS-managed;
-  validate before reloading Caddy and preserve the existing Hermes/Invoice/
-  Booking routes.
+- Modified: `.sandcastle/tsconfig.json`, `frontend/next-env.d.ts`,
+  `tests/news-enrichment.test.mjs` (the `datetime.now(...)` change is user work).
+- Untracked: `.agents/`, `.scratch-t5-diff.txt`, `CHANGE-BASIC-AUTH.md`,
+  `backend/app/__pycache__/`, `docs/operations/D2-*.md`, `frontend/.next/`,
+  `frontend/tsconfig.tsbuildinfo`, `scripts/d2-demo-vps-wizard.sh`, and
+  `skills-lock.json`.
+- `.venv/` is local test tooling created by `npm run setup:backend-test`; it
+  should remain untracked.
 
-## Verification already performed
-
-- The frontend image workflow built the production image, started it, and
-  asserted the Dashboard entrypoint.
-- VPS Compose configuration and host Caddy configuration validated before
-  reload.
-- `scripts/release.sh deploy` smoke check passed after the frontend deploy.
-- Public verification: unauthenticated `/` returns `401`; `/healthz` returns
-  `ok`; authenticated API status asserts both execution flags are false.
-
-## Working tree — preserve
-
-Do not absorb these user-owned/unrelated changes into UI work:
-
-- Modified `tests/news-enrichment.test.mjs`.
-- Untracked `.agents/`, `.scratch-t5-diff.txt`, `CHANGE-BASIC-AUTH.md`,
-  `backend/app/__pycache__/`, `docs/operations/`,
-  `scripts/d2-demo-vps-wizard.sh`, and `skills-lock.json`.
-- `HANDOFF.md` itself is intentionally untracked and was refreshed for this
-  session transition.
+Git may emit permission warnings for stale `.git/worktrees/sandcastle-issue-*`
+during commits. Do not broadly delete them; follow the scoped Windows-worktree
+recovery steps in `docs/agents/sandcastle-delivery-workflow.md` if cleanup is
+actually needed.
 
 ## Suggested skills
 
-- `codebase-design`: shape the dashboard design system and component seams
-  before changing the UI.
-- `tdd`: add UI/browser-level regression coverage while implementing the
-  redesign.
-- `diagnosing-bugs`: only if a deployed dashboard/API/Caddy behavior fails.
-- `handoff`: before the next session transition.
-
-## Latest session state (2026-09-14)
-
-- Dashboard UI remediation has started and is deployed to production at
-  `https://trading.optitek.xyz/`.
-- Commit `1f597c8` added the shared operator shell: desktop sidebar, mobile
-  bottom navigation, account context header, DEMO/LIVE badge, freshness
-  indicator, and compact emergency dialog. It also added the global dark UI
-  styling and Dashboard Variant A first slice.
-- Commit `8c3f1dd` added the account-scoped Markets slice: pair/timeframe
-  controls, watchlist, read-only candle visualization through the `MarketChart`
-  adapter, and market stream resync status.
-- Commit `51a772c` added the requested minimal branding copy: `By O-O` below
-  `TRADING ENGINE` and `Good morning, Chief` in the Dashboard greeting.
-- Commit `9412260` restored the shared shell CSS after a patch accidentally
-  replaced the CSS rule containing the sidebar/topbar layout. The sidebar
-  fix and branding are live. The latest production frontend release is
-  recorded on the VPS as
-  `/srv/trading-engine-v0/deploy/releases/release-20260914T093039Z-22825.env`.
-- No BrokerAccount has been configured or made active for the operator yet, so
-  account-scoped Markets data cannot currently be demonstrated with live
-  account context. This is expected and no broker/execution setup was done.
-- The next recommended UI slice is **Opportunities**: newest-first signal
-  list, actionability filters/labels, detail evidence, and explicit
-  account/pair/reason confirmation for Approve and Execute. Deploy the slice
-  through the existing frontend image workflow and shared-host release flow.
-- Do not start D2 until the remaining UI remediation has had an acceptance
-  pass, especially Opportunities/Positions/System safety states and command
-  lifecycle feedback.
+- `wizard` only if the operator requests help preparing a human-run provisioning or drill workflow.
+- `diagnosing-bugs` if a D2 preflight or drill fails.
+- Read `deploy/README.md` before any deployment action.
