@@ -1,0 +1,12 @@
+[Unit]
+Description=Send Telegram alert for failed Trading Engine backup job %I
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ExecStart=/srv/trading-engine-v0/scripts/telegram-alert.sh Trading Engine backup job %I failed. Inspect journalctl -u %I.

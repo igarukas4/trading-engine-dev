@@ -2,6 +2,7 @@
 Description=Trading Engine PostgreSQL backup and isolated restore verification
 Wants=docker.service
 After=docker.service network-online.target
+OnFailure=trading-engine-backup-failure@%n.service
 
 [Service]
 Type=oneshot
