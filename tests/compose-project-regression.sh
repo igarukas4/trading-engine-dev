@@ -114,8 +114,12 @@ cat >"$test_directory/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ " $* " == *' --config - '* ]]; then
+if [[ " $* " == *' --config - '* && " $* " == *' --write-out '* && " $* " == *health/live* ]]; then
   cat >/dev/null
+  printf '200'
+elif [[ " $* " == *' --config - '* && " $* " == *' --write-out '* ]]; then
+  cat >/dev/null
+  printf '200 text/html; charset=utf-8'
 elif [[ " $* " == *' --write-out '* ]]; then
   printf '401'
 else
