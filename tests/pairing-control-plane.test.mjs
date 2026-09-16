@@ -39,6 +39,7 @@ assert len(accounts.accounts) == 1 and len(accounts.bindings) == 1
 assert confirmed.connector_secret and confirmed.key_id
 delivered = pairing.consume_key(started.session_id, "terminal-1")
 assert delivered.connector_secret == confirmed.connector_secret
+assert delivered.as_connector_payload()["connector_secret"] == confirmed.connector_secret
 try:
     pairing.consume_key(started.session_id, "terminal-1")
 except PairingError as error:
@@ -53,13 +54,13 @@ print("ok")
 test("pairing expiration, cancellation, duplicate identity, and controls fail closed", () => {
   const output = run(`
 from datetime import datetime, timezone, timedelta
-from backend.app.broker_accounts import AccountError, AccountRegistry
+from backend.app.broker_accounts import AccountRegistry
 from backend.app.pairing import CandidateReport, PairingError, PairingRegistry
 
 now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 accounts = AccountRegistry()
 pairing = PairingRegistry(accounts)
-bounded = pairing.start("custodian", now=now)
+pairing.start("custodian", now=now)
 for _ in range(4):
     try: pairing.submit_candidate("INVALIDCODE", "terminal", CandidateReport("MT5", "server", "bad", "DEMO"), now=now)
     except PairingError as error: assert error.code == "INVALID_DEVICE_CODE"

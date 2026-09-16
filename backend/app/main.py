@@ -340,6 +340,45 @@ def _pairing_error(error: PairingError) -> HTTPException:
     )
 
 
+def _control_state(account: BrokerAccount) -> dict[str, Any]:
+    return {
+        "execution_mode": account.execution_mode,
+        "live_execution_enabled": account.live_execution_enabled,
+        "runtime_interlock": account.runtime_interlock,
+    }
+
+
+def _require_expected_version(
+    account: BrokerAccount, expected_version: int | None
+) -> None:
+    if expected_version is None or expected_version == account.version:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_412_PRECONDITION_FAILED,
+        detail={"code": "STALE_VERSION", "expected_version": account.version},
+    )
+
+
+def _audit_control_change(
+    account: BrokerAccount,
+    event_type: str,
+    reason: str,
+    previous: dict[str, Any],
+) -> None:
+    _audit(
+        account.id,
+        event_type,
+        reason,
+        {
+            "actor": "custodian",
+            "target_account_id": account.id,
+            "previous": previous,
+            "result": _control_state(account),
+        },
+        actor="custodian",
+    )
+
+
 def _strategy_config_for(account_id: str, config_id: str) -> StrategyConfig:
     config = next(
         (item for item in _strategy_configs_for(account_id) if item.id == config_id),
@@ -806,32 +845,14 @@ def _global_emergency_payload(
 def set_execution_mode(account_id: str, request: ExecutionModeRequest) -> dict[str, Any]:
     _require_account(account_id)
     current = accounts.accounts[account_id]
-    if request.expected_version is not None and request.expected_version != current.version:
-        raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail={"code": "STALE_VERSION", "expected_version": current.version},
-        )
-    previous = {
-        "execution_mode": current.execution_mode,
-        "live_execution_enabled": current.live_execution_enabled,
-        "runtime_interlock": current.runtime_interlock,
-    }
+    _require_expected_version(current, request.expected_version)
+    previous = _control_state(current)
     account = accounts.set_execution_mode(account_id, request.mode)
-    _audit(
-        account_id,
+    _audit_control_change(
+        account,
         "bot.mode.changed",
         "custodian execution mode changed",
-        {
-            "actor": "custodian",
-            "target_account_id": account_id,
-            "previous": previous,
-            "result": {
-                "execution_mode": account.execution_mode,
-                "live_execution_enabled": account.live_execution_enabled,
-                "runtime_interlock": account.runtime_interlock,
-            },
-        },
-        actor="custodian",
+        previous,
     )
     return {
         "account_id": account_id,
@@ -849,32 +870,14 @@ def _set_live_execution(
 ) -> dict[str, Any]:
     _require_account(account_id)
     current = accounts.accounts[account_id]
-    if request.expected_version is not None and request.expected_version != current.version:
-        raise HTTPException(
-            status_code=status.HTTP_412_PRECONDITION_FAILED,
-            detail={"code": "STALE_VERSION", "expected_version": current.version},
-        )
-    previous = {
-        "execution_mode": current.execution_mode,
-        "live_execution_enabled": current.live_execution_enabled,
-        "runtime_interlock": current.runtime_interlock,
-    }
+    _require_expected_version(current, request.expected_version)
+    previous = _control_state(current)
     account = accounts.set_live_execution(account_id, enabled)
-    _audit(
-        account_id,
+    _audit_control_change(
+        account,
         "broker_account.live_execution.changed",
         "custodian LIVE unlock changed",
-        {
-            "actor": "custodian",
-            "target_account_id": account_id,
-            "previous": previous,
-            "result": {
-                "execution_mode": account.execution_mode,
-                "live_execution_enabled": account.live_execution_enabled,
-                "runtime_interlock": account.runtime_interlock,
-            },
-        },
-        actor="custodian",
+        previous,
     )
     return {
         "account_id": account_id,
@@ -1594,19 +1597,9 @@ async def connector_stream(websocket: WebSocket) -> None:
                         continue
                     await websocket.send_json({"type": "error", "code": error.code})
                     return
-                connector_key_field = "connector_" + "secret"
                 await websocket.send_json({
                     "type": "pairing.confirmed",
-                    "session_id": confirmed.session_id,
-                    "account_id": confirmed.account.id,
-                    "identity": {
-                        "provider": confirmed.account.provider,
-                        "broker_server": confirmed.account.broker_server,
-                        "external_account_id": confirmed.account.external_account_id,
-                    },
-                    "key_id": confirmed.key_id,
-                    connector_key_field: getattr(confirmed, connector_key_field),
-                    "generation": confirmed.account.connector_generation,
+                    **confirmed.as_connector_payload(),
                 })
                 await websocket.close(code=1000, reason="pairing complete")
                 return

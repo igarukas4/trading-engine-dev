@@ -73,6 +73,21 @@ class PairingConfirmation:
     key_id: str
     connector_secret: str
 
+    def as_connector_payload(self) -> dict[str, Any]:
+        """Build the one-time credential message for the paired connector."""
+        return {
+            "session_id": self.session_id,
+            "account_id": self.account.id,
+            "identity": {
+                "provider": self.account.provider,
+                "broker_server": self.account.broker_server,
+                "external_account_id": self.account.external_account_id,
+            },
+            "key_id": self.key_id,
+            "connector_secret": self.connector_secret,
+            "generation": self.account.connector_generation,
+        }
+
 
 @dataclass
 class _PairingSession:
