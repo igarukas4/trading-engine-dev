@@ -78,6 +78,12 @@ locally. It selects the lowest-numbered issue whose linked blockers are not
 also open eligible tickets. Keep labels and blocker links accurate; otherwise
 the deterministic selector cannot represent the real dependency graph.
 
+To run an approved delivery phase without changing ticket labels, set
+`SANDCASTLE_ISSUES` to its comma-separated issue numbers. The host selector
+filters to that list before it dispatches, while still treating every open
+issue as a blocker. The planner receives the same scope. Omit the variable only
+when the whole ready backlog is approved for one delivery run.
+
 ## Credentials and trust boundary
 
 Use two independent credentials:
@@ -159,6 +165,17 @@ context but cannot override that safety check.
 
 ```powershell
 npm run sandcastle
+```
+
+For a two-phase delivery, run each command from a clean `main` worktree:
+
+```powershell
+$env:SANDCASTLE_ISSUES = "58,59"
+npm run sandcastle:watch
+
+# After the human review of #59 passes:
+$env:SANDCASTLE_ISSUES = "60,61,62"
+npm run sandcastle:watch
 ```
 
 One iteration has this lifecycle for each selected ticket:

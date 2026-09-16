@@ -10,6 +10,13 @@ Here are the open issues in the repo:
 
 The list above contains only issues authorized for autonomous implementation.
 
+# DELIVERY SCOPE
+
+This run is limited to these issue IDs: {{ALLOWED_ISSUES}}.
+
+Include only an issue within that scope. The host selector enforces the same
+scope and will still reject an issue whose declared blocker remains open.
+
 # TASK
 
 Analyze the open issues and build a dependency graph. For each issue, determine whether it **blocks** or **is blocked by** any other open issue.

@@ -62,6 +62,30 @@ type PlannedIssue = {
 
 const execFileAsync = promisify(execFile);
 
+function phaseIssueNumbers(): Set<number> | undefined {
+  const rawIssueNumbers = process.env.SANDCASTLE_ISSUES;
+  if (!rawIssueNumbers) {
+    return undefined;
+  }
+
+  const issueNumbers = rawIssueNumbers.split(",").map((value) => Number(value.trim()));
+  if (
+    issueNumbers.length === 0 ||
+    issueNumbers.some((number) => !Number.isSafeInteger(number) || number < 1)
+  ) {
+    throw new Error(
+      "SANDCASTLE_ISSUES must be a comma-separated list of positive issue numbers.",
+    );
+  }
+
+  return new Set(issueNumbers);
+}
+
+const allowedPhaseIssues = phaseIssueNumbers();
+const phaseDescription = allowedPhaseIssues
+  ? [...allowedPhaseIssues].sort((left, right) => left - right).join(", ")
+  : "all ready-for-agent issues";
+
 async function nextUnblockedIssues(
   plannedIssues: PlannedIssue[],
 ): Promise<PlannedIssue[]> {
@@ -90,6 +114,9 @@ async function nextUnblockedIssues(
     ]),
   ]);
   const readyIssues = JSON.parse(readyResult.stdout) as ReadyIssue[];
+  const phaseReadyIssues = allowedPhaseIssues
+    ? readyIssues.filter((issue) => allowedPhaseIssues.has(issue.number))
+    : readyIssues;
   const openIssueNumbers = new Set(
     (JSON.parse(openResult.stdout) as Array<{ number: number }>).map(
       (issue) => issue.number,
@@ -100,7 +127,7 @@ async function nextUnblockedIssues(
   );
 
   return selectDispatchableIssues(
-    readyIssues,
+    phaseReadyIssues,
     openIssueNumbers,
     plannedIssueNumbers,
     MAX_CONCURRENT_ISSUES,
@@ -203,6 +230,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     maxIterations: 1,
     agent: plannerAgent,
     promptFile: "./.sandcastle/plan-prompt.md",
+    promptArgs: { ALLOWED_ISSUES: phaseDescription },
     // Extract and validate the <plan> JSON into a typed object. Throws
     // StructuredOutputError if the tag is missing, the JSON is malformed, or
     // validation fails — which aborts the loop.

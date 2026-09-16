@@ -15,6 +15,14 @@ test("Sandcastle selects a bounded batch of ready agent tickets", () => {
   assert.match(main, /plan\.output\.issues/);
 });
 
+test("Sandcastle can constrain a delivery phase without weakening blockers", () => {
+  assert.match(main, /process\.env\.SANDCASTLE_ISSUES/);
+  assert.match(main, /phaseReadyIssues/);
+  assert.match(main, /readyIssues\.filter\(\(issue\) => allowedPhaseIssues\.has\(issue\.number\)\)/);
+  assert.match(main, /promptArgs: \{ ALLOWED_ISSUES: phaseDescription \}/);
+  assert.match(planner, /This run is limited to these issue IDs: \{\{ALLOWED_ISSUES\}\}/);
+});
+
 test("closed blockers do not prevent the next ready issue", () => {
   const program = `
     import assert from "node:assert/strict";
