@@ -31,7 +31,7 @@ from .risk_calendar import (
     RiskLimitsStore,
 )
 from .signals import SignalStore
-from .execution import ExecutionError, ExecutionSubstrate, GlobalEmergencyOperation, OperatorCommand
+from .execution import ExecutionCoordinator, ExecutionError, GlobalEmergencyOperation, OperatorCommand
 from .dashboard import audit_hub, dashboard_hub
 
 
@@ -95,7 +95,7 @@ accounts = AccountRegistry(settings.database_url)
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
-execution = ExecutionSubstrate()
+execution = ExecutionCoordinator(database_url=settings.database_url or None)
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
@@ -614,6 +614,11 @@ def submit_pairing_candidate(request: PairingCandidateRequest) -> dict[str, Any]
 
 def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
     account = accounts.accounts[account_id]
+    execution_audit = [
+        event.__dict__
+        for event in execution.audit_events
+        if event.account_id == account_id
+    ]
     recovery = [
         {
             "kind": "ORDER_RECONCILIATION",
@@ -653,7 +658,10 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
             for position in execution.positions.values()
             if position.account_id == account_id
         ],
-        "audit_events": audit_hub.list(account_id, limit=50)["audit_events"],
+        "audit_events": [
+            *audit_hub.list(account_id, limit=50)["audit_events"],
+            *execution_audit[-50:],
+        ],
         "stream_watermark": dashboard_hub.watermark("account", account_id),
         "recovery": recovery,
         "freshness": {

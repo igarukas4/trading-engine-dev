@@ -1,0 +1,152 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+const run = (script) => execFileSync(process.execPath, ["tests/python.mjs", "-c", script], { encoding: "utf8" });
+
+test("Execution Coordination reloads durable intents and projects duplicate partial observations", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+from tempfile import TemporaryDirectory
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def order_check(self, order): return True
+    def order_send(self, order): return {"status": "SUBMITTED", "external_id": "mt5-order-1"}
+
+now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+assessment = RiskAssessment(
+    broker_account_id="account-a", risk_limits_version=4, approved=True,
+    purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(seconds=20), signal_revision=2,
+)
+with TemporaryDirectory() as directory:
+    path = f"{directory}/execution.json"
+    engine = ExecutionCoordinator(state_path=path)
+    created = engine.accept_execution(
+        account_id="account-a", signal_id="signal-a", idempotency_key="command-a",
+        canonical_hash="request-a", execution_epoch=1, risk_assessment=assessment,
+        order_payload={"symbol": "EURUSD", "side": "BUY", "volume": "1", "stop_loss": "90", "take_profit": "110"},
+        now=now,
+    )
+    assert created.order.status == "INTENT"
+    assert created.order.command_id in engine.commands
+    assert engine.dispatch_next("account-a", Broker()).status == "SUBMITTED"
+
+    reloaded = ExecutionCoordinator(state_path=path)
+    assert reloaded.orders[created.order.id].external_id == "mt5-order-1"
+    assert reloaded.orders[created.order.id].command_id in reloaded.commands
+    assert created.order.risk_assessment_id in reloaded.risk_assessments
+    first = reloaded.reconcile_observation("account-a", {
+        "orders": [{"order_id": created.order.id, "status": "PARTIALLY_FILLED"}],
+        "fills": [{"deal_id": "deal-1", "order_id": created.order.id, "volume": "0.4", "position_id": "position-1", "entry": "IN"}],
+        "positions": [{"position_id": "position-1", "order_id": created.order.id, "symbol": "EURUSD", "side": "BUY", "volume": "0.4", "sl": "90", "tp": "110"}],
+    })
+    second = reloaded.reconcile_observation("account-a", {
+        "fills": [{"deal_id": "deal-1", "order_id": created.order.id, "volume": "0.4", "position_id": "position-1", "entry": "IN"}],
+        "positions": [{"position_id": "position-1", "order_id": created.order.id, "symbol": "EURUSD", "side": "BUY", "volume": "0.4", "sl": "90", "tp": "110"}],
+    })
+    assert first.status == "PARTIALLY_FILLED"
+    assert second.duplicate_fill_ids == ("deal-1",)
+    assert len(reloaded.fills) == 1
+    assert reloaded.position("account-a", "position-1").volume == "0.4"
+    assert all(event.account_id == "account-a" for event in reloaded.audit_events)
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("Execution Coordination rejects stale risk and keeps netting and hedging account-local", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+def assessment(account):
+    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10))
+
+engine = ExecutionCoordinator()
+try:
+    engine.accept_execution(account_id="a", signal_id="s", idempotency_key="bad", canonical_hash="h", execution_epoch=1,
+        risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10)),
+        order_payload={"volume": "1"}, now=now)
+except ExecutionError as error: assert error.code == "PRE_ORDER_RISK_REJECTED"
+else: raise AssertionError("rejected assessment accepted")
+
+def order(account, key):
+    return engine.accept_execution(account_id=account, signal_id=key, idempotency_key=key, canonical_hash=key,
+        execution_epoch=1, risk_assessment=assessment(account), order_payload={"symbol": "EURUSD", "volume": "1"}, now=now).order
+
+net_a = order("a", "net-a")
+net_b = order("a", "net-b")
+result = engine.reconcile_observation("a", {"fills": [
+    {"deal_id": "net-deal-a", "order_id": net_a.id, "volume": "0.4", "position_id": "net-position", "entry": "IN"},
+    {"deal_id": "net-deal-b", "order_id": net_b.id, "volume": "0.6", "position_id": "net-position", "entry": "IN"},
+], "positions": [{"position_id": "net-position", "order_id": net_a.id, "symbol": "EURUSD", "side": "BUY", "volume": "1", "accounting_mode": "NETTING"}]})
+assert result.status == "PARTIALLY_FILLED"
+assert len([p for p in engine.positions.values() if p.account_id == "a"]) == 1
+
+hedge_a = order("b", "hedge-a")
+hedge_b = order("b", "hedge-b")
+engine.reconcile_observation("b", {"positions": [
+    {"position_id": "hedge-1", "order_id": hedge_a.id, "symbol": "EURUSD", "side": "BUY", "volume": "0.5", "accounting_mode": "HEDGING"},
+    {"position_id": "hedge-2", "order_id": hedge_b.id, "symbol": "EURUSD", "side": "SELL", "volume": "0.5", "accounting_mode": "HEDGING"},
+]})
+assert len([p for p in engine.positions.values() if p.account_id == "b"]) == 2
+try: engine.reconcile_observation("a", {"account_id": "b"})
+except ExecutionError as error: assert error.code == "WRONG_ACCOUNT"
+else: raise AssertionError("observation crossed account boundary")
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("execution coordination has a forward-only PostgreSQL restart checkpoint", () => {
+  const migration = readFileSync("backend/migrations/010_execution_coordination_checkpoint.sql", "utf8");
+  const backend = readFileSync("backend/app/main.py", "utf8");
+  assert.match(migration, /execution_state_snapshots/);
+  assert.match(migration, /JSONB/);
+  assert.match(migration, /PARTIALLY_FILLED/);
+  assert.match(migration, /010_execution_coordination_checkpoint/);
+  assert.match(backend, /ExecutionCoordinator\(database_url=/);
+});
+
+test("Execution Coordination quarantines an ambiguous dispatch and recovers without a resend", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+from tempfile import TemporaryDirectory
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def __init__(self): self.sent = 0
+    def order_check(self, order): return True
+    def order_send(self, order): self.sent += 1; return "TIMEOUT"
+    def journal(self, order): return None
+    def broker_state(self, order): return {"status": "FILLED", "external_id": "mt5-order-reconciled"}
+
+now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10))
+with TemporaryDirectory() as directory:
+    path = f"{directory}/execution.json"
+    engine = ExecutionCoordinator(state_path=path)
+    created = engine.accept_execution(account_id="a", signal_id="s", idempotency_key="k", canonical_hash="h", execution_epoch=1,
+        risk_assessment=assessment, order_payload={"volume": "1"}, now=now)
+    broker = Broker()
+    assert engine.dispatch_next("a", broker).status == "UNKNOWN"
+    assert engine.account("a").exposure_gate == "QUARANTINED"
+    recovered = ExecutionCoordinator(state_path=path)
+    assert recovered.recover("a", created.order.id, broker).status == "FILLED"
+    assert broker.sent == 1
+    checked_again = ExecutionCoordinator(state_path=path)
+    assert checked_again.orders[created.order.id].status == "FILLED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});

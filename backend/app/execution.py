@@ -9,10 +9,14 @@ the journal/broker for truth before any further side effect.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+from typing import Protocol
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -59,14 +63,21 @@ class OrderIntent:
     payload: dict[str, Any]
     status: Literal[
         "INTENT",
+        "CHECKED",
         "DISPATCHING",
         "SUBMITTED",
+        "PARTIALLY_FILLED",
         "REJECTED",
         "UNKNOWN",
         "FILLED",
         "CANCELLED",
     ] = "INTENT"
     external_id: str | None = None
+    requested_volume: str | None = None
+    cumulative_filled_volume: str = "0"
+    remaining_volume: str | None = None
+    risk_assessment_id: str | None = None
+    command_id: str | None = None
 
 
 @dataclass
@@ -165,6 +176,106 @@ class PreOrderResult:
     reservation: RiskReservation
     order: OrderIntent
     outbox_event: OutboxEvent
+
+
+class BrokerAdapter(Protocol):
+    """Capability-based broker boundary used by Execution Coordination."""
+
+    def order_check(self, order: OrderIntent) -> bool: ...
+
+    def order_send(self, order: OrderIntent) -> Any: ...
+
+
+Broker = BrokerAdapter
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    id: str
+    account_id: str
+    event_type: str
+    payload: dict[str, Any]
+    occurred_at: datetime
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    account_id: str
+    status: str
+    applied_fill_ids: tuple[str, ...] = ()
+    duplicate_fill_ids: tuple[str, ...] = ()
+    position_ids: tuple[str, ...] = ()
+
+
+class ExecutionStateStore(Protocol):
+    def load(self) -> dict[str, Any] | None: ...
+
+    def save(self, state: dict[str, Any]) -> None: ...
+
+
+class JsonExecutionStore:
+    """Small atomic store for local restart tests and single-process dev runs."""
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path)
+
+    def load(self) -> dict[str, Any] | None:
+        if not self.path.exists():
+            return None
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def save(self, state: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", dir=self.path.parent
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(state, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+DurableExecutionStore = JsonExecutionStore
+
+
+class PostgresExecutionStore:
+    """PostgreSQL-backed checkpoint store used by the API process."""
+
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+
+    def load(self) -> dict[str, Any] | None:
+        from psycopg import connect
+
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT state FROM execution_state_snapshots WHERE snapshot_id = 1"
+                )
+                row = cursor.fetchone()
+        return row[0] if row else None
+
+    def save(self, state: dict[str, Any]) -> None:
+        from psycopg import connect
+        from psycopg.types.json import Jsonb
+
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO execution_state_snapshots (snapshot_id, state)
+                       VALUES (1, %s)
+                       ON CONFLICT (snapshot_id) DO UPDATE
+                       SET state = EXCLUDED.state, updated_at = now()""",
+                    (Jsonb(state),),
+                )
 
 
 OperatorCommandKind = Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
@@ -898,3 +1009,457 @@ class ExecutionSubstrate:
             account.exposure_gate = "FENCE_PENDING"
         account.execution_epoch += 1
         return SafetyFence(account_id, account.fence_sequence, kind)
+
+
+def _state_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return {"__datetime__": value.isoformat()}
+    if isinstance(value, dict):
+        return {str(key): _state_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_state_value(item) for item in value]
+    return value
+
+
+def _state_datetime(value: Any) -> datetime:
+    if isinstance(value, dict) and "__datetime__" in value:
+        return datetime.fromisoformat(value["__datetime__"])
+    return datetime.fromisoformat(value)
+
+
+class ExecutionCoordinator(ExecutionSubstrate):
+    """Durable account-scoped execution coordination.
+
+    The coordinator keeps the existing in-memory model as its working set and
+    writes a complete account-local journal state after each public mutation.
+    The broker adapter is only called after the intent and reservation are
+    stored. A second coordinator can load the same store after a restart.
+    """
+
+    def __init__(
+        self,
+        state_store: ExecutionStateStore | None = None,
+        *,
+        state_path: str | os.PathLike[str] | None = None,
+        database_url: str | None = None,
+    ) -> None:
+        super().__init__()
+        configured_stores = sum(value is not None for value in (state_store, state_path, database_url))
+        if configured_stores > 1:
+            raise ValueError("execution state store options are mutually exclusive")
+        self._state_store = state_store or (
+            JsonExecutionStore(state_path) if state_path is not None else
+            PostgresExecutionStore(database_url) if database_url else None
+        )
+        self.audit_events: list[AuditEvent] = []
+        self.risk_assessments: dict[str, dict[str, Any]] = {}
+        if self._state_store is not None:
+            self._restore(self._state_store.load())
+
+    def _snapshot(self) -> dict[str, Any]:
+        return _state_value({
+            "accounts": {key: value.__dict__ for key, value in self._accounts.items()},
+            "reservations": {key: value.__dict__ for key, value in self.reservations.items()},
+            "orders": {key: value.__dict__ for key, value in self.orders.items()},
+            "events": {key: value.__dict__ for key, value in self.events.items()},
+            "journal": {key: value.__dict__ for key, value in self.journal.items()},
+            "fills": {key: value.__dict__ for key, value in self.fills.items()},
+            "positions": {
+                f"{account_id}|{position_id}": value.__dict__
+                for (account_id, position_id), value in self.positions.items()
+            },
+            "position_commands": [value.__dict__ for value in self.position_commands],
+            "commands": {key: value.__dict__ for key, value in self.commands.items()},
+            "order_reservations": self._order_reservations,
+            "risk_assessments": self.risk_assessments,
+            "global_emergencies": {
+                key: {
+                    **value.__dict__,
+                    "targets": {
+                        target_id: target.__dict__
+                        for target_id, target in value.targets.items()
+                    },
+                }
+                for key, value in self.global_emergencies.items()
+            },
+            "audit_events": [value.__dict__ for value in self.audit_events],
+        })
+
+    def _save(self) -> None:
+        if self._state_store is not None:
+            self._state_store.save(self._snapshot())
+
+    def _restore(self, state: dict[str, Any] | None) -> None:
+        if not state:
+            return
+        state = _state_value(state)
+        for key, value in state.get("accounts", {}).items():
+            self._accounts[key] = AccountExecutionState(**value)
+        for key, value in state.get("reservations", {}).items():
+            self.reservations[key] = RiskReservation(**value)
+        for key, value in state.get("orders", {}).items():
+            self.orders[key] = OrderIntent(**value)
+        for key, value in state.get("events", {}).items():
+            self.events[key] = OutboxEvent(**value)
+        for key, value in state.get("journal", {}).items():
+            value["observed_at"] = _state_datetime(value["observed_at"])
+            self.journal[key] = ConnectorJournalEntry(**value)
+        for key, value in state.get("fills", {}).items():
+            self.fills[key] = Fill(**value)
+        for key, value in state.get("positions", {}).items():
+            account_id, position_id = key.split("|", 1)
+            self.positions[(account_id, position_id)] = Position(**value)
+        self.position_commands = [
+            PositionCommand(**value) for value in state.get("position_commands", [])
+        ]
+        for key, value in state.get("commands", {}).items():
+            self.commands[key] = OperatorCommand(**value)
+        self.audit_events = [
+            AuditEvent(
+                id=value["id"], account_id=value["account_id"],
+                event_type=value["event_type"], payload=value["payload"],
+                occurred_at=_state_datetime(value["occurred_at"]),
+            )
+            for value in state.get("audit_events", [])
+        ]
+        self.risk_assessments = state.get("risk_assessments", {})
+        for key, value in state.get("global_emergencies", {}).items():
+            targets = {
+                target_id: GlobalEmergencyTarget(**target)
+                for target_id, target in value.get("targets", {}).items()
+            }
+            self.global_emergencies[key] = GlobalEmergencyOperation(
+                id=value["id"], requested_kind=value["requested_kind"],
+                target_account_ids=tuple(value["target_account_ids"]),
+                status=value["status"], version=value["version"], targets=targets,
+            )
+        for order in self.orders.values():
+            reservation_id = state.get("order_reservations", {}).get(order.id)
+            if reservation_id is None:
+                reservation_id = next(
+                    reservation.id for reservation in self.reservations.values()
+                    if reservation.account_id == order.account_id
+                    and reservation.signal_id == order.signal_id
+                )
+            self._order_reservations[order.id] = reservation_id
+            self._idempotency[(order.account_id, order.idempotency_key)] = (
+                order.id, order.canonical_hash
+            )
+        for command in self.commands.values():
+            self._command_keys[(command.account_id, command.idempotency_key)] = command.id
+            if command.kind == "APPROVE_SIGNAL" and command.signal_id:
+                self._approved_signals[(command.account_id, command.signal_id)] = command.id
+
+    def _audit(self, account_id: str, event_type: str, **payload: Any) -> None:
+        self.audit_events.append(
+            AuditEvent(str(uuid4()), account_id, event_type, payload, _now())
+        )
+
+    def _assessment_is_fresh(
+        self, account_id: str, assessment: Any, now: datetime
+    ) -> None:
+        if assessment.broker_account_id != account_id:
+            raise ExecutionError("RISK_ASSESSMENT_ACCOUNT_MISMATCH")
+        if assessment.purpose != "PRE_ORDER":
+            raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
+        if not assessment.approved:
+            raise ExecutionError("PRE_ORDER_RISK_REJECTED")
+        if assessment.assessed_at is None or assessment.valid_until is None:
+            raise ExecutionError("RISK_ASSESSMENT_NOT_FRESH")
+        if now < assessment.assessed_at or now >= assessment.valid_until:
+            raise ExecutionError("RISK_ASSESSMENT_EXPIRED")
+
+    def accept_execution(
+        self,
+        *,
+        account_id: str,
+        signal_id: str,
+        idempotency_key: str,
+        canonical_hash: str,
+        execution_epoch: int,
+        risk_assessment: Any,
+        order_payload: dict[str, Any],
+        risk_amount: str | Decimal = "0",
+        now: datetime | None = None,
+    ) -> PreOrderResult:
+        """Atomically accept a fresh assessment, reservation, and Order intent."""
+        with self._lock_for(account_id):
+            self._assessment_is_fresh(account_id, risk_assessment, now or _now())
+            prior = self._idempotency.get((account_id, idempotency_key))
+            if prior and prior[1] == canonical_hash:
+                order = self.orders[prior[0]]
+                return PreOrderResult(self._reservation_for(order.id), order, self._event_for(order.id))
+            result = self.pre_order(
+                account_id=account_id, signal_id=signal_id,
+                idempotency_key=idempotency_key, canonical_hash=canonical_hash,
+                risk_approved=True, execution_epoch=execution_epoch,
+                order_payload=order_payload,
+                risk_amount=str(risk_amount),
+            )
+            requested_volume = order_payload.get("requested_volume", order_payload.get("volume"))
+            if requested_volume is not None:
+                result.order.requested_volume = str(requested_volume)
+                result.order.remaining_volume = str(requested_volume)
+            result.order.risk_assessment_id = getattr(risk_assessment, "id", None)
+            assessment_id = result.order.risk_assessment_id or str(uuid4())
+            result.order.risk_assessment_id = assessment_id
+            self.risk_assessments[assessment_id] = {
+                "id": assessment_id,
+                "account_id": account_id,
+                "signal_id": signal_id,
+                "purpose": risk_assessment.purpose,
+                "approved": risk_assessment.approved,
+                "assessed_at": risk_assessment.assessed_at,
+                "valid_until": risk_assessment.valid_until,
+                "reason_codes": tuple(risk_assessment.reason_codes),
+            }
+            command = self._command(
+                account_id=account_id,
+                signal_id=signal_id,
+                kind="EXECUTE_SIGNAL",
+                idempotency_key=idempotency_key,
+                reason="Execution Coordination accepted the order",
+                confirmed=True,
+            )
+            command.order_id = result.order.id
+            result.order.command_id = command.id
+            self._audit(
+                account_id, "execution.intent.accepted",
+                command_id=command.id, order_id=result.order.id,
+            )
+            self._save()
+            return result
+
+    def pre_order(self, **kwargs: Any) -> PreOrderResult:
+        result = super().pre_order(**kwargs)
+        self._save()
+        return result
+
+    def approve_signal(self, **kwargs: Any) -> OperatorCommand:
+        result = super().approve_signal(**kwargs)
+        self._save()
+        return result
+
+    def execute_signal(self, **kwargs: Any) -> PreOrderResult:
+        result = super().execute_signal(**kwargs)
+        command = self.commands.get(
+            self._command_keys.get((kwargs["account_id"], kwargs["idempotency_key"]), "")
+        )
+        if command is not None:
+            result.order.command_id = command.id
+        self._save()
+        return result
+
+    def schedule_automated_signal(self, **kwargs: Any) -> PreOrderResult:
+        result = super().schedule_automated_signal(**kwargs)
+        self._save()
+        return result
+
+    def dispatch_next(self, account_id: str, connector: BrokerAdapter) -> DispatchResult:
+        result = super().dispatch_next(account_id, connector)
+        if result.status == "UNKNOWN":
+            self.account(account_id).exposure_gate = "QUARANTINED"
+            self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
+        self._audit(account_id, "execution.dispatch", order_id=result.order_id, status=result.status)
+        self._save()
+        return result
+
+    def recover(self, account_id: str, order_id: str, connector: Any) -> DispatchResult:
+        result = super().recover(account_id, order_id, connector)
+        self._audit(account_id, "execution.reconciled", order_id=order_id, status=result.status)
+        self._save()
+        return result
+
+    def record_fill(self, *args: Any, **kwargs: Any) -> Fill:
+        result = super().record_fill(*args, **kwargs)
+        self._save()
+        return result
+
+    def record_exit_fill(self, *args: Any, **kwargs: Any) -> PositionCommand:
+        result = super().record_exit_fill(*args, **kwargs)
+        self._save()
+        return result
+
+    def install_fence(self, *args: Any, **kwargs: Any) -> SafetyFence:
+        result = super().install_fence(*args, **kwargs)
+        self._save()
+        return result
+
+    def close_all(self, **kwargs: Any) -> OperatorCommand:
+        result = super().close_all(**kwargs)
+        self._save()
+        return result
+
+    def begin_global_emergency(self, *args: Any, **kwargs: Any) -> GlobalEmergencyOperation:
+        result = super().begin_global_emergency(*args, **kwargs)
+        self._save()
+        return result
+
+    def converge_global_target(self, *args: Any, **kwargs: Any) -> GlobalEmergencyOperation:
+        result = super().converge_global_target(*args, **kwargs)
+        self._save()
+        return result
+
+    def emergency_stop(self, *args: Any, **kwargs: Any) -> SafetyFence:
+        result = super().emergency_stop(*args, **kwargs)
+        self._save()
+        return result
+
+    def confirm_trailing(self, *args: Any, **kwargs: Any) -> PositionCommand:
+        result = super().confirm_trailing(*args, **kwargs)
+        self._save()
+        return result
+
+    def mark_protection_unknown(self, *args: Any, **kwargs: Any) -> Position:
+        result = super().mark_protection_unknown(*args, **kwargs)
+        self._save()
+        return result
+
+    def mark_position_command_unknown(self, *args: Any, **kwargs: Any) -> PositionCommand:
+        result = super().mark_position_command_unknown(*args, **kwargs)
+        self._save()
+        return result
+
+    def confirm_protection(self, *args: Any, **kwargs: Any) -> Position:
+        result = super().confirm_protection(*args, **kwargs)
+        self._save()
+        return result
+
+    def request_position_close(self, *args: Any, **kwargs: Any) -> PositionCommand:
+        result = super().request_position_close(*args, **kwargs)
+        self._save()
+        return result
+
+    def position(self, account_id: str, position_id: str) -> Position:
+        position = self.positions.get((account_id, position_id))
+        if position is not None:
+            return position
+        position = next(
+            (
+                item for item in self.positions.values()
+                if item.account_id == account_id and item.order_id == position_id
+            ),
+            None,
+        )
+        if position is None:
+            raise ExecutionError("POSITION_NOT_FOUND")
+        return position
+
+    def _find_position_key(
+        self, account_id: str, position_id: str, pair: str, mode: str
+    ) -> tuple[str, str]:
+        if mode == "NETTING":
+            for key, position in self.positions.items():
+                if (
+                    key[0] == account_id and position.accounting_mode == "NETTING"
+                    and position.pair == pair
+                ):
+                    return key
+        return account_id, position_id
+
+    def _project_position(self, account_id: str, item: dict[str, Any]) -> Position:
+        position_id = str(item.get("position_id", item.get("external_position_id", "")))
+        if not position_id:
+            raise ExecutionError("POSITION_ID_REQUIRED")
+        order_id = str(item.get("order_id", position_id))
+        order = self.orders.get(order_id)
+        if order is None or order.account_id != account_id:
+            raise ExecutionError("WRONG_ACCOUNT")
+        mode = str(item.get("accounting_mode", "NETTING"))
+        pair = str(item.get("symbol", item.get("pair", "UNKNOWN")))
+        key = self._find_position_key(account_id, position_id, pair, mode)
+        position = self.positions.get(key)
+        volume = str(item.get("volume", item.get("remaining_volume", "0")))
+        protection = "CONFIRMED" if item.get("sl") is not None or item.get("stop_loss") is not None else "UNCONFIRMED"
+        if position is None:
+            side = str(item.get("side", item.get("direction", "BUY"))).upper()
+            position = Position(
+                account_id=account_id, order_id=order_id, volume=volume,
+                remaining_volume=volume, protection_status=protection,
+                native_stop_loss=str(item.get("sl", item.get("stop_loss"))) if item.get("sl", item.get("stop_loss")) is not None else None,
+                native_take_profit=str(item.get("tp", item.get("take_profit"))) if item.get("tp", item.get("take_profit")) is not None else None,
+                accounting_mode=mode if mode in {"NETTING", "HEDGING"} else "NETTING",
+                external_position_id=position_id, pair=pair,
+                direction="LONG" if side in {"BUY", "LONG"} else "SHORT",
+                entry_price=str(item["entry_price"]) if item.get("entry_price") is not None else "UNKNOWN",
+                current_pnl=str(item["current_pnl"]) if item.get("current_pnl") is not None else None,
+                data_status="CONFIRMED",
+            )
+            self.positions[key] = position
+        else:
+            position.volume = volume
+            position.remaining_volume = str(item.get("remaining_volume", volume))
+            position.protection_status = protection
+            position.data_status = "CONFIRMED"
+            if item.get("current_pnl") is not None:
+                position.current_pnl = str(item["current_pnl"])
+        if protection != "CONFIRMED":
+            self.account(account_id).exposure_gate = "QUARANTINED"
+        return position
+
+    def reconcile_observation(
+        self, account_id: str, observation: dict[str, Any]
+    ) -> ReconciliationResult:
+        """Apply an account-bound broker snapshot exactly once per deal."""
+        observed_account = observation.get("account_id", observation.get("broker_account_id"))
+        if observed_account is not None and str(observed_account) != account_id:
+            raise ExecutionError("WRONG_ACCOUNT")
+        applied: list[str] = []
+        duplicates: list[str] = []
+        position_ids: list[str] = []
+        with self._lock_for(account_id):
+            for item in observation.get("orders", ()):
+                order_id = str(item.get("order_id", ""))
+                order = self.orders.get(order_id)
+                if order is None or order.account_id != account_id:
+                    raise ExecutionError("WRONG_ACCOUNT")
+                if item.get("status") in {"SUBMITTED", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "UNKNOWN"}:
+                    order.status = item["status"]
+                if item.get("external_id") is not None:
+                    order.external_id = str(item["external_id"])
+            for item in observation.get("fills", ()):
+                deal_id = str(item.get("deal_id", item.get("external_deal_id", "")))
+                order_id = str(item.get("order_id", ""))
+                order = self.orders.get(order_id)
+                if not deal_id or order is None or order.account_id != account_id:
+                    raise ExecutionError("WRONG_ACCOUNT")
+                if self._fill_for_deal(account_id, deal_id) is not None:
+                    duplicates.append(deal_id)
+                    continue
+                entry = str(item.get("entry", "IN")).upper()
+                fill = Fill(
+                    str(uuid4()), account_id, order_id, deal_id,
+                    str(item.get("volume", "0")),
+                    bool(item.get("native_protection_confirmed", False)),
+                )
+                self.fills[fill.id] = fill
+                applied.append(deal_id)
+                if entry in {"IN", "INOUT"}:
+                    requested = Decimal(str(order.requested_volume or order.payload.get("volume", item.get("volume", "0"))))
+                    cumulative = sum(
+                        (self._decimal(other.volume) for other in self.fills.values()
+                         if other.account_id == account_id and other.order_id == order_id),
+                        Decimal("0"),
+                    )
+                    order.cumulative_filled_volume = self._decimal_string(cumulative)
+                    order.remaining_volume = self._decimal_string(max(requested - cumulative, Decimal("0")))
+                    order.status = "FILLED" if requested and cumulative >= requested else "PARTIALLY_FILLED"
+                    reservation = self._reservation_for(order_id)
+                    reservation.status = "CONSUMED" if order.status == "FILLED" else "ACTIVE"
+                elif entry in {"OUT", "OUT_BY"}:
+                    order.status = "FILLED"
+            for item in observation.get("positions", ()):
+                position = self._project_position(account_id, item)
+                position_ids.append(position.external_position_id or position.order_id)
+            order_ids = {str(item.get("order_id")) for item in observation.get("fills", ())}
+            statuses = [self.orders[item].status for item in order_ids if item in self.orders]
+            status = statuses[0] if statuses else "RECONCILED"
+            self._audit(
+                account_id, "execution.observation.reconciled",
+                applied_fill_ids=tuple(applied), duplicate_fill_ids=tuple(duplicates),
+            )
+            self._save()
+            return ReconciliationResult(account_id, status, tuple(applied), tuple(duplicates), tuple(position_ids))
+
+    def observe_broker(self, account_id: str, observation: dict[str, Any]) -> ReconciliationResult:
+        return self.reconcile_observation(account_id, observation)
