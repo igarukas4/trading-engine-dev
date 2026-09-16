@@ -160,12 +160,21 @@ class AuditHub:
         self.events: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._lock = RLock()
 
-    def record(self, account_id: str, event_type: str, reason: str = "", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def record(
+        self,
+        account_id: str,
+        event_type: str,
+        reason: str = "",
+        payload: dict[str, Any] | None = None,
+        *,
+        actor: str = "system",
+    ) -> dict[str, Any]:
         event = {
             "id": str(uuid4()),
             "broker_account_id": account_id,
             "event_type": event_type,
             "reason": reason,
+            "actor": actor,
             "payload": payload or {},
             "created_at": _now(),
         }

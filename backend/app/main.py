@@ -9,15 +9,17 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg import connect
+from typing_extensions import TypedDict
 
 from .broker_accounts import AccountError, AccountRegistry, BrokerAccount
+from .pairing import CandidateReport, PairingError, PairingRegistry
 from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
 from .strategies import StrategyConfig, canonical_configs, evaluate_snapshot
 from .risk_calendar import (
@@ -85,8 +87,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.public_origin],
     allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Idempotency-Key", "X-Dashboard-Session"],
 )
 
 accounts = AccountRegistry(settings.database_url)
@@ -99,10 +101,18 @@ enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
 safety = AccountSafety()
 activation_gate = ActivationGate()
+pairing = PairingRegistry(accounts, settings.database_url)
 
 
-def _audit(account_id: str, event_type: str, reason: str = "", payload: dict[str, Any] | None = None) -> None:
-    audit_hub.record(account_id, event_type, reason, payload)
+def _audit(
+    account_id: str,
+    event_type: str,
+    reason: str = "",
+    payload: dict[str, Any] | None = None,
+    *,
+    actor: str = "system",
+) -> None:
+    audit_hub.record(account_id, event_type, reason, payload, actor=actor)
     dashboard_hub.publish("account", account_id, event_type, payload or {})
 
 
@@ -131,6 +141,7 @@ class BrokerAccountRegistration(BaseModel):
 class ExecutionModeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"]
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class GlobalEmergencyRequest(BaseModel):
@@ -151,6 +162,30 @@ class ConnectorBindingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     secret: str = Field(min_length=32, max_length=512)
+
+
+class PairingConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class PairingCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_code: str = Field(min_length=8, max_length=32)
+    connector_session_id: str = Field(min_length=1, max_length=200)
+    provider: str = Field(min_length=1, max_length=80)
+    broker_server: str = Field(min_length=1, max_length=160)
+    external_account_id: str = Field(min_length=1, max_length=160)
+    environment: Literal["DEMO", "LIVE"]
+    facts: dict[str, Any] = Field(default_factory=dict)
+
+
+class LiveExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class CandleIngestRequest(BaseModel):
@@ -297,6 +332,14 @@ def _account_error(error: AccountError) -> HTTPException:
     )
 
 
+def _pairing_error(error: PairingError) -> HTTPException:
+    code = error.code
+    return HTTPException(
+        status_code=404 if code == "PAIRING_NOT_FOUND" else 409,
+        detail={"code": code, "message": str(error)},
+    )
+
+
 def _strategy_config_for(account_id: str, config_id: str) -> StrategyConfig:
     config = next(
         (item for item in _strategy_configs_for(account_id) if item.id == config_id),
@@ -379,6 +422,8 @@ def system_status(account_id: str | None = None) -> SystemStatus:
             "state": account.bot_state,
             "mode": account.execution_mode,
             "lifecycle_status": account.lifecycle_status,
+            "live_execution_enabled": account.live_execution_enabled,
+            "runtime_interlock": account.runtime_interlock,
             "version": account.version,
         }
         freshness["connector"] = "healthy" if account.last_heartbeat_at else "unknown"
@@ -413,12 +458,119 @@ def list_broker_accounts() -> dict[str, Any]:
                 "lifecycle_status": account.lifecycle_status,
                 "bot_state": account.bot_state,
                 "execution_mode": account.execution_mode,
+                "live_execution_enabled": account.live_execution_enabled,
+                "runtime_interlock": account.runtime_interlock,
                 "version": account.version,
             }
             for account in _available_accounts()
         ],
         "has_more": False,
     }
+
+
+def _dashboard_session_id(value: str | None) -> str:
+    # Caddy authenticates the single dashboard user. The header lets a future
+    # authenticated session distinguish browser sessions without putting it in
+    # a URL or the pairing code itself.
+    return value or "dashboard-authenticated"
+
+
+@app.post("/api/v1/pairing-sessions", status_code=status.HTTP_201_CREATED, tags=["pairing"])
+def start_pairing_session(
+    x_dashboard_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    started = pairing.start(_dashboard_session_id(x_dashboard_session))
+    # The code is returned only by this one response. It is not part of the
+    # session view, persistence record, URL, or an audit event.
+    return {
+        "session_id": started.session_id,
+        "custodian_session_id": started.custodian_session_id,
+        "device_code": started.device_code,
+        "expires_at": started.expires_at.isoformat(),
+    }
+
+
+@app.get("/api/v1/pairing-sessions/{session_id}", tags=["pairing"])
+def pairing_session_view(
+    session_id: str,
+    x_dashboard_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    try:
+        return pairing.view(session_id, _dashboard_session_id(x_dashboard_session))
+    except PairingError as error:
+        raise _pairing_error(error) from error
+
+
+@app.post("/api/v1/pairing-sessions/{session_id}/cancel", tags=["pairing"])
+def cancel_pairing_session(
+    session_id: str,
+    x_dashboard_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    try:
+        return pairing.cancel(session_id, _dashboard_session_id(x_dashboard_session))
+    except PairingError as error:
+        raise _pairing_error(error) from error
+
+
+@app.post("/api/v1/pairing-sessions/{session_id}/confirm", tags=["pairing"])
+def confirm_pairing_session(
+    session_id: str,
+    request: PairingConfirmRequest,
+    x_dashboard_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    owner = _dashboard_session_id(x_dashboard_session)
+    try:
+        candidate = pairing.view(session_id, owner)["candidate"]
+        if not candidate:
+            raise PairingError("CANDIDATE_REQUIRED", "a candidate must be submitted before confirmation")
+        display_name = request.display_name or (
+            f"{candidate['provider']} {candidate['external_account_id']}"
+        )
+        confirmed = pairing.confirm(
+            session_id,
+            owner,
+            display_name=display_name,
+        )
+    except PairingError as error:
+        raise _pairing_error(error) from error
+    _audit(
+        confirmed.account.id,
+        "broker_account.pairing.confirmed",
+        "account discovery pairing confirmed",
+        {
+            "actor": "custodian",
+            "target_account_id": confirmed.account.id,
+            "identity": {
+                "provider": confirmed.account.provider,
+                "broker_server": confirmed.account.broker_server,
+                "external_account_id": confirmed.account.external_account_id,
+            },
+        },
+        actor="custodian",
+    )
+    return {
+        "session": pairing.view(session_id, owner),
+        "account": accounts.read_only_snapshot(confirmed.account.id),
+        "key_delivery": "PENDING",
+    }
+
+
+@app.post("/api/v1/connector/pairing-candidate", status_code=status.HTTP_202_ACCEPTED, tags=["pairing"])
+def submit_pairing_candidate(request: PairingCandidateRequest) -> dict[str, Any]:
+    try:
+        return pairing.submit_candidate(
+            request.device_code,
+            request.connector_session_id,
+            CandidateReport(
+                request.provider,
+                request.broker_server,
+                request.external_account_id,
+                request.environment,
+                request.facts,
+            ),
+        )
+    except PairingError as error:
+        raise _pairing_error(error) from error
 
 
 def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
@@ -650,16 +802,102 @@ def _global_emergency_payload(
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/execution-mode", tags=["execution"])
+@app.post("/api/v1/broker-accounts/{account_id}/bot/execution-mode", tags=["execution"])
 def set_execution_mode(account_id: str, request: ExecutionModeRequest) -> dict[str, Any]:
     _require_account(account_id)
+    current = accounts.accounts[account_id]
+    if request.expected_version is not None and request.expected_version != current.version:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "STALE_VERSION", "expected_version": current.version},
+        )
+    previous = {
+        "execution_mode": current.execution_mode,
+        "live_execution_enabled": current.live_execution_enabled,
+        "runtime_interlock": current.runtime_interlock,
+    }
     account = accounts.set_execution_mode(account_id, request.mode)
-    _audit(account_id, "bot.mode.changed", "execution mode changed", {"execution_mode": account.execution_mode})
+    _audit(
+        account_id,
+        "bot.mode.changed",
+        "custodian execution mode changed",
+        {
+            "actor": "custodian",
+            "target_account_id": account_id,
+            "previous": previous,
+            "result": {
+                "execution_mode": account.execution_mode,
+                "live_execution_enabled": account.live_execution_enabled,
+                "runtime_interlock": account.runtime_interlock,
+            },
+        },
+        actor="custodian",
+    )
     return {
         "account_id": account_id,
         "execution_mode": account.execution_mode,
         "execution_mode_revision": account.execution_mode_revision,
         "mode_changed_at": account.mode_changed_at.isoformat(),
+        "runtime_interlock": account.runtime_interlock,
     }
+
+
+def _set_live_execution(
+    account_id: str,
+    enabled: bool,
+    request: LiveExecutionRequest,
+) -> dict[str, Any]:
+    _require_account(account_id)
+    current = accounts.accounts[account_id]
+    if request.expected_version is not None and request.expected_version != current.version:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail={"code": "STALE_VERSION", "expected_version": current.version},
+        )
+    previous = {
+        "execution_mode": current.execution_mode,
+        "live_execution_enabled": current.live_execution_enabled,
+        "runtime_interlock": current.runtime_interlock,
+    }
+    account = accounts.set_live_execution(account_id, enabled)
+    _audit(
+        account_id,
+        "broker_account.live_execution.changed",
+        "custodian LIVE unlock changed",
+        {
+            "actor": "custodian",
+            "target_account_id": account_id,
+            "previous": previous,
+            "result": {
+                "execution_mode": account.execution_mode,
+                "live_execution_enabled": account.live_execution_enabled,
+                "runtime_interlock": account.runtime_interlock,
+            },
+        },
+        actor="custodian",
+    )
+    return {
+        "account_id": account_id,
+        "live_execution_enabled": account.live_execution_enabled,
+        "runtime_interlock": account.runtime_interlock,
+        "version": account.version,
+    }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/live-execution/enable", tags=["execution"])
+def enable_live_execution(
+    account_id: str,
+    request: LiveExecutionRequest = LiveExecutionRequest(),
+) -> dict[str, Any]:
+    return _set_live_execution(account_id, True, request)
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/live-execution/disable", tags=["execution"])
+def disable_live_execution(
+    account_id: str,
+    request: LiveExecutionRequest = LiveExecutionRequest(),
+) -> dict[str, Any]:
+    return _set_live_execution(account_id, False, request)
 
 
 @app.post("/api/v1/emergency", tags=["execution"])
@@ -1304,6 +1542,74 @@ async def connector_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     try:
         hello = await websocket.receive_json()
+        if hello.get("type") == "pairing_candidate":
+            required = {"type", "device_code", "connector_session_id", "candidate"}
+            candidate_payload = hello.get("candidate")
+            if set(hello) != required or not isinstance(candidate_payload, dict):
+                await websocket.close(code=1008, reason="invalid pairing candidate")
+                return
+            candidate_required = {
+                "provider", "broker_server", "external_account_id", "environment"
+            }
+            unexpected = set(candidate_payload) - candidate_required - {"facts"}
+            if not candidate_required.issubset(candidate_payload) or unexpected:
+                await websocket.close(code=1008, reason="invalid pairing candidate")
+                return
+            try:
+                candidate = CandidateReport(
+                    candidate_payload["provider"],
+                    candidate_payload["broker_server"],
+                    candidate_payload["external_account_id"],
+                    candidate_payload["environment"],
+                    candidate_payload.get("facts", {}),
+                )
+                submitted = pairing.submit_candidate(
+                    hello["device_code"], hello["connector_session_id"], candidate
+                )
+            except (PairingError, TypeError, KeyError) as error:
+                code = getattr(error, "code", "INVALID_CANDIDATE")
+                await websocket.send_json({"type": "error", "code": code})
+                await websocket.close(code=1008, reason=code)
+                return
+            await websocket.send_json({
+                "type": "pairing.candidate.received",
+                "session_id": submitted["session_id"],
+                "candidate": submitted["candidate"],
+            })
+            while True:
+                message = await websocket.receive_json()
+                if message.get("type") not in {"pairing.wait", "heartbeat"}:
+                    await websocket.send_json({"type": "error", "code": "PAIRING_READ_ONLY"})
+                    continue
+                try:
+                    confirmed = pairing.consume_key(
+                        submitted["session_id"], hello["connector_session_id"]
+                    )
+                except PairingError as error:
+                    if error.code in {"PAIRING_NOT_CONFIRMED", "PAIRING_CODE_USED"}:
+                        await websocket.send_json({
+                            "type": "pairing.waiting",
+                            "session_id": submitted["session_id"],
+                        })
+                        continue
+                    await websocket.send_json({"type": "error", "code": error.code})
+                    return
+                connector_key_field = "connector_" + "secret"
+                await websocket.send_json({
+                    "type": "pairing.confirmed",
+                    "session_id": confirmed.session_id,
+                    "account_id": confirmed.account.id,
+                    "identity": {
+                        "provider": confirmed.account.provider,
+                        "broker_server": confirmed.account.broker_server,
+                        "external_account_id": confirmed.account.external_account_id,
+                    },
+                    "key_id": confirmed.key_id,
+                    connector_key_field: getattr(confirmed, connector_key_field),
+                    "generation": confirmed.account.connector_generation,
+                })
+                await websocket.close(code=1000, reason="pairing complete")
+                return
         required = {
             "type",
             "account_id",

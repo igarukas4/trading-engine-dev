@@ -11,6 +11,7 @@ import hmac
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -107,6 +108,11 @@ class BrokerAccount:
             self.environment == "DEMO" or self.live_execution_enabled
         )
 
+    @property
+    def runtime_interlock(self) -> Literal["BLOCKED", "ELIGIBLE"]:
+        """Expose exposure readiness without changing custodian selections."""
+        return "ELIGIBLE" if self.can_enable and self.bot_state == "RUNNING" else "BLOCKED"
+
     def enable(self) -> None:
         if not self.can_enable:
             raise AccountError("NOT_READY", "account readiness gates are not healthy")
@@ -160,6 +166,7 @@ class AccountRegistry:
         self.accounts: dict[str, BrokerAccount] = {}
         self.bindings: dict[str, ConnectorBinding] = {}
         self.database_url = database_url
+        self._lock = RLock()
         if database_url:
             self._load()
 
@@ -290,6 +297,70 @@ class AccountRegistry:
             self._persist_account(account)
         return key_id
 
+    def create_bound_account(
+        self,
+        *,
+        provider: str,
+        broker_server: str,
+        external_account_id: str,
+        display_name: str,
+        environment: Literal["DEMO", "LIVE"],
+        secret: str,
+    ) -> tuple[BrokerAccount, str]:
+        """Create an immutable account and its only binding in one transaction."""
+        identity = (provider, broker_server, external_account_id)
+        with self._lock:
+            if any(account.identity == identity for account in self.accounts.values()):
+                raise AccountError("DUPLICATE_IDENTITY", "BrokerAccount identity already exists")
+            salt_hex, digest = hash_connector_secret(secret)
+            account = BrokerAccount(
+                provider=provider,
+                broker_server=broker_server,
+                external_account_id=external_account_id,
+                display_name=display_name,
+                environment=environment,
+            )
+            key_id = secrets.token_urlsafe(12)
+            binding = ConnectorBinding(
+                account.id, *account.identity, key_id, salt_hex, digest
+            )
+            if self.database_url:
+                try:
+                    with connect(self.database_url) as connection:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                """INSERT INTO broker_accounts
+                                   (id, provider, broker_server, external_account_id, display_name, environment)
+                                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                                (account.id, provider, broker_server, external_account_id,
+                                 display_name, environment),
+                            )
+                            cursor.execute(
+                                """INSERT INTO connector_bindings
+                                   (id, broker_account_id, provider, broker_server, external_account_id,
+                                    key_id, secret_salt, secret_hash)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                (str(uuid4()), account.id, provider, broker_server,
+                                 external_account_id, key_id, salt_hex, digest),
+                            )
+                except UniqueViolation as error:
+                    raise AccountError("DUPLICATE_IDENTITY", "BrokerAccount identity already exists") from error
+            account.connector_bound = True
+            self.accounts[account.id] = account
+            self.bindings[account.id] = binding
+            return account, key_id
+
+    def set_live_execution(self, account_id: str, enabled: bool) -> BrokerAccount:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
+        if account.live_execution_enabled == enabled:
+            return account
+        account.live_execution_enabled = enabled
+        account.version += 1
+        self._persist_account(account)
+        return account
+
     def authenticate(self, account_id: str, key_id: str, secret: str, generation: int) -> BrokerAccount:
         account = self.accounts.get(account_id)
         binding = self.bindings.get(account_id)
@@ -349,6 +420,7 @@ class AccountRegistry:
             "execution_mode_revision": account.execution_mode_revision,
             "mode_changed_at": account.mode_changed_at.isoformat(),
             "live_execution_enabled": account.live_execution_enabled,
+            "runtime_interlock": account.runtime_interlock,
             "connector": {
                 "bound": account.connector_bound,
                 "healthy": account.connector_healthy,
