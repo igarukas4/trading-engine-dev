@@ -116,6 +116,141 @@ print("ok")
   assert.match(output, /ok/);
 });
 
+test("Execution Coordination requires a fresh PRE_ORDER assessment for manual execution", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+engine.approve_signal(
+    account_id="account-a", signal_id="signal-a", idempotency_key="approve-a",
+    reason="reviewed", confirmed=True, signal_revision=1,
+)
+expired = RiskAssessment(
+    "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now - timedelta(seconds=20),
+    valid_until=now - timedelta(seconds=10), signal_revision=1,
+)
+try:
+    engine.execute_signal(
+        account_id="account-a", signal_id="signal-a", idempotency_key="execute-a",
+        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        risk_assessment=expired, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1,
+        order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
+    )
+except ExecutionError as error: assert error.code == "RISK_ASSESSMENT_EXPIRED"
+else: raise AssertionError("expired PRE_ORDER assessment created an order")
+assert not engine.orders and not engine.reservations
+
+engine.approve_signal(
+    account_id="account-a", signal_id="signal-initial", idempotency_key="approve-initial",
+    reason="reviewed", confirmed=True, signal_revision=1,
+)
+initial = RiskAssessment(
+    "account-a", 1, True, purpose="INITIAL", assessed_at=now,
+    valid_until=now + timedelta(seconds=20), signal_revision=1,
+)
+try:
+    engine.execute_signal(
+        account_id="account-a", signal_id="signal-initial", idempotency_key="execute-initial",
+        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        risk_assessment=initial, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1,
+        order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
+    )
+except ExecutionError as error: assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
+else: raise AssertionError("INITIAL assessment created an order")
+assert not engine.orders and not engine.reservations
+
+engine.approve_signal(
+    account_id="account-a", signal_id="signal-b", idempotency_key="approve-b",
+    reason="reviewed", confirmed=True, signal_revision=1,
+)
+fresh = RiskAssessment(
+    "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(seconds=20), signal_revision=1,
+)
+try:
+    engine.execute_signal(
+        account_id="account-a", signal_id="signal-b", idempotency_key="execute-stale-revision",
+        reason="execute", confirmed=True, signal_revision=2, risk_approved=True,
+        risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1,
+        order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 2},
+    )
+except ExecutionError as error: assert error.code == "SIGNAL_REVISION_CHANGED"
+else: raise AssertionError("assessment from another Signal revision created an order")
+assert not engine.orders and not engine.reservations
+accepted = engine.execute_signal(
+    account_id="account-a", signal_id="signal-b", idempotency_key="execute-b",
+    reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+    risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+    live_lock=True, execution_epoch=1,
+    order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
+)
+assert accepted.order.risk_assessment_id in engine.risk_assessments
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("Execution Coordination fences semi-auto Signals from old modes and foreign risk", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
+fresh = RiskAssessment(
+    "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(seconds=20), signal_revision=1,
+)
+try:
+    engine.schedule_automated_signal(
+        account_id="account-a", signal_id="old-signal", idempotency_key="old-order",
+        mode="SEMI_AUTO", signal_created_at=now - timedelta(seconds=1), signal_revision=1,
+        signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+        risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "SIGNAL_PRECEDES_MODE_CHANGE"
+else: raise AssertionError("Signal from before the mode change was scheduled")
+
+foreign = RiskAssessment(
+    "account-b", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(seconds=20), signal_revision=1,
+)
+try:
+    engine.schedule_automated_signal(
+        account_id="account-a", signal_id="new-signal", idempotency_key="foreign-order",
+        mode="SEMI_AUTO", signal_created_at=now, signal_revision=1,
+        signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+        risk_assessment=foreign, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "RISK_ASSESSMENT_ACCOUNT_MISMATCH"
+else: raise AssertionError("foreign PRE_ORDER assessment created an order")
+assert not engine.orders and not engine.reservations
+
+accepted = engine.schedule_automated_signal(
+    account_id="account-a", signal_id="new-signal", idempotency_key="fresh-order",
+    mode="SEMI_AUTO", signal_created_at=now, signal_revision=1,
+    signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+    risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+    live_lock=True, execution_epoch=1, order_payload=payload,
+)
+assert accepted.order.risk_assessment_id in engine.risk_assessments
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
 test("execution coordination has a forward-only PostgreSQL restart checkpoint", () => {
   const migration = readFileSync("backend/migrations/010_execution_coordination_checkpoint.sql", "utf8");
   const backend = readFileSync("backend/app/main.py", "utf8");

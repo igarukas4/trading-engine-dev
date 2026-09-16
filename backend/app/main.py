@@ -27,6 +27,7 @@ from .risk_calendar import (
     ActivationGate,
     CalendarHealth,
     EnrichmentPolicy,
+    RiskAssessment,
     RiskLimits,
     RiskLimitsStore,
 )
@@ -1212,6 +1213,24 @@ def _backend_risk_context(
     }
 
 
+def _pre_order_risk_assessment(
+    account_id: str, signal: Any, account: BrokerAccount
+) -> RiskAssessment:
+    """Reassess a Signal against the current account-local execution context."""
+    policy = enrichment_policies.get((account_id, signal.strategy_config_version_id))
+    context = dict(signal.risk_context)
+    context.update(_backend_risk_context(account.bot_state, policy, account_id))
+    return signals.risk_engine.assess(
+        account_id,
+        risk_limits.active(account_id),
+        purpose="PRE_ORDER",
+        signal_expires_at=signal.expires_at,
+        signal_revision=signal.revision,
+        approved_revision=signal.revision,
+        **context,
+    )
+
+
 def _account_data_status(account_id: str) -> dict[str, Any]:
     """Expose the conservative dashboard gate for account-owned broker data."""
     account = accounts.accounts[account_id]
@@ -1363,6 +1382,7 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
         raise HTTPException(status_code=409, detail={"code": code}) from error
     if account.execution_mode == "SEMI_AUTO":
         try:
+            assessment = _pre_order_risk_assessment(account_id, signal, account)
             scheduled = execution.schedule_automated_signal(
                 account_id=account_id,
                 signal_id=signal_id,
@@ -1373,7 +1393,8 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
                 signal_eligible=True,
                 signal_approved=True,
                 mode_changed_at=account.mode_changed_at,
-                risk_approved=signal.risk_assessment.approved,
+                risk_approved=assessment.approved,
+                risk_assessment=assessment,
                 signal_fresh=signal.as_dict()["status"] == "APPROVED",
                 fence_safe=execution.account(account_id).exposure_gate == "OPEN",
                 account_state=account.bot_state,
@@ -1399,10 +1420,12 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
         if signal.account_id != account_id:
             raise ValueError("SIGNAL_NOT_FOUND")
         account = accounts.accounts[account_id]
+        assessment = _pre_order_risk_assessment(account_id, signal, account)
         result = execution.execute_signal(
             account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
             reason=request.reason, confirmed=request.confirmed, signal_revision=request.signal_revision,
-            risk_approved=signal.risk_assessment.approved, signal_fresh=signal.as_dict()["status"] == "APPROVED",
+            risk_approved=assessment.approved, signal_fresh=signal.as_dict()["status"] == "APPROVED",
+            risk_assessment=assessment,
             fence_safe=execution.account(account_id).exposure_gate == "OPEN",
             account_state=account.bot_state, live_lock=account.connector_healthy and account.connector_bound,
             execution_epoch=execution.account(account_id).execution_epoch,

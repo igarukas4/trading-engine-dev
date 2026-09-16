@@ -349,6 +349,30 @@ class ExecutionSubstrate:
     def account(self, account_id: str) -> AccountExecutionState:
         return self._accounts.setdefault(account_id, AccountExecutionState(account_id))
 
+    def _accept_execution(
+        self,
+        *,
+        account_id: str,
+        signal_id: str,
+        idempotency_key: str,
+        canonical_hash: str,
+        execution_epoch: int,
+        risk_assessment: RiskAssessment | None,
+        signal_revision: int,
+        order_payload: dict[str, Any],
+        risk_amount: str,
+    ) -> PreOrderResult:
+        return self.pre_order(
+            account_id=account_id,
+            signal_id=signal_id,
+            idempotency_key=idempotency_key,
+            canonical_hash=canonical_hash,
+            risk_approved=True,
+            execution_epoch=execution_epoch,
+            order_payload=order_payload,
+            risk_amount=risk_amount,
+        )
+
     def pre_order(
         self, *, account_id: str, signal_id: str, idempotency_key: str,
         canonical_hash: str, risk_approved: bool, execution_epoch: int,
@@ -453,6 +477,7 @@ class ExecutionSubstrate:
         risk_approved: bool, signal_fresh: bool, fence_safe: bool,
         account_state: str, live_lock: bool, execution_epoch: int,
         order_payload: dict[str, Any], risk_amount: str = "0",
+        risk_assessment: RiskAssessment | None = None,
     ) -> PreOrderResult:
         """Execute an already approved Signal after every last-mile gate."""
         with self._lock_for(account_id):
@@ -475,13 +500,14 @@ class ExecutionSubstrate:
                 reason=reason,
                 confirmed=confirmed,
             )
-            result = self.pre_order(
+            result = self._accept_execution(
                 account_id=account_id,
                 signal_id=signal_id,
                 idempotency_key=idempotency_key,
                 canonical_hash=json.dumps(order_payload, sort_keys=True),
-                risk_approved=True,
                 execution_epoch=execution_epoch,
+                risk_assessment=risk_assessment,
+                signal_revision=signal_revision,
                 order_payload=order_payload,
                 risk_amount=risk_amount,
             )
@@ -496,6 +522,7 @@ class ExecutionSubstrate:
         risk_approved: bool, signal_fresh: bool, fence_safe: bool,
         account_state: str, live_lock: bool, execution_epoch: int,
         order_payload: dict[str, Any], risk_amount: str = "0",
+        risk_assessment: RiskAssessment | None = None,
     ) -> PreOrderResult:
         """Schedule exactly one account-local order for an eligible Signal."""
         with self._lock_for(account_id):
@@ -515,11 +542,12 @@ class ExecutionSubstrate:
                 raise ExecutionError("SIGNAL_REVISION_CHANGED")
             if not order_payload.get("stop_loss") or not order_payload.get("take_profit"):
                 raise ExecutionError("NATIVE_PROTECTION_REQUIRED")
-            return self.pre_order(
+            return self._accept_execution(
                 account_id=account_id, signal_id=signal_id,
                 idempotency_key=idempotency_key,
                 canonical_hash=json.dumps(order_payload, sort_keys=True),
-                risk_approved=True, execution_epoch=execution_epoch,
+                execution_epoch=execution_epoch, risk_assessment=risk_assessment,
+                signal_revision=signal_revision,
                 order_payload=order_payload, risk_amount=risk_amount,
             )
 
@@ -1212,7 +1240,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
         )
 
     def _assessment_is_fresh(
-        self, account_id: str, assessment: RiskAssessment, now: datetime
+        self,
+        account_id: str,
+        assessment: RiskAssessment,
+        now: datetime,
+        signal_revision: int | None = None,
     ) -> None:
         if assessment.broker_account_id != account_id:
             raise ExecutionError("RISK_ASSESSMENT_ACCOUNT_MISMATCH")
@@ -1220,10 +1252,39 @@ class ExecutionCoordinator(ExecutionSubstrate):
             raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
         if not assessment.approved:
             raise ExecutionError("PRE_ORDER_RISK_REJECTED")
+        if signal_revision is not None and assessment.signal_revision != signal_revision:
+            raise ExecutionError("SIGNAL_REVISION_CHANGED")
         if assessment.assessed_at is None or assessment.valid_until is None:
             raise ExecutionError("RISK_ASSESSMENT_NOT_FRESH")
         if now < assessment.assessed_at or now >= assessment.valid_until:
             raise ExecutionError("RISK_ASSESSMENT_EXPIRED")
+
+    def _accept_execution(
+        self,
+        *,
+        account_id: str,
+        signal_id: str,
+        idempotency_key: str,
+        canonical_hash: str,
+        execution_epoch: int,
+        risk_assessment: RiskAssessment | None,
+        signal_revision: int,
+        order_payload: dict[str, Any],
+        risk_amount: str,
+    ) -> PreOrderResult:
+        if risk_assessment is None:
+            raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
+        return self.accept_execution(
+            account_id=account_id,
+            signal_id=signal_id,
+            idempotency_key=idempotency_key,
+            canonical_hash=canonical_hash,
+            execution_epoch=execution_epoch,
+            risk_assessment=risk_assessment,
+            signal_revision=signal_revision,
+            order_payload=order_payload,
+            risk_amount=risk_amount,
+        )
 
     def accept_execution(
         self,
@@ -1235,12 +1296,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
         execution_epoch: int,
         risk_assessment: RiskAssessment,
         order_payload: dict[str, Any],
+        signal_revision: int | None = None,
         risk_amount: str | Decimal = "0",
         now: datetime | None = None,
     ) -> PreOrderResult:
         """Atomically accept a fresh assessment, reservation, and Order intent."""
         with self._mutation(), self._lock_for(account_id):
-            self._assessment_is_fresh(account_id, risk_assessment, now or _now())
+            self._assessment_is_fresh(
+                account_id, risk_assessment, now or _now(), signal_revision
+            )
             prior = self._idempotency.get((account_id, idempotency_key))
             if prior and prior[1] == canonical_hash:
                 order = self.orders[prior[0]]
