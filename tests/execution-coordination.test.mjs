@@ -40,6 +40,7 @@ with TemporaryDirectory() as directory:
     assert reloaded.orders[created.order.id].external_id == "mt5-order-1"
     assert reloaded.orders[created.order.id].command_id in reloaded.commands
     assert created.order.risk_assessment_id in reloaded.risk_assessments
+    assert reloaded.risk_assessments[created.order.risk_assessment_id]["assessed_at"] == now
     first = reloaded.reconcile_observation("account-a", {
         "orders": [{"order_id": created.order.id, "status": "PARTIALLY_FILLED"}],
         "fills": [{"deal_id": "deal-1", "order_id": created.order.id, "volume": "0.4", "position_id": "position-1", "entry": "IN"}],
@@ -53,6 +54,15 @@ with TemporaryDirectory() as directory:
     assert second.duplicate_fill_ids == ("deal-1",)
     assert len(reloaded.fills) == 1
     assert reloaded.position("account-a", "position-1").volume == "0.4"
+    close = reloaded.request_position_close(
+        "account-a", created.order.id, "0.1", "EURUSD", "test close",
+        confirmed=True, idempotency_key="close-1",
+    )
+    reloaded_again = ExecutionCoordinator(state_path=path)
+    assert reloaded_again.request_position_close(
+        "account-a", created.order.id, "0.1", "EURUSD", "test close",
+        confirmed=True, idempotency_key="close-1",
+    ).id == close.id
     assert all(event.account_id == "account-a" for event in reloaded.audit_events)
 print("ok")
 `);

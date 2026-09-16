@@ -12,13 +12,15 @@ import json
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
-from typing import Any, Literal
+from typing import Any, Iterator, Literal, Protocol
 from uuid import uuid4
+
+from .risk_calendar import RiskAssessment
 
 
 def _now() -> datetime:
@@ -1011,17 +1013,33 @@ class ExecutionSubstrate:
         return SafetyFence(account_id, account.fence_sequence, kind)
 
 
-def _state_value(value: Any) -> Any:
+def _serialize_state_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return {"__datetime__": value.isoformat()}
     if isinstance(value, dict):
-        return {str(key): _state_value(item) for key, item in value.items()}
+        return {
+            str(key): _serialize_state_value(item) for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_state_value(item) for item in value]
+        return [_serialize_state_value(item) for item in value]
+    return value
+
+
+def _deserialize_state_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {"__datetime__"}:
+            return datetime.fromisoformat(value["__datetime__"])
+        return {
+            key: _deserialize_state_value(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_deserialize_state_value(item) for item in value]
     return value
 
 
 def _state_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
     if isinstance(value, dict) and "__datetime__" in value:
         return datetime.fromisoformat(value["__datetime__"])
     return datetime.fromisoformat(value)
@@ -1044,55 +1062,88 @@ class ExecutionCoordinator(ExecutionSubstrate):
         database_url: str | None = None,
     ) -> None:
         super().__init__()
-        configured_stores = sum(value is not None for value in (state_store, state_path, database_url))
+        configured_stores = sum(
+            value is not None for value in (state_store, state_path, database_url)
+        )
         if configured_stores > 1:
             raise ValueError("execution state store options are mutually exclusive")
-        self._state_store = state_store or (
-            JsonExecutionStore(state_path) if state_path is not None else
-            PostgresExecutionStore(database_url) if database_url else None
-        )
+        if state_store is not None:
+            self._state_store = state_store
+        elif state_path is not None:
+            self._state_store = JsonExecutionStore(state_path)
+        elif database_url:
+            self._state_store = PostgresExecutionStore(database_url)
+        else:
+            self._state_store = None
+        self._mutation_depth = 0
         self.audit_events: list[AuditEvent] = []
         self.risk_assessments: dict[str, dict[str, Any]] = {}
         if self._state_store is not None:
             self._restore(self._state_store.load())
 
     def _snapshot(self) -> dict[str, Any]:
-        return _state_value({
-            "accounts": {key: value.__dict__ for key, value in self._accounts.items()},
-            "reservations": {key: value.__dict__ for key, value in self.reservations.items()},
-            "orders": {key: value.__dict__ for key, value in self.orders.items()},
-            "events": {key: value.__dict__ for key, value in self.events.items()},
-            "journal": {key: value.__dict__ for key, value in self.journal.items()},
-            "fills": {key: value.__dict__ for key, value in self.fills.items()},
-            "positions": {
-                f"{account_id}|{position_id}": value.__dict__
-                for (account_id, position_id), value in self.positions.items()
-            },
-            "position_commands": [value.__dict__ for value in self.position_commands],
-            "commands": {key: value.__dict__ for key, value in self.commands.items()},
-            "order_reservations": self._order_reservations,
-            "risk_assessments": self.risk_assessments,
-            "global_emergencies": {
-                key: {
-                    **value.__dict__,
-                    "targets": {
-                        target_id: target.__dict__
-                        for target_id, target in value.targets.items()
-                    },
-                }
-                for key, value in self.global_emergencies.items()
-            },
-            "audit_events": [value.__dict__ for value in self.audit_events],
-        })
+        return _serialize_state_value(
+            {
+                "accounts": {
+                    key: value.__dict__ for key, value in self._accounts.items()
+                },
+                "reservations": {
+                    key: value.__dict__ for key, value in self.reservations.items()
+                },
+                "orders": {key: value.__dict__ for key, value in self.orders.items()},
+                "events": {key: value.__dict__ for key, value in self.events.items()},
+                "journal": {
+                    key: value.__dict__ for key, value in self.journal.items()
+                },
+                "fills": {key: value.__dict__ for key, value in self.fills.items()},
+                "positions": {
+                    f"{account_id}|{position_id}": value.__dict__
+                    for (account_id, position_id), value in self.positions.items()
+                },
+                "position_commands": [
+                    value.__dict__ for value in self.position_commands
+                ],
+                "commands": {
+                    key: value.__dict__ for key, value in self.commands.items()
+                },
+                "order_reservations": self._order_reservations,
+                "risk_assessments": self.risk_assessments,
+                "global_emergencies": {
+                    key: {
+                        **value.__dict__,
+                        "targets": {
+                            target_id: target.__dict__
+                            for target_id, target in value.targets.items()
+                        },
+                    }
+                    for key, value in self.global_emergencies.items()
+                },
+                "audit_events": [value.__dict__ for value in self.audit_events],
+            }
+        )
 
     def _save(self) -> None:
         if self._state_store is not None:
             self._state_store.save(self._snapshot())
 
+    @contextmanager
+    def _mutation(self) -> Iterator[None]:
+        """Checkpoint once after the outermost successful public mutation."""
+        self._mutation_depth += 1
+        try:
+            yield
+        except BaseException:
+            self._mutation_depth -= 1
+            raise
+        else:
+            self._mutation_depth -= 1
+            if self._mutation_depth == 0:
+                self._save()
+
     def _restore(self, state: dict[str, Any] | None) -> None:
         if not state:
             return
-        state = _state_value(state)
+        state = _deserialize_state_value(state)
         for key, value in state.get("accounts", {}).items():
             self._accounts[key] = AccountExecutionState(**value)
         for key, value in state.get("reservations", {}).items():
@@ -1112,6 +1163,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
         self.position_commands = [
             PositionCommand(**value) for value in state.get("position_commands", [])
         ]
+        for command in self.position_commands:
+            if command.idempotency_key:
+                self._position_command_keys[
+                    (command.account_id, command.idempotency_key)
+                ] = command.id
         for key, value in state.get("commands", {}).items():
             self.commands[key] = OperatorCommand(**value)
         self.audit_events = [
@@ -1156,7 +1212,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         )
 
     def _assessment_is_fresh(
-        self, account_id: str, assessment: Any, now: datetime
+        self, account_id: str, assessment: RiskAssessment, now: datetime
     ) -> None:
         if assessment.broker_account_id != account_id:
             raise ExecutionError("RISK_ASSESSMENT_ACCOUNT_MISMATCH")
@@ -1177,26 +1233,35 @@ class ExecutionCoordinator(ExecutionSubstrate):
         idempotency_key: str,
         canonical_hash: str,
         execution_epoch: int,
-        risk_assessment: Any,
+        risk_assessment: RiskAssessment,
         order_payload: dict[str, Any],
         risk_amount: str | Decimal = "0",
         now: datetime | None = None,
     ) -> PreOrderResult:
         """Atomically accept a fresh assessment, reservation, and Order intent."""
-        with self._lock_for(account_id):
+        with self._mutation(), self._lock_for(account_id):
             self._assessment_is_fresh(account_id, risk_assessment, now or _now())
             prior = self._idempotency.get((account_id, idempotency_key))
             if prior and prior[1] == canonical_hash:
                 order = self.orders[prior[0]]
-                return PreOrderResult(self._reservation_for(order.id), order, self._event_for(order.id))
+                return PreOrderResult(
+                    self._reservation_for(order.id),
+                    order,
+                    self._event_for(order.id),
+                )
             result = self.pre_order(
-                account_id=account_id, signal_id=signal_id,
-                idempotency_key=idempotency_key, canonical_hash=canonical_hash,
-                risk_approved=True, execution_epoch=execution_epoch,
+                account_id=account_id,
+                signal_id=signal_id,
+                idempotency_key=idempotency_key,
+                canonical_hash=canonical_hash,
+                risk_approved=True,
+                execution_epoch=execution_epoch,
                 order_payload=order_payload,
                 risk_amount=str(risk_amount),
             )
-            requested_volume = order_payload.get("requested_volume", order_payload.get("volume"))
+            requested_volume = order_payload.get(
+                "requested_volume", order_payload.get("volume")
+            )
             if requested_volume is not None:
                 result.order.requested_volume = str(requested_volume)
                 result.order.remaining_volume = str(requested_volume)
@@ -1224,111 +1289,117 @@ class ExecutionCoordinator(ExecutionSubstrate):
             command.order_id = result.order.id
             result.order.command_id = command.id
             self._audit(
-                account_id, "execution.intent.accepted",
-                command_id=command.id, order_id=result.order.id,
+                account_id,
+                "execution.intent.accepted",
+                command_id=command.id,
+                order_id=result.order.id,
             )
-            self._save()
             return result
 
     def pre_order(self, **kwargs: Any) -> PreOrderResult:
-        result = super().pre_order(**kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().pre_order(**kwargs)
 
     def approve_signal(self, **kwargs: Any) -> OperatorCommand:
-        result = super().approve_signal(**kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().approve_signal(**kwargs)
 
     def execute_signal(self, **kwargs: Any) -> PreOrderResult:
-        result = super().execute_signal(**kwargs)
-        command = self.commands.get(
-            self._command_keys.get((kwargs["account_id"], kwargs["idempotency_key"]), "")
-        )
-        if command is not None:
-            result.order.command_id = command.id
-        self._save()
-        return result
+        with self._mutation():
+            result = super().execute_signal(**kwargs)
+            command = self.commands.get(
+                self._command_keys.get(
+                    (kwargs["account_id"], kwargs["idempotency_key"]), ""
+                )
+            )
+            if command is not None:
+                result.order.command_id = command.id
+            return result
 
     def schedule_automated_signal(self, **kwargs: Any) -> PreOrderResult:
-        result = super().schedule_automated_signal(**kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().schedule_automated_signal(**kwargs)
 
     def dispatch_next(self, account_id: str, connector: BrokerAdapter) -> DispatchResult:
-        result = super().dispatch_next(account_id, connector)
-        if result.status == "UNKNOWN":
-            self.account(account_id).exposure_gate = "QUARANTINED"
-            self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
-        self._audit(account_id, "execution.dispatch", order_id=result.order_id, status=result.status)
-        self._save()
-        return result
+        with self._mutation():
+            result = super().dispatch_next(account_id, connector)
+            if result.status == "UNKNOWN":
+                self.account(account_id).exposure_gate = "QUARANTINED"
+                self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
+            self._audit(
+                account_id,
+                "execution.dispatch",
+                order_id=result.order_id,
+                status=result.status,
+            )
+            return result
 
     def recover(self, account_id: str, order_id: str, connector: Any) -> DispatchResult:
-        result = super().recover(account_id, order_id, connector)
-        self._audit(account_id, "execution.reconciled", order_id=order_id, status=result.status)
-        self._save()
-        return result
+        with self._mutation():
+            result = super().recover(account_id, order_id, connector)
+            self._audit(
+                account_id,
+                "execution.reconciled",
+                order_id=order_id,
+                status=result.status,
+            )
+            return result
 
     def record_fill(self, *args: Any, **kwargs: Any) -> Fill:
-        result = super().record_fill(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().record_fill(*args, **kwargs)
 
     def record_exit_fill(self, *args: Any, **kwargs: Any) -> PositionCommand:
-        result = super().record_exit_fill(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().record_exit_fill(*args, **kwargs)
 
     def install_fence(self, *args: Any, **kwargs: Any) -> SafetyFence:
-        result = super().install_fence(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().install_fence(*args, **kwargs)
 
     def close_all(self, **kwargs: Any) -> OperatorCommand:
-        result = super().close_all(**kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().close_all(**kwargs)
 
     def begin_global_emergency(self, *args: Any, **kwargs: Any) -> GlobalEmergencyOperation:
-        result = super().begin_global_emergency(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().begin_global_emergency(*args, **kwargs)
 
     def converge_global_target(self, *args: Any, **kwargs: Any) -> GlobalEmergencyOperation:
-        result = super().converge_global_target(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().converge_global_target(*args, **kwargs)
 
     def emergency_stop(self, *args: Any, **kwargs: Any) -> SafetyFence:
-        result = super().emergency_stop(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().emergency_stop(*args, **kwargs)
 
     def confirm_trailing(self, *args: Any, **kwargs: Any) -> PositionCommand:
-        result = super().confirm_trailing(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().confirm_trailing(*args, **kwargs)
 
     def mark_protection_unknown(self, *args: Any, **kwargs: Any) -> Position:
-        result = super().mark_protection_unknown(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().mark_protection_unknown(*args, **kwargs)
 
     def mark_position_command_unknown(self, *args: Any, **kwargs: Any) -> PositionCommand:
-        result = super().mark_position_command_unknown(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().mark_position_command_unknown(*args, **kwargs)
 
     def confirm_protection(self, *args: Any, **kwargs: Any) -> Position:
-        result = super().confirm_protection(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().confirm_protection(*args, **kwargs)
 
     def request_position_close(self, *args: Any, **kwargs: Any) -> PositionCommand:
-        result = super().request_position_close(*args, **kwargs)
-        self._save()
-        return result
+        with self._mutation():
+            return super().request_position_close(*args, **kwargs)
+
+    def request_trailing(self, *args: Any, **kwargs: Any) -> PositionCommand | None:
+        with self._mutation():
+            return super().request_trailing(*args, **kwargs)
+
+    def connector_disconnected(self, *args: Any, **kwargs: Any) -> Position:
+        with self._mutation():
+            return super().connector_disconnected(*args, **kwargs)
 
     def position(self, account_id: str, position_id: str) -> Position:
         position = self.positions.get((account_id, position_id))
@@ -1407,7 +1478,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         applied: list[str] = []
         duplicates: list[str] = []
         position_ids: list[str] = []
-        with self._lock_for(account_id):
+        with self._mutation(), self._lock_for(account_id):
             for item in observation.get("orders", ()):
                 order_id = str(item.get("order_id", ""))
                 order = self.orders.get(order_id)
@@ -1458,8 +1529,13 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 account_id, "execution.observation.reconciled",
                 applied_fill_ids=tuple(applied), duplicate_fill_ids=tuple(duplicates),
             )
-            self._save()
-            return ReconciliationResult(account_id, status, tuple(applied), tuple(duplicates), tuple(position_ids))
+            return ReconciliationResult(
+                account_id,
+                status,
+                tuple(applied),
+                tuple(duplicates),
+                tuple(position_ids),
+            )
 
     def observe_broker(self, account_id: str, observation: dict[str, Any]) -> ReconciliationResult:
         return self.reconcile_observation(account_id, observation)
