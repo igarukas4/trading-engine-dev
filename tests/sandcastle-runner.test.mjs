@@ -59,9 +59,28 @@ test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {
   assert.match(main, /readonly: true/);
 });
 
-test("Sandcastle uses the approved Codex model and effort", () => {
-  assert.match(main, /codex\("gpt-5\.6-luna", \{\s+effort: "medium",/);
-  assert.match(main, /captureSessions: false/);
+test("Sandcastle uses the canonical role-specific Codex profiles", () => {
+  assert.match(
+    main,
+    /const plannerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+  );
+  assert.match(
+    main,
+    /const implementerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+  );
+  assert.match(
+    main,
+    /const reviewerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+  );
+  assert.match(
+    main,
+    /const mergerAgent = sandcastle\.codex\("gpt-5\.6-terra", \{\s+effort: "high",/,
+  );
+  assert.match(main, /agent: plannerAgent/);
+  assert.match(main, /agent: implementerAgent/);
+  assert.match(main, /agent: reviewerAgent/);
+  assert.match(main, /agent: mergerAgent/);
+  assert.doesNotMatch(main, /const codeAgent/);
 });
 
 test("sandbox installs the committed Node dependency graph", () => {

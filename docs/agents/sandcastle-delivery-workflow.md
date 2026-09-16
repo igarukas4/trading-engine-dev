@@ -46,14 +46,15 @@ changed.
 | Planner | `gpt-5.6-luna`, `high` | Read backlog context and emit a plan; issue selection remains deterministic. |
 | Implementer | `gpt-5.6-luna`, `high` | Complete one ticket, test it, and commit on its ticket branch. |
 | Reviewer | `gpt-5.6-luna`, `high` | Review only that branch, make justified corrections, and verify. |
-| Merger | `gpt-5.6-luna`, `high` | Merge reviewed committed work, verify, and close the issue. |
+| Merger | `gpt-5.6-terra`, `high` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
-The `codeAgent` object is currently shared by all four autonomous roles. If a
-different worker-only profile is wanted, split that configuration deliberately,
-cover it in `tests/sandcastle-runner.test.mjs`, run `npm run typecheck` and
-`npm test`, and commit it before starting. A model/effort change is a runner
-configuration change, not an in-flight steering mechanism.
+The four role profiles in `.sandcastle/main.mts` are the canonical
+configuration. Keep them explicit rather than sharing one agent object. Change
+a model or effort only through a reviewed runner configuration change. Cover it
+in `tests/sandcastle-runner.test.mjs`, run `npm run typecheck` and `npm test`,
+then commit it before starting. A profile change does not affect an agent that
+is already running.
 
 ## Admission: ticket and repository
 

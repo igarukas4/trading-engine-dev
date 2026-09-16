@@ -1,7 +1,7 @@
-// Parallel Planner with Review — four-phase orchestration loop
+// Dependency-aware delivery with review and serial merge
 //
 // This template drives a multi-phase workflow:
-//   Phase 1 (Plan):             An opus agent analyzes open issues, builds a
+//   Phase 1 (Plan):             A planner analyzes open issues, builds a
 //                               dependency graph, and outputs a <plan> JSON
 //                               listing unblocked issues with branch names.
 //   Phase 2 (Execute + Review): For each issue, a sandbox is created via
@@ -121,10 +121,25 @@ async function nextUnblockedIssues(
 const MAX_ITERATIONS = 100;
 const MAX_CONCURRENT_ISSUES = 3;
 
-// Keep Codex usage predictable for the ChatGPT Plus rate limit. Concurrent
-// issue pipelines are bounded by MAX_CONCURRENT_ISSUES.
-const codeAgent = sandcastle.codex("gpt-5.6-luna", {
-  effort: "medium",
+// These checked-in role profiles are the canonical Sandcastle configuration.
+// Change a profile only as a reviewed runner configuration change.
+const plannerAgent = sandcastle.codex("gpt-5.6-luna", {
+  effort: "high",
+  captureSessions: false,
+});
+
+const implementerAgent = sandcastle.codex("gpt-5.6-luna", {
+  effort: "high",
+  captureSessions: false,
+});
+
+const reviewerAgent = sandcastle.codex("gpt-5.6-luna", {
+  effort: "high",
+  captureSessions: false,
+});
+
+const mergerAgent = sandcastle.codex("gpt-5.6-terra", {
+  effort: "high",
   captureSessions: false,
 });
 
@@ -186,7 +201,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
-    agent: codeAgent,
+    agent: plannerAgent,
     promptFile: "./.sandcastle/plan-prompt.md",
     // Extract and validate the <plan> JSON into a typed object. Throws
     // StructuredOutputError if the tag is missing, the JSON is malformed, or
@@ -234,7 +249,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
         const implement = await sandbox.run({
           name: "implementer",
           maxIterations: 100,
-          agent: codeAgent,
+          agent: implementerAgent,
           promptFile: "./.sandcastle/implement-prompt.md",
           promptArgs: {
             TASK_ID: issue.id,
@@ -248,7 +263,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
           const review = await sandbox.run({
             name: "reviewer",
             maxIterations: 1,
-            agent: codeAgent,
+            agent: reviewerAgent,
             promptFile: "./.sandcastle/review-prompt.md",
             promptArgs: {
               BRANCH: issue.branch,
@@ -334,7 +349,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     sandbox: sandboxProvider,
     name: "merger",
     maxIterations: 1,
-    agent: codeAgent,
+    agent: mergerAgent,
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
       // A markdown list of branch names, one per line.
