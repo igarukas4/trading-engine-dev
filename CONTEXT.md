@@ -14,6 +14,9 @@ Identifier pair di broker tertentu (e.g. MT5: `EURUSD`, Binance: `BTCUSDT`). Tid
 **BrokerAccount**:
 Identitas immutable dan batas kepemilikan satu akun trading pada satu broker server. Berbeda dari akun pengguna dashboard; setiap BrokerAccount memiliki Environment (`DEMO` atau `LIVE`) dan lifecycle sendiri, dan beberapa BrokerAccount dapat aktif bersamaan tanpa berbagi keputusan, risiko, atau data broker.
 
+**Account Discovery Pairing**:
+Proses onboarding saat custodian memilih satu identitas akun MT5 yang ditemukan untuk dijadikan BrokerAccount. Deteksi saja tidak membuat akun, mengizinkan eksekusi, atau mengubah Mode maupun State; konfirmasi custodian membentuk satu ikatan antara BrokerAccount dan sesi Connector.
+
 **Account Scope**:
 Batas domain yang memastikan data, keputusan, risiko, perintah, external broker identity, dan failure hanya berlaku pada satu BrokerAccount. Relasi yang berasal dari broker harus tetap berada dalam account scope yang sama. News dan kalender ekonomi dapat menjadi sumber bersama, tetapi dampak kebijakannya diproyeksikan hanya ke BrokerAccount yang terpengaruh.
 
@@ -129,6 +132,12 @@ Siapa yang mengizinkan pembuatan Order dari Signal pada satu BrokerAccount: `MAN
 
 **State**:
 Status hidup engine khusus satu BrokerAccount: `RUNNING`, `STOPPED`, `EMERGENCY_STOP`. `STOPPED` menolak entry baru tetapi monitoring dan exit posisi terbuka tetap aktif. `EMERGENCY_STOP` selalu menolak entry baru; close-all hanya dijalankan bila diminta secara eksplisit. `RECOVERING` adalah status kesiapan saat memulihkan account, bukan nilai State.
+
+**RuntimeInterlock**:
+Keputusan keselamatan account-local yang mengizinkan atau menahan exposure baru berdasarkan fakta runtime dan broker yang dapat dipercaya. Interlock tidak mengubah Mode, LIVE unlock, atau State yang dipilih custodian.
+
+**Quarantine**:
+Kondisi RuntimeInterlock persisten yang menahan entry baru karena state atau proteksi BrokerAccount belum dapat dipercaya. Position yang telah terbuka tetap dimonitor dan dapat ditutup; kondisi berakhir hanya setelah recovery yang terverifikasi dan, bila diperlukan, command custodian yang diaudit.
 
 **GlobalEmergencyOperation**:
 Operasi darurat induk yang menerapkan satu kebijakan ke himpunan BrokerAccount yang ditetapkan saat diterima. Stop-only mencakup semua account `ENABLED`; close-all juga mencakup setiap account non-`ARCHIVED` yang masih memiliki exposure atau efek broker/darurat yang belum terselesaikan. Operasi selesai hanya setelah setiap target mencapai hasil yang diminta; account offline atau hasil ambigu tetap belum selesai.
