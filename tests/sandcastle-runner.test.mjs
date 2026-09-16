@@ -18,6 +18,7 @@ test("Sandcastle selects a bounded batch of ready agent tickets", () => {
 test("Sandcastle can constrain a delivery phase without weakening blockers", () => {
   assert.match(main, /process\.env\.SANDCASTLE_ISSUES/);
   assert.match(main, /phaseReadyIssues/);
+  assert.match(main, /allowedPhaseIssues\s+\? new Set\(phaseReadyIssues\.map\(\(issue\) => issue\.number\)\)/);
   assert.match(main, /readyIssues\.filter\(\(issue\) => allowedPhaseIssues\.has\(issue\.number\)\)/);
   assert.match(main, /promptArgs: \{ ALLOWED_ISSUES: phaseDescription \}/);
   assert.match(planner, /This run is limited to these issue IDs: \{\{ALLOWED_ISSUES\}\}/);

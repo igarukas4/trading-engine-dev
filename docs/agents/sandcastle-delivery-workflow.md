@@ -81,8 +81,10 @@ the deterministic selector cannot represent the real dependency graph.
 To run an approved delivery phase without changing ticket labels, set
 `SANDCASTLE_ISSUES` to its comma-separated issue numbers. The host selector
 filters to that list before it dispatches, while still treating every open
-issue as a blocker. The planner receives the same scope. Omit the variable only
-when the whole ready backlog is approved for one delivery run.
+issue as a blocker. The planner receives the same scope, but the host selector
+remains authoritative for a scoped phase even if the planner returns an empty
+or stale list. Omit the variable only when the whole ready backlog is approved
+for one delivery run.
 
 ## Credentials and trust boundary
 

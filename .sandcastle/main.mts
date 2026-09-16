@@ -122,9 +122,9 @@ async function nextUnblockedIssues(
       (issue) => issue.number,
     ),
   );
-  const plannedIssueNumbers = new Set(
-    plannedIssues.map((issue) => Number(issue.id)),
-  );
+  const plannedIssueNumbers = allowedPhaseIssues
+    ? new Set(phaseReadyIssues.map((issue) => issue.number))
+    : new Set(plannedIssues.map((issue) => Number(issue.id)));
 
   return selectDispatchableIssues(
     phaseReadyIssues,
