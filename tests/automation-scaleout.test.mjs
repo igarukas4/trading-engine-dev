@@ -10,8 +10,10 @@ test("automation mode is account-local and mode changes fence older Signals", ()
 from datetime import datetime, timezone, timedelta
 from backend.app.broker_accounts import AccountRegistry
 from backend.app.execution import ExecutionError, ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
 
 at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+now = datetime.now(timezone.utc)
 registry = AccountRegistry()
 accounts = [registry.register(provider="mt5", broker_server="demo", external_account_id=str(i), display_name=str(i), environment="DEMO") for i in range(3)]
 for account in accounts:
@@ -19,13 +21,15 @@ for account in accounts:
     account.bot_state = "RUNNING"
 engine = ExecutionSubstrate()
 payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
+def assessment(account_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
 old = at - timedelta(seconds=1)
 try:
     engine.schedule_automated_signal(account_id=accounts[0].id, signal_id="old", idempotency_key="old", mode="FULL_AUTO", signal_created_at=old, signal_revision=1, signal_eligible=True, signal_approved=False, mode_changed_at=at, risk_approved=True, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload=payload)
 except ExecutionError as error: assert error.code == "SIGNAL_PRECEDES_MODE_CHANGE"
 else: raise AssertionError("old Signal was auto-scheduled after mode change")
 for number, account in enumerate(accounts):
-    result = engine.schedule_automated_signal(account_id=account.id, signal_id=f"s-{number}", idempotency_key=f"i-{number}", mode="FULL_AUTO", signal_created_at=at, signal_revision=1, signal_eligible=True, signal_approved=False, mode_changed_at=at, risk_approved=True, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload=payload)
+    result = engine.schedule_automated_signal(account_id=account.id, signal_id=f"s-{number}", idempotency_key=f"i-{number}", mode="FULL_AUTO", signal_created_at=at, signal_revision=1, signal_eligible=True, signal_approved=False, mode_changed_at=at, risk_approved=True, risk_assessment=assessment(account.id), signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload=payload)
     assert result.order.account_id == account.id and result.order.dispatch_sequence == 1
 assert [len(engine.outbox(account.id)) for account in accounts] == [1, 1, 1]
 print("ok")

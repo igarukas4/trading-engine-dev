@@ -31,12 +31,65 @@ print("ok")
   assert.match(output, /ok/);
 });
 
+test("ExecutionSubstrate requires a fresh account-local PRE_ORDER assessment", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionError, ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
+engine = ExecutionSubstrate()
+engine.approve_signal(account_id="account-a", signal_id="manual", idempotency_key="approve-manual", reason="reviewed", confirmed=True, signal_revision=1)
+try:
+    engine.execute_signal(
+        account_id="account-a", signal_id="manual", idempotency_key="missing-risk",
+        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True,
+        execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
+else: raise AssertionError("manual execution accepted no PRE_ORDER assessment")
+
+initial = RiskAssessment("account-a", 1, True, purpose="INITIAL", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
+try:
+    engine.execute_signal(
+        account_id="account-a", signal_id="manual", idempotency_key="initial-risk",
+        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        risk_assessment=initial, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
+else: raise AssertionError("INITIAL assessment created a manual order")
+
+foreign = RiskAssessment("account-b", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
+try:
+    engine.schedule_automated_signal(
+        account_id="account-a", signal_id="semi", idempotency_key="foreign-risk",
+        mode="SEMI_AUTO", signal_created_at=now, signal_revision=1, signal_eligible=True,
+        signal_approved=True, mode_changed_at=now, risk_approved=True,
+        risk_assessment=foreign, signal_fresh=True, fence_safe=True, account_state="RUNNING",
+        live_lock=True, execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "RISK_ASSESSMENT_ACCOUNT_MISMATCH"
+else: raise AssertionError("foreign assessment created a semi-auto order")
+assert not engine.orders and not engine.reservations
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
 test("execute requires every gate and broker-native protection", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionError, ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
 engine = ExecutionSubstrate()
 engine.approve_signal(account_id="a", signal_id="s", idempotency_key="a1", reason="reviewed", confirmed=True, signal_revision=1)
-kwargs = dict(account_id="a", signal_id="s", idempotency_key="e1", reason="confirmed execution", confirmed=True, signal_revision=1, risk_approved=True, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1)
+now = datetime.now(timezone.utc)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
+kwargs = dict(account_id="a", signal_id="s", idempotency_key="e1", reason="confirmed execution", confirmed=True, signal_revision=1, risk_approved=True, risk_assessment=assessment, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1)
 try: engine.execute_signal(**kwargs, order_payload={})
 except ExecutionError as error: assert error.code == "NATIVE_PROTECTION_REQUIRED"
 else: raise AssertionError("unprotected entry accepted")

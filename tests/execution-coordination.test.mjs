@@ -29,6 +29,7 @@ with TemporaryDirectory() as directory:
     created = engine.accept_execution(
         account_id="account-a", signal_id="signal-a", idempotency_key="command-a",
         canonical_hash="request-a", execution_epoch=1, risk_assessment=assessment,
+        signal_revision=2,
         order_payload={"symbol": "EURUSD", "side": "BUY", "volume": "1", "stop_loss": "90", "take_profit": "110"},
         now=now,
     )
@@ -78,19 +79,24 @@ from backend.app.risk_calendar import RiskAssessment
 
 now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 def assessment(account):
-    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10))
+    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1)
 
 engine = ExecutionCoordinator()
 try:
     engine.accept_execution(account_id="a", signal_id="s", idempotency_key="bad", canonical_hash="h", execution_epoch=1,
-        risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10)),
+        risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1), signal_revision=1,
         order_payload={"volume": "1"}, now=now)
 except ExecutionError as error: assert error.code == "PRE_ORDER_RISK_REJECTED"
 else: raise AssertionError("rejected assessment accepted")
+try:
+    engine.accept_execution(account_id="a", signal_id="s", idempotency_key="stale-revision", canonical_hash="stale", execution_epoch=1,
+        risk_assessment=assessment("a"), signal_revision=2, order_payload={"volume": "1"}, now=now)
+except ExecutionError as error: assert error.code == "SIGNAL_REVISION_CHANGED"
+else: raise AssertionError("assessment from another revision accepted")
 
 def order(account, key):
     return engine.accept_execution(account_id=account, signal_id=key, idempotency_key=key, canonical_hash=key,
-        execution_epoch=1, risk_assessment=assessment(account), order_payload={"symbol": "EURUSD", "volume": "1"}, now=now).order
+        execution_epoch=1, risk_assessment=assessment(account), signal_revision=1, order_payload={"symbol": "EURUSD", "volume": "1"}, now=now).order
 
 net_a = order("a", "net-a")
 net_b = order("a", "net-b")
@@ -277,12 +283,12 @@ class Broker:
     def broker_state(self, order): return {"status": "FILLED", "external_id": "mt5-order-reconciled"}
 
 now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10))
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1)
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path)
     created = engine.accept_execution(account_id="a", signal_id="s", idempotency_key="k", canonical_hash="h", execution_epoch=1,
-        risk_assessment=assessment, order_payload={"volume": "1"}, now=now)
+        risk_assessment=assessment, signal_revision=1, order_payload={"volume": "1"}, now=now)
     broker = Broker()
     assert engine.dispatch_next("a", broker).status == "UNKNOWN"
     assert engine.account("a").exposure_gate == "QUARANTINED"

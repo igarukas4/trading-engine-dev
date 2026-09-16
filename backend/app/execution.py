@@ -349,6 +349,26 @@ class ExecutionSubstrate:
     def account(self, account_id: str) -> AccountExecutionState:
         return self._accounts.setdefault(account_id, AccountExecutionState(account_id))
 
+    def _assessment_is_fresh(
+        self,
+        account_id: str,
+        assessment: RiskAssessment,
+        now: datetime,
+        signal_revision: int | None = None,
+    ) -> None:
+        if assessment.broker_account_id != account_id:
+            raise ExecutionError("RISK_ASSESSMENT_ACCOUNT_MISMATCH")
+        if assessment.purpose != "PRE_ORDER":
+            raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
+        if not assessment.approved:
+            raise ExecutionError("PRE_ORDER_RISK_REJECTED")
+        if signal_revision is not None and assessment.signal_revision != signal_revision:
+            raise ExecutionError("SIGNAL_REVISION_CHANGED")
+        if assessment.assessed_at is None or assessment.valid_until is None:
+            raise ExecutionError("RISK_ASSESSMENT_NOT_FRESH")
+        if now < assessment.assessed_at or now >= assessment.valid_until:
+            raise ExecutionError("RISK_ASSESSMENT_EXPIRED")
+
     def _accept_execution(
         self,
         *,
@@ -362,6 +382,11 @@ class ExecutionSubstrate:
         order_payload: dict[str, Any],
         risk_amount: str,
     ) -> PreOrderResult:
+        if risk_assessment is None:
+            raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
+        self._assessment_is_fresh(
+            account_id, risk_assessment, _now(), signal_revision
+        )
         return self.pre_order(
             account_id=account_id,
             signal_id=signal_id,
@@ -1239,26 +1264,6 @@ class ExecutionCoordinator(ExecutionSubstrate):
             AuditEvent(str(uuid4()), account_id, event_type, payload, _now())
         )
 
-    def _assessment_is_fresh(
-        self,
-        account_id: str,
-        assessment: RiskAssessment,
-        now: datetime,
-        signal_revision: int | None = None,
-    ) -> None:
-        if assessment.broker_account_id != account_id:
-            raise ExecutionError("RISK_ASSESSMENT_ACCOUNT_MISMATCH")
-        if assessment.purpose != "PRE_ORDER":
-            raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
-        if not assessment.approved:
-            raise ExecutionError("PRE_ORDER_RISK_REJECTED")
-        if signal_revision is not None and assessment.signal_revision != signal_revision:
-            raise ExecutionError("SIGNAL_REVISION_CHANGED")
-        if assessment.assessed_at is None or assessment.valid_until is None:
-            raise ExecutionError("RISK_ASSESSMENT_NOT_FRESH")
-        if now < assessment.assessed_at or now >= assessment.valid_until:
-            raise ExecutionError("RISK_ASSESSMENT_EXPIRED")
-
     def _accept_execution(
         self,
         *,
@@ -1296,7 +1301,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         execution_epoch: int,
         risk_assessment: RiskAssessment,
         order_payload: dict[str, Any],
-        signal_revision: int | None = None,
+        signal_revision: int,
         risk_amount: str | Decimal = "0",
         now: datetime | None = None,
     ) -> PreOrderResult:
