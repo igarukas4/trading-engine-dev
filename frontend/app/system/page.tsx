@@ -31,6 +31,7 @@ type AuditEvent = {
 type Recovery = {
   kind: string;
   order_id: string;
+  subject_id?: string;
   status: string;
   reason: string;
   recovery_legal: boolean;
@@ -115,6 +116,30 @@ export default function SystemPage() {
       setAudit(snapshot.audit_events ?? []);
       setRecovery(snapshot.recovery ?? []);
     }).catch(() => setStatus(null));
+  }, []);
+
+  useEffect(() => {
+    const account = new URLSearchParams(window.location.search).get("account");
+    if (!account) return;
+    const socket = new WebSocket(`${apiBase.replace(/^http/, "ws")}/ws/v1/dashboard`);
+    socket.onopen = () => socket.send(JSON.stringify({
+      account_cursors: { [account]: 0 }, system_cursor: 0,
+    }));
+    socket.onmessage = (event) => {
+      const message = JSON.parse(event.data) as { type?: string; broker_account_id?: string };
+      if (
+        message.broker_account_id === account
+        && (message.type?.startsWith("execution.reconciliation") || message.type?.startsWith("critical.reconciliation"))
+      ) {
+        fetchJson<{ audit_events?: AuditEvent[]; recovery?: Recovery[] }>(
+          `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
+        ).then((snapshot) => {
+          setAudit(snapshot.audit_events ?? []);
+          setRecovery(snapshot.recovery ?? []);
+        }).catch(() => undefined);
+      }
+    };
+    return () => socket.close();
   }, []);
 
   async function resume(operation: Emergency) {
@@ -232,7 +257,7 @@ export default function SystemPage() {
         <h2>Recovery & reconciliation</h2>
         {recovery.length ? recovery.map((item) => (
           <p key={item.order_id} className="warning">
-            {item.kind} · {item.order_id} · {item.status} · {item.reason}{" "}
+            {item.kind} · {item.subject_id ?? item.order_id} · {item.status} · {item.reason}{" "}
             {item.status === "RECOVERED"
               ? "· Pemulihan otomatis selesai"
               : item.critical

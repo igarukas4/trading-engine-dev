@@ -423,8 +423,8 @@ with TemporaryDirectory() as directory:
 
     stuck = accept(restarted, "account-a", "signal-stuck")
     restarted.dispatch_next("account-a", Broker())
-    records = restarted.reconcile_due("account-a", Broker(), now=at + timedelta(seconds=31))
-    assert records[0].status == "UNKNOWN"
+    records = restarted.advance_recovery_deadlines(now=at + timedelta(seconds=31))
+    assert records[0].subject_id == stuck.id
     escalated = [item for item in restarted.recovery_records("account-a") if item["subject_id"] == stuck.id][0]
     assert escalated["status"] == "ESCALATED" and escalated["critical"]
     assert restarted.account("account-a").exposure_gate == "QUARANTINED"
@@ -433,6 +433,79 @@ with TemporaryDirectory() as directory:
         accept(restarted, "account-a", "signal-after-deadline")
     except ExecutionError as error: assert error.code == "EXPOSURE_GATE_CLOSED"
     else: raise AssertionError("escalated account accepted new exposure")
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("connector reconnect requests and applies account-scoped reconciliation work", () => {
+  const output = run(`
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from starlette.websockets import WebSocketDisconnect
+
+from backend.app.main import accounts, connector_stream, dashboard_hub, execution
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def order_check(self, order): return True
+    def order_send(self, order): return "TIMEOUT"
+
+now = datetime.now(timezone.utc)
+account = accounts.register(provider="mt5", broker_server="demo", external_account_id="reconcile-1", display_name="reconcile", environment="DEMO")
+secret = "x" * 32
+key_id = accounts.bind_connector(account.id, secret)
+assessment = RiskAssessment(account.id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+created = execution.accept_execution(account_id=account.id, signal_id="signal", idempotency_key="reconcile", canonical_hash="reconcile", execution_epoch=1,
+    risk_assessment=assessment, signal_revision=1, order_payload={"volume": "1"}, now=now)
+assert execution.dispatch_next(account.id, Broker()).status == "UNKNOWN"
+
+class Socket:
+    def __init__(self, messages): self.messages = iter(messages); self.sent = []
+    async def accept(self): pass
+    async def receive_json(self):
+        try: return next(self.messages)
+        except StopIteration: raise WebSocketDisconnect()
+    async def send_json(self, message): self.sent.append(message)
+    async def close(self, **kwargs): self.sent.append({"type": "closed", **kwargs})
+
+socket = Socket([
+    {"type": "hello", "account_id": account.id, "provider": "mt5", "broker_server": "demo", "external_account_id": "reconcile-1", "key_id": key_id, "secret": secret, "generation": 0, "session_id": "session"},
+    {"type": "reconciliation_observation", "account_id": account.id, "generation": 0, "observation": {"orders": [{"order_id": created.order.id, "status": "SUBMITTED", "external_id": "mt5-1"}]}},
+    {"type": "reconciliation_observation", "account_id": account.id, "generation": 0, "observation": {"account_id": "other"}},
+    {"type": "reconciliation_observation", "account_id": account.id, "generation": 0, "observation": "invalid"},
+])
+asyncio.run(connector_stream(socket))
+assert socket.sent and socket.sent[0]["type"] == "snapshot", socket.sent
+assert socket.sent[1]["type"] == "reconciliation.required" and socket.sent[1]["account_id"] == account.id
+assert socket.sent[2]["type"] == "reconciliation_observed"
+assert socket.sent[3]["code"] == "WRONG_ACCOUNT"
+assert socket.sent[4]["code"] == "INVALID_RECONCILIATION_OBSERVATION"
+
+assert execution.orders[created.order.id].status == "SUBMITTED"
+assert execution.account(account.id).exposure_gate == "OPEN"
+assert any(event["type"] == "execution.reconciliation.observed" for event in dashboard_hub.connect({"account_cursors": {account.id: 0}})["events"])
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("ambiguous close-all and position commands stay UNKNOWN until broker observations resolve them", () => {
+  const output = run(`
+from backend.app.execution import ExecutionCoordinator
+
+class Broker:
+    def close_all(self, account_id): return None
+
+engine = ExecutionCoordinator()
+close = engine.close_all(account_id="a", idempotency_key="close", reason="operator", confirmed=True, connector=Broker())
+assert close.status == "UNKNOWN"
+work = engine.recovery_records("a")[0]
+assert work["subject_id"] == close.id and work["kind"] == "COMMAND"
+engine.reconcile_observation("a", {"commands": [{"command_id": close.id, "status": "CONFIRMED"}]})
+assert close.status == "EXECUTED" and engine.recovery_records("a")[0]["status"] == "RECOVERED"
 print("ok")
 `);
   assert.match(output, /ok/);

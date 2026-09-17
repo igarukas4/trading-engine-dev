@@ -230,7 +230,7 @@ class ReconciliationWork:
     id: str
     account_id: str
     subject_id: str
-    subject_kind: Literal["ORDER", "POSITION_COMMAND"]
+    subject_kind: Literal["ORDER", "POSITION_COMMAND", "COMMAND"]
     first_seen_at: datetime
     deadline_at: datetime
     status: Literal["PENDING", "RECOVERED", "ESCALATED"] = "PENDING"
@@ -343,7 +343,7 @@ class OperatorCommand:
     idempotency_key: str
     reason: str
     confirmed: bool
-    status: Literal["ACCEPTED", "REJECTED", "EXECUTED"]
+    status: Literal["ACCEPTED", "REJECTED", "EXECUTED", "UNKNOWN"]
     rejection_code: str | None = None
     order_id: str | None = None
 
@@ -715,6 +715,7 @@ class ExecutionSubstrate:
                     isinstance(response, dict) and response.get("status") == "UNKNOWN"
                 )
                 if response_is_ambiguous:
+                    command.status = "UNKNOWN"
                     command.rejection_code = "RECONCILIATION_PENDING"
                 else:
                     command.status = "EXECUTED"
@@ -1369,7 +1370,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def _work_for(
         self, account_id: str, subject_id: str,
-        subject_kind: Literal["ORDER", "POSITION_COMMAND"] | None = None,
+        subject_kind: Literal["ORDER", "POSITION_COMMAND", "COMMAND"] | None = None,
     ) -> ReconciliationWork | None:
         return next(
             (
@@ -1383,7 +1384,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def _record_unknown(
         self, account_id: str, order_id: str, *, now: datetime | None = None,
-        subject_kind: Literal["ORDER", "POSITION_COMMAND"] = "ORDER",
+        subject_kind: Literal["ORDER", "POSITION_COMMAND", "COMMAND"] = "ORDER",
     ) -> ReconciliationWork:
         """Persist recovery work before the account is fenced from new exposure."""
         existing = self._work_for(account_id, order_id, subject_kind)
@@ -1432,6 +1433,39 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 order_id=order_id, status=order.status,
             )
         self._restore_temporary_entry_eligibility(account_id)
+
+    def _complete_non_order_work_if_converged(
+        self, account_id: str, subject_id: str,
+        subject_kind: Literal["POSITION_COMMAND", "COMMAND"],
+    ) -> None:
+        work = self._work_for(account_id, subject_id, subject_kind)
+        if work is None:
+            return
+        work.status = "RECOVERED"
+        self._audit(
+            account_id, "execution.reconciliation.converged",
+            subject_id=subject_id, subject_kind=subject_kind,
+        )
+        self._restore_temporary_entry_eligibility(account_id)
+
+    def advance_recovery_deadlines(
+        self, *, now: datetime | None = None,
+    ) -> tuple[ReconciliationWork, ...]:
+        """Escalate overdue work even while its connector is disconnected."""
+        at = now or _now()
+        escalated: list[ReconciliationWork] = []
+        with self._mutation():
+            for work in self.reconciliation_work.values():
+                if work.status == "PENDING" and at >= work.deadline_at:
+                    work.status = "ESCALATED"
+                    escalated.append(work)
+                    self._audit(
+                        work.account_id, "execution.reconciliation.escalated",
+                        subject_id=work.subject_id,
+                        subject_kind=work.subject_kind,
+                        deadline_at=work.deadline_at.isoformat(),
+                    )
+        return tuple(escalated)
 
     def recovery_records(self, account_id: str) -> list[dict[str, Any]]:
         """Dashboard-safe, account-scoped recovery progress."""
@@ -1619,12 +1653,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             ]
             for work in due:
                 if at >= work.deadline_at:
-                    work.status = "ESCALATED"
-                    self._audit(
-                        account_id, "execution.reconciliation.escalated",
-                        order_id=work.subject_id,
-                        deadline_at=work.deadline_at.isoformat(),
-                    )
+                    self.advance_recovery_deadlines(now=at)
                     results.append(DispatchResult(work.subject_id, "UNKNOWN", "ESCALATION_DEADLINE_EXCEEDED"))
                     continue
                 work.attempts += 1
@@ -1650,7 +1679,12 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def close_all(self, **kwargs: Any) -> OperatorCommand:
         with self._mutation():
-            return super().close_all(**kwargs)
+            command = super().close_all(**kwargs)
+            if command.status == "UNKNOWN":
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="COMMAND",
+                )
+            return command
 
     def begin_global_emergency(self, *args: Any, **kwargs: Any) -> GlobalEmergencyOperation:
         with self._mutation():
@@ -1676,7 +1710,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         with self._mutation():
             command = super().mark_position_command_unknown(*args, **kwargs)
             self._record_unknown(
-                command.account_id, command.order_id,
+                command.account_id, command.id,
                 subject_kind="POSITION_COMMAND",
             )
             return command
@@ -1784,6 +1818,41 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     order.status = item["status"]
                 if item.get("external_id") is not None:
                     order.external_id = str(item["external_id"])
+            for item in observation.get("commands", ()):
+                command_id = str(item.get("command_id", ""))
+                command = self.commands.get(command_id)
+                if command is None or command.account_id != account_id:
+                    raise ExecutionError("WRONG_ACCOUNT")
+                observed_status = str(item.get("status", ""))
+                if observed_status in {"CONFIRMED", "EXECUTED"}:
+                    command.status = "EXECUTED"
+                    self._complete_non_order_work_if_converged(
+                        account_id, command.id, "COMMAND"
+                    )
+                elif observed_status in {"REJECTED", "CANCELLED", "NOT_FOUND"}:
+                    command.status = "REJECTED"
+                    self._complete_non_order_work_if_converged(
+                        account_id, command.id, "COMMAND"
+                    )
+            for item in observation.get("position_commands", ()):
+                command_id = str(item.get("command_id", ""))
+                command = next(
+                    (value for value in self.position_commands if value.id == command_id),
+                    None,
+                )
+                if command is None or command.account_id != account_id:
+                    raise ExecutionError("WRONG_ACCOUNT")
+                observed_status = str(item.get("status", ""))
+                if observed_status == "CONFIRMED":
+                    command.status = "CONFIRMED"
+                    self._complete_non_order_work_if_converged(
+                        account_id, command.id, "POSITION_COMMAND"
+                    )
+                elif observed_status in {"REJECTED", "CANCELLED", "NOT_FOUND"}:
+                    command.status = "REJECTED"
+                    self._complete_non_order_work_if_converged(
+                        account_id, command.id, "POSITION_COMMAND"
+                    )
             for item in observation.get("fills", ()):
                 deal_id = str(item.get("deal_id", item.get("external_deal_id", "")))
                 order_id = str(item.get("order_id", ""))

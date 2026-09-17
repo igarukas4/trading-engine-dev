@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote
 from copy import deepcopy
@@ -89,7 +91,35 @@ class SystemStatus(TypedDict):
 
 
 settings = Settings.from_environment()
-app = FastAPI(title=settings.app_name, version=settings.version, docs_url="/docs")
+
+
+async def _recovery_deadline_worker() -> None:
+    while True:
+        for work in execution.advance_recovery_deadlines():
+            _audit(
+                work.account_id,
+                "critical.reconciliation.deadline_exceeded",
+                "broker reconciliation deadline exceeded",
+                {"subject_id": work.subject_id, "subject_kind": work.subject_kind},
+            )
+        await asyncio.sleep(5)
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    worker = asyncio.create_task(_recovery_deadline_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+
+
+app = FastAPI(
+    title=settings.app_name, version=settings.version, docs_url="/docs",
+    lifespan=_lifespan,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.public_origin],
@@ -1314,6 +1344,22 @@ def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str,
     return {"order_id": scheduled.order.id, "status": scheduled.order.status}
 
 
+def _attach_full_auto_result(
+    response: dict[str, Any], signal: Any, account: BrokerAccount,
+) -> dict[str, Any]:
+    try:
+        scheduled = _schedule_full_auto_signal(signal, account)
+    except ExecutionError as error:
+        _audit(
+            account.id, "execution.full_auto.held", error.code,
+            {"signal_id": signal.id, "reason_code": error.code},
+        )
+        scheduled = {"status": "HELD", "reason_code": error.code}
+    if scheduled is not None:
+        response["full_auto"] = scheduled
+    return response
+
+
 def _account_data_status(account_id: str) -> dict[str, Any]:
     """Expose the conservative dashboard gate for account-owned broker data."""
     account = accounts.accounts[account_id]
@@ -1438,20 +1484,7 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    response = signal.as_dict()
-    try:
-        scheduled = _schedule_full_auto_signal(signal, account)
-    except ExecutionError as error:
-        # A current runtime gate may hold entry, but does not rewrite the
-        # immutable Signal's eligibility or invent a second safety state.
-        _audit(
-            account_id, "execution.full_auto.held", error.code,
-            {"signal_id": signal.id, "reason_code": error.code},
-        )
-        scheduled = {"status": "HELD", "reason_code": error.code}
-    if scheduled is not None:
-        response["full_auto"] = scheduled
-    return response
+    return _attach_full_auto_result(signal.as_dict(), signal, account)
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/signals", tags=["signals"])
@@ -1479,18 +1512,9 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
     limits = risk_limits.active(account_id)
     revised = signals.create_revision(signal_id, policy_version=policy_version,
                                       limits=limits)
-    response = revised.as_dict()
-    try:
-        scheduled = _schedule_full_auto_signal(revised, accounts.accounts[account_id])
-    except ExecutionError as error:
-        _audit(
-            account_id, "execution.full_auto.held", error.code,
-            {"signal_id": revised.id, "reason_code": error.code},
-        )
-        scheduled = {"status": "HELD", "reason_code": error.code}
-    if scheduled is not None:
-        response["full_auto"] = scheduled
-    return response
+    return _attach_full_auto_result(
+        revised.as_dict(), revised, accounts.accounts[account_id]
+    )
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
@@ -1827,6 +1851,16 @@ async def connector_stream(websocket: WebSocket) -> None:
             await websocket.close(code=1008, reason=error.code)
             return
         await websocket.send_json({"type": "snapshot", "snapshot": accounts.read_only_snapshot(account.id)})
+        pending_recovery = [
+            record for record in execution.recovery_records(account.id)
+            if record["recovery_legal"]
+        ]
+        if pending_recovery:
+            await websocket.send_json({
+                "type": "reconciliation.required",
+                "account_id": account.id,
+                "recovery": pending_recovery,
+            })
         while True:
             message = await websocket.receive_json()
             if message.get("account_id") != account.id or message.get("generation") != account.connector_generation:
