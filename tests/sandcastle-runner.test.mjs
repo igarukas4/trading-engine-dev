@@ -71,15 +71,15 @@ test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {
 test("Sandcastle uses the canonical role-specific Codex profiles", () => {
   assert.match(
     main,
-    /const plannerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const plannerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "xhigh",/,
   );
   assert.match(
     main,
-    /const implementerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const implementerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "xhigh",/,
   );
   assert.match(
     main,
-    /const reviewerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const reviewerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "xhigh",/,
   );
   assert.match(
     main,

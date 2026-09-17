@@ -151,17 +151,17 @@ const MAX_CONCURRENT_ISSUES = 3;
 // These checked-in role profiles are the canonical Sandcastle configuration.
 // Change a profile only as a reviewed runner configuration change.
 const plannerAgent = sandcastle.codex("gpt-5.6-luna", {
-  effort: "high",
+  effort: "xhigh",
   captureSessions: false,
 });
 
 const implementerAgent = sandcastle.codex("gpt-5.6-luna", {
-  effort: "high",
+  effort: "xhigh",
   captureSessions: false,
 });
 
 const reviewerAgent = sandcastle.codex("gpt-5.6-luna", {
-  effort: "high",
+  effort: "xhigh",
   captureSessions: false,
 });
 
