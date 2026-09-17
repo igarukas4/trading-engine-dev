@@ -34,6 +34,9 @@ type Recovery = {
   status: string;
   reason: string;
   recovery_legal: boolean;
+  deadline_at?: string;
+  attempts?: number;
+  critical?: boolean;
 };
 type Target = { account_id: string; status: string; detail?: string | null };
 type Emergency = {
@@ -230,7 +233,15 @@ export default function SystemPage() {
         {recovery.length ? recovery.map((item) => (
           <p key={item.order_id} className="warning">
             {item.kind} · {item.order_id} · {item.status} · {item.reason}{" "}
-            {item.recovery_legal ? "· Recovery tersedia" : `· ${ATTENTION_REQUIRED}`}
+            {item.status === "RECOVERED"
+              ? "· Pemulihan otomatis selesai"
+              : item.critical
+                ? `· ${ATTENTION_REQUIRED}`
+                : item.recovery_legal
+                  ? "· Recovery otomatis berjalan"
+                  : `· ${ATTENTION_REQUIRED}`}
+            {item.deadline_at ? ` · Deadline ${new Date(item.deadline_at).toLocaleString("id-ID")}` : ""}
+            {item.attempts !== undefined ? ` · Percobaan ${item.attempts}` : ""}
           </p>
         )) : <p>Tidak ada recovery yang dinyatakan legal oleh backend.</p>}
       </section>

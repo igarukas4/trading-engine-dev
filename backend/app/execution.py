@@ -14,7 +14,7 @@ import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator, Literal, Protocol
@@ -221,6 +221,22 @@ class ReconciliationResult:
     applied_fill_ids: tuple[str, ...] = ()
     duplicate_fill_ids: tuple[str, ...] = ()
     position_ids: tuple[str, ...] = ()
+
+
+@dataclass
+class ReconciliationWork:
+    """Durable, account-local follow-up for an ambiguous broker effect."""
+
+    id: str
+    account_id: str
+    subject_id: str
+    subject_kind: Literal["ORDER", "POSITION_COMMAND"]
+    first_seen_at: datetime
+    deadline_at: datetime
+    status: Literal["PENDING", "RECOVERED", "ESCALATED"] = "PENDING"
+    attempts: int = 0
+    last_attempt_at: datetime | None = None
+    reason: str = "CONNECTOR_RESULT_AMBIGUOUS"
 
 
 class ExecutionStateStore(Protocol):
@@ -747,6 +763,11 @@ class ExecutionSubstrate:
 
     def dispatch_next(self, account_id: str, connector: Any) -> DispatchResult:
         with self._lock_for(account_id):
+            if any(
+                order.account_id == account_id and order.status == "UNKNOWN"
+                for order in self.orders.values()
+            ):
+                raise ExecutionError("RECONCILIATION_PENDING")
             pending = self.outbox(account_id)
             if not pending:
                 raise ExecutionError("DISPATCH_EMPTY")
@@ -809,7 +830,10 @@ class ExecutionSubstrate:
             except Exception:
                 observed = None
             if not observed:
-                observed = connector.broker_state(order)
+                try:
+                    observed = connector.broker_state(order)
+                except Exception:
+                    observed = None
             if not observed:
                 return DispatchResult(order.id, "UNKNOWN", "RECONCILIATION_PENDING")
             if isinstance(observed, dict):
@@ -823,6 +847,10 @@ class ExecutionSubstrate:
                 order.external_id = external_id
                 journal.state = "ACCEPTED"
                 self._reservation_for(order.id).status = "CONSUMED"
+            elif status in {"ACCEPTED", "SUBMITTED", "PARTIALLY_FILLED"}:
+                order.status = "PARTIALLY_FILLED" if status == "PARTIALLY_FILLED" else "SUBMITTED"
+                order.external_id = external_id
+                journal.state = "ACCEPTED"
             elif status in {"REJECTED", "NOT_FOUND"}:
                 order.status = "REJECTED"
                 journal.state = "REJECTED"
@@ -1173,8 +1201,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
         *,
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
+        reconciliation_deadline: timedelta = timedelta(minutes=5),
     ) -> None:
         super().__init__()
+        if reconciliation_deadline <= timedelta(0):
+            raise ValueError("reconciliation_deadline must be positive")
         configured_stores = sum(
             value is not None for value in (state_store, state_path, database_url)
         )
@@ -1189,6 +1220,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
         else:
             self._state_store = None
         self._mutation_depth = 0
+        self.reconciliation_deadline = reconciliation_deadline
+        self.reconciliation_work: dict[str, ReconciliationWork] = {}
         self.audit_events: list[AuditEvent] = []
         self.risk_assessments: dict[str, dict[str, Any]] = {}
         if self._state_store is not None:
@@ -1221,6 +1254,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 },
                 "order_reservations": self._order_reservations,
                 "risk_assessments": self.risk_assessments,
+                "reconciliation_work": {
+                    key: value.__dict__
+                    for key, value in self.reconciliation_work.items()
+                },
                 "global_emergencies": {
                     key: {
                         **value.__dict__,
@@ -1292,6 +1329,12 @@ class ExecutionCoordinator(ExecutionSubstrate):
             for value in state.get("audit_events", [])
         ]
         self.risk_assessments = state.get("risk_assessments", {})
+        for key, value in state.get("reconciliation_work", {}).items():
+            value["first_seen_at"] = _state_datetime(value["first_seen_at"])
+            value["deadline_at"] = _state_datetime(value["deadline_at"])
+            if value.get("last_attempt_at") is not None:
+                value["last_attempt_at"] = _state_datetime(value["last_attempt_at"])
+            self.reconciliation_work[key] = ReconciliationWork(**value)
         for key, value in state.get("global_emergencies", {}).items():
             targets = {
                 target_id: GlobalEmergencyTarget(**target)
@@ -1323,6 +1366,92 @@ class ExecutionCoordinator(ExecutionSubstrate):
         self.audit_events.append(
             AuditEvent(str(uuid4()), account_id, event_type, payload, _now())
         )
+
+    def _work_for(
+        self, account_id: str, subject_id: str,
+        subject_kind: Literal["ORDER", "POSITION_COMMAND"] | None = None,
+    ) -> ReconciliationWork | None:
+        return next(
+            (
+                item for item in self.reconciliation_work.values()
+                if item.account_id == account_id and item.subject_id == subject_id
+                and (subject_kind is None or item.subject_kind == subject_kind)
+                and item.status in {"PENDING", "ESCALATED"}
+            ),
+            None,
+        )
+
+    def _record_unknown(
+        self, account_id: str, order_id: str, *, now: datetime | None = None,
+        subject_kind: Literal["ORDER", "POSITION_COMMAND"] = "ORDER",
+    ) -> ReconciliationWork:
+        """Persist recovery work before the account is fenced from new exposure."""
+        existing = self._work_for(account_id, order_id, subject_kind)
+        if existing is not None:
+            return existing
+        observed_at = now or _now()
+        work = ReconciliationWork(
+            id=str(uuid4()), account_id=account_id, subject_id=order_id,
+            subject_kind=subject_kind, first_seen_at=observed_at,
+            deadline_at=observed_at + self.reconciliation_deadline,
+        )
+        self.reconciliation_work[work.id] = work
+        self.account(account_id).exposure_gate = "QUARANTINED"
+        self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
+        self._audit(
+            account_id, "execution.reconciliation.pending", order_id=order_id,
+            deadline_at=work.deadline_at.isoformat(), subject_kind=subject_kind,
+        )
+        return work
+
+    def _restore_temporary_entry_eligibility(self, account_id: str) -> None:
+        """Reopen only the temporary UNKNOWN fence after all local facts converge."""
+        unresolved = any(
+            item.account_id == account_id and item.status in {"PENDING", "ESCALATED"}
+            for item in self.reconciliation_work.values()
+        )
+        protection_unconfirmed = any(
+            position.account_id == account_id
+            and position.protection_status != "CONFIRMED"
+            for position in self.positions.values()
+        )
+        account = self.account(account_id)
+        if not unresolved and not protection_unconfirmed and account.exposure_gate == "QUARANTINED":
+            account.exposure_gate = "OPEN"
+            self._audit(account_id, "execution.reconciliation.recovered")
+
+    def _complete_work_if_converged(self, account_id: str, order_id: str) -> None:
+        order = self.orders.get(order_id)
+        if order is None or order.account_id != account_id or order.status == "UNKNOWN":
+            return
+        work = self._work_for(account_id, order_id, "ORDER")
+        if work is not None:
+            work.status = "RECOVERED"
+            self._audit(
+                account_id, "execution.reconciliation.converged",
+                order_id=order_id, status=order.status,
+            )
+        self._restore_temporary_entry_eligibility(account_id)
+
+    def recovery_records(self, account_id: str) -> list[dict[str, Any]]:
+        """Dashboard-safe, account-scoped recovery progress."""
+        with self._lock_for(account_id):
+            return [
+                {
+                    "kind": item.subject_kind,
+                    "order_id": item.subject_id,
+                    "subject_id": item.subject_id,
+                    "status": item.status,
+                    "reason": item.reason,
+                    "first_seen_at": item.first_seen_at.isoformat(),
+                    "deadline_at": item.deadline_at.isoformat(),
+                    "attempts": item.attempts,
+                    "critical": item.status == "ESCALATED",
+                    "recovery_legal": item.status == "PENDING",
+                }
+                for item in self.reconciliation_work.values()
+                if item.account_id == account_id
+            ]
 
     def _accept_execution(
         self,
@@ -1450,8 +1579,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         with self._mutation():
             result = super().dispatch_next(account_id, connector)
             if result.status == "UNKNOWN":
-                self.account(account_id).exposure_gate = "QUARANTINED"
-                self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
+                self._record_unknown(account_id, result.order_id)
             self._audit(
                 account_id,
                 "execution.dispatch",
@@ -1463,6 +1591,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def recover(self, account_id: str, order_id: str, connector: Any) -> DispatchResult:
         with self._mutation():
             result = super().recover(account_id, order_id, connector)
+            if result.status != "UNKNOWN":
+                self._complete_work_if_converged(account_id, order_id)
             self._audit(
                 account_id,
                 "execution.reconciled",
@@ -1470,6 +1600,41 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 status=result.status,
             )
             return result
+
+    def reconcile_due(
+        self, account_id: str, connector: Any, *, now: datetime | None = None,
+    ) -> tuple[DispatchResult, ...]:
+        """Run persisted UNKNOWN work without ever resending a broker command.
+
+        A scheduler or reconnect handler may call this repeatedly.  It only
+        reads journal/broker truth through ``recover``; dispatch is deliberately
+        absent from this path.
+        """
+        at = now or _now()
+        results: list[DispatchResult] = []
+        with self._mutation(), self._lock_for(account_id):
+            due = [
+                item for item in self.reconciliation_work.values()
+                if item.account_id == account_id and item.status == "PENDING"
+            ]
+            for work in due:
+                if at >= work.deadline_at:
+                    work.status = "ESCALATED"
+                    self._audit(
+                        account_id, "execution.reconciliation.escalated",
+                        order_id=work.subject_id,
+                        deadline_at=work.deadline_at.isoformat(),
+                    )
+                    results.append(DispatchResult(work.subject_id, "UNKNOWN", "ESCALATION_DEADLINE_EXCEEDED"))
+                    continue
+                work.attempts += 1
+                work.last_attempt_at = at
+                if work.subject_kind != "ORDER":
+                    results.append(DispatchResult(work.subject_id, "UNKNOWN", "RECONCILIATION_PENDING"))
+                    continue
+                result = self.recover(account_id, work.subject_id, connector)
+                results.append(result)
+            return tuple(results)
 
     def record_fill(self, *args: Any, **kwargs: Any) -> Fill:
         with self._mutation():
@@ -1509,7 +1674,12 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def mark_position_command_unknown(self, *args: Any, **kwargs: Any) -> PositionCommand:
         with self._mutation():
-            return super().mark_position_command_unknown(*args, **kwargs)
+            command = super().mark_position_command_unknown(*args, **kwargs)
+            self._record_unknown(
+                command.account_id, command.order_id,
+                subject_kind="POSITION_COMMAND",
+            )
+            return command
 
     def confirm_protection(self, *args: Any, **kwargs: Any) -> Position:
         with self._mutation():
@@ -1655,6 +1825,14 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 account_id, "execution.observation.reconciled",
                 applied_fill_ids=tuple(applied), duplicate_fill_ids=tuple(duplicates),
             )
+            reconciled_order_ids = {
+                str(item.get("order_id", "")) for item in observation.get("orders", ())
+            }
+            reconciled_order_ids.update(
+                str(item.get("order_id", "")) for item in observation.get("fills", ())
+            )
+            for order_id in reconciled_order_ids:
+                self._complete_work_if_converged(account_id, order_id)
             return ReconciliationResult(
                 account_id,
                 status,

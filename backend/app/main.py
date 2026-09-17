@@ -626,17 +626,7 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
         for event in execution.audit_events
         if event.account_id == account_id
     ]
-    recovery = [
-        {
-            "kind": "ORDER_RECONCILIATION",
-            "order_id": order.id,
-            "status": order.status,
-            "reason": "CONNECTOR_RESULT_AMBIGUOUS",
-            "recovery_legal": order.status == "UNKNOWN",
-        }
-        for order in execution.orders.values()
-        if order.account_id == account_id and order.status == "UNKNOWN"
-    ]
+    recovery = execution.recovery_records(account_id)
     return {
         "account_id": account_id,
         "account": accounts.read_only_snapshot(account_id),
@@ -701,10 +691,23 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
             for account in available
         ],
         "critical_alerts": [
-            event
-            for account in available
-            for event in audit_hub.events.get(account.id, [])
-            if event["event_type"].startswith("critical")
+            *[
+                event
+                for account in available
+                for event in audit_hub.events.get(account.id, [])
+                if event["event_type"].startswith("critical")
+            ],
+            *[
+                {
+                    "id": f"reconciliation:{account.id}:{record['subject_id']}",
+                    "event_type": "critical.reconciliation.deadline_exceeded",
+                    "broker_account_id": account.id,
+                    "recovery": record,
+                }
+                for account in available
+                for record in execution.recovery_records(account.id)
+                if record["critical"]
+            ],
         ],
         "global_emergency": [_global_emergency_payload(operation) for operation in execution.global_emergencies.values()],
         "account_watermarks": {
@@ -1266,6 +1269,51 @@ def _pre_order_risk_assessment(
     )
 
 
+def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str, Any] | None:
+    """Route a newly eligible Signal through the one execution seam.
+
+    This is deliberately a thin caller: FULL_AUTO eligibility, risk freshness,
+    idempotency, account scope, and the exposure gate remain owned by
+    Execution Coordination.
+    """
+    if account.execution_mode != "FULL_AUTO" or signal.as_dict()["status"] != "ELIGIBLE":
+        return None
+    opportunity = signal.opportunity
+    payload = {
+        "symbol": str(opportunity.get("pair", "")),
+        "side": "BUY" if opportunity.get("direction") == "LONG" else "SELL",
+        "stop_loss": str(signal.stop_loss),
+        "take_profit": [str(value) for value in signal.take_profit],
+        "signal_revision": signal.revision,
+    }
+    with execution.account_lock(account.id):
+        assessment = _pre_order_risk_assessment(account.id, signal, account)
+        scheduled = execution.schedule_automated_signal(
+            account_id=account.id,
+            signal_id=signal.id,
+            idempotency_key=f"full-auto:{signal.id}:revision:{signal.revision}",
+            mode="FULL_AUTO",
+            signal_created_at=signal.created_at,
+            signal_revision=signal.revision,
+            signal_eligible=True,
+            signal_approved=False,
+            mode_changed_at=account.mode_changed_at,
+            risk_assessment=assessment,
+            signal_fresh=signal.as_dict()["status"] == "ELIGIBLE",
+            fence_safe=execution.account(account.id).exposure_gate == "OPEN",
+            account_state=account.bot_state,
+            live_lock=account.connector_healthy and account.connector_bound,
+            execution_epoch=execution.account(account.id).execution_epoch,
+            risk_amount=str(signal.risk_context["requested_risk"]),
+            order_payload=payload,
+        )
+    _audit(
+        account.id, "execution.full_auto.scheduled", "eligible Signal scheduled",
+        {"signal_id": signal.id, "order_id": scheduled.order.id},
+    )
+    return {"order_id": scheduled.order.id, "status": scheduled.order.status}
+
+
 def _account_data_status(account_id: str) -> dict[str, Any]:
     """Expose the conservative dashboard gate for account-owned broker data."""
     account = accounts.accounts[account_id]
@@ -1390,7 +1438,20 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    return signal.as_dict()
+    response = signal.as_dict()
+    try:
+        scheduled = _schedule_full_auto_signal(signal, account)
+    except ExecutionError as error:
+        # A current runtime gate may hold entry, but does not rewrite the
+        # immutable Signal's eligibility or invent a second safety state.
+        _audit(
+            account_id, "execution.full_auto.held", error.code,
+            {"signal_id": signal.id, "reason_code": error.code},
+        )
+        scheduled = {"status": "HELD", "reason_code": error.code}
+    if scheduled is not None:
+        response["full_auto"] = scheduled
+    return response
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/signals", tags=["signals"])
@@ -1416,8 +1477,20 @@ def revise_signal(account_id: str, signal_id: str, policy_version: int = 1) -> d
     if policy is None or policy.version != policy_version:
         raise HTTPException(status_code=409, detail="EnrichmentPolicy version is not account-scoped/current")
     limits = risk_limits.active(account_id)
-    return signals.create_revision(signal_id, policy_version=policy_version,
-                                   limits=limits).as_dict()
+    revised = signals.create_revision(signal_id, policy_version=policy_version,
+                                      limits=limits)
+    response = revised.as_dict()
+    try:
+        scheduled = _schedule_full_auto_signal(revised, accounts.accounts[account_id])
+    except ExecutionError as error:
+        _audit(
+            account_id, "execution.full_auto.held", error.code,
+            {"signal_id": revised.id, "reason_code": error.code},
+        )
+        scheduled = {"status": "HELD", "reason_code": error.code}
+    if scheduled is not None:
+        response["full_auto"] = scheduled
+    return response
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/signals/{signal_id}/approve", status_code=status.HTTP_202_ACCEPTED, tags=["execution"])
@@ -1762,6 +1835,30 @@ async def connector_stream(websocket: WebSocket) -> None:
             if message.get("type") == "heartbeat":
                 accounts.heartbeat(account.id, account.connector_generation, message.get("session_id", ""))
                 await websocket.send_json({"type": "heartbeat_ack", "account_id": account.id, "generation": account.connector_generation})
+            elif message.get("type") == "reconciliation_observation":
+                observation = message.get("observation")
+                if not isinstance(observation, dict):
+                    await websocket.send_json({"type": "error", "code": "INVALID_RECONCILIATION_OBSERVATION"})
+                    continue
+                try:
+                    result = execution.reconcile_observation(account.id, observation)
+                except ExecutionError as error:
+                    await websocket.send_json({"type": "error", "code": error.code})
+                    continue
+                _audit(
+                    account.id, "execution.reconciliation.observed",
+                    "connector broker observation",
+                    {
+                        "status": result.status,
+                        "applied_fill_ids": result.applied_fill_ids,
+                        "duplicate_fill_ids": result.duplicate_fill_ids,
+                    },
+                )
+                await websocket.send_json({
+                    "type": "reconciliation_observed",
+                    "account_id": account.id,
+                    "status": result.status,
+                })
             else:
                 await websocket.send_json({"type": "error", "code": "READ_ONLY_FOUNDATION"})
     except WebSocketDisconnect:

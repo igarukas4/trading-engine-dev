@@ -360,3 +360,80 @@ print("ok")
 `);
   assert.match(output, /ok/);
 });
+
+test("Execution Coordination persists automatic UNKNOWN recovery, isolates accounts, and escalates deadlines", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+from tempfile import TemporaryDirectory
+
+from backend.app.execution import ExecutionCoordinator, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def __init__(self, state=None): self.sent = 0; self.state = state
+    def order_check(self, order): return True
+    def order_send(self, order): self.sent += 1; return "TIMEOUT"
+    def journal(self, order): return None
+    def broker_state(self, order): return self.state
+
+at = datetime.now(timezone.utc)
+def assessment(account, signal):
+    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=at,
+        valid_until=at + timedelta(minutes=10), signal_revision=1, signal_id=signal)
+def accept(engine, account, signal):
+    return engine.schedule_automated_signal(
+        account_id=account, signal_id=signal, idempotency_key=f"auto:{signal}",
+        mode="FULL_AUTO", signal_created_at=at, signal_revision=1,
+        signal_eligible=True, signal_approved=False, mode_changed_at=at,
+        risk_assessment=assessment(account, signal), signal_fresh=True,
+        fence_safe=True, account_state="RUNNING", live_lock=True,
+        execution_epoch=engine.account(account).execution_epoch,
+        order_payload={"volume": "1", "stop_loss": "1", "take_profit": ["2"]},
+    ).order
+
+ordered = ExecutionCoordinator(reconciliation_deadline=timedelta(seconds=30))
+accept(ordered, "account-ordered", "first")
+accept(ordered, "account-ordered", "second")
+assert ordered.dispatch_next("account-ordered", Broker()).status == "UNKNOWN"
+try:
+    ordered.dispatch_next("account-ordered", Broker({"status": "SUBMITTED"}))
+except ExecutionError as error: assert error.code == "RECONCILIATION_PENDING"
+else: raise AssertionError("a later account dispatch crossed unresolved UNKNOWN")
+
+with TemporaryDirectory() as directory:
+    path = f"{directory}/execution.json"
+    engine = ExecutionCoordinator(state_path=path, reconciliation_deadline=timedelta(seconds=30))
+    unknown = accept(engine, "account-a", "signal-a")
+    healthy = accept(engine, "account-b", "signal-b")
+    ambiguous = Broker()
+    assert engine.dispatch_next("account-a", ambiguous).status == "UNKNOWN"
+    assert ambiguous.sent == 1 and engine.account("account-a").exposure_gate == "QUARANTINED"
+    assert engine.account("account-b").exposure_gate == "OPEN"
+    work = engine.recovery_records("account-a")[0]
+    assert work["status"] == "PENDING" and work["deadline_at"]
+
+    restarted = ExecutionCoordinator(state_path=path, reconciliation_deadline=timedelta(seconds=30))
+    broker_truth = Broker({"status": "SUBMITTED", "external_id": "mt5-a"})
+    results = restarted.reconcile_due("account-a", broker_truth, now=at + timedelta(seconds=1))
+    assert results[0].status == "SUBMITTED" and broker_truth.sent == 0
+    assert restarted.orders[unknown.id].status == "SUBMITTED"
+    assert restarted.account("account-a").exposure_gate == "OPEN"
+    assert restarted.recovery_records("account-a")[0]["status"] == "RECOVERED"
+    assert restarted.account("account-b").exposure_gate == "OPEN"
+
+    stuck = accept(restarted, "account-a", "signal-stuck")
+    restarted.dispatch_next("account-a", Broker())
+    records = restarted.reconcile_due("account-a", Broker(), now=at + timedelta(seconds=31))
+    assert records[0].status == "UNKNOWN"
+    escalated = [item for item in restarted.recovery_records("account-a") if item["subject_id"] == stuck.id][0]
+    assert escalated["status"] == "ESCALATED" and escalated["critical"]
+    assert restarted.account("account-a").exposure_gate == "QUARANTINED"
+    assert restarted.account("account-b").exposure_gate == "OPEN"
+    try:
+        accept(restarted, "account-a", "signal-after-deadline")
+    except ExecutionError as error: assert error.code == "EXPOSURE_GATE_CLOSED"
+    else: raise AssertionError("escalated account accepted new exposure")
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
