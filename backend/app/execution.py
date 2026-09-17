@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterator, Literal, Protocol
+from typing import Any, Iterable, Iterator, Literal, Protocol
 from uuid import uuid4
 
 from .risk_calendar import RiskAssessment
@@ -56,6 +56,11 @@ class AccountExecutionState:
         "OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"
     ] = "OPEN"
     fence_sequence: int = 0
+    runtime_interlock: Literal["ELIGIBLE", "BLOCKED", "QUARANTINED"] = "ELIGIBLE"
+    interlock_reasons: tuple[str, ...] = ()
+    interlock_evidence: dict[str, Any] = field(default_factory=dict)
+    quarantine_requires_command: bool = False
+    interlock_updated_at: datetime | None = None
 
 
 @dataclass
@@ -240,6 +245,47 @@ class ReconciliationWork:
     entry_gate_before: Literal["OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"] = "OPEN"
 
 
+@dataclass(frozen=True)
+class RuntimeInterlockDecision:
+    """Account-local decision about whether new exposure may be accepted."""
+
+    account_id: str
+    status: Literal["ELIGIBLE", "BLOCKED", "QUARANTINED"]
+    reasons: tuple[str, ...] = ()
+    evidence: dict[str, Any] = field(default_factory=dict)
+    requires_custodian_command: bool = False
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        return self.reasons
+
+    @property
+    def recovery_evidence(self) -> dict[str, Any]:
+        return self.evidence
+
+
+@dataclass(frozen=True)
+class ProtectionRepairResult:
+    account_id: str
+    position_id: str
+    status: Literal["RECOVERED", "QUARANTINED"]
+    attempts: int
+    reason_code: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CriticalAlert:
+    id: str
+    account_id: str
+    reason_code: str
+    detail: str
+    evidence: dict[str, Any]
+    status: Literal["OPEN", "RESOLVED"] = "OPEN"
+    created_at: datetime = field(default_factory=_now)
+    resolved_at: datetime | None = None
+
+
 class ExecutionStateStore(Protocol):
     def load(self) -> dict[str, Any] | None: ...
 
@@ -375,6 +421,10 @@ class ExecutionSubstrate:
         self._position_command_keys: dict[tuple[str, str], str] = {}
         self._approved_signals: dict[tuple[str, str], str] = {}
         self.global_emergencies: dict[str, GlobalEmergencyOperation] = {}
+        self._critical_alerts: dict[str, CriticalAlert] = {}
+        self.protection_repairs: dict[tuple[str, str], dict[str, Any]] = {}
+        self.calendar_blocks: dict[str, list[dict[str, Any]]] = {}
+        self.calendar_overrides: dict[str, dict[str, Any]] = {}
 
     def _lock_for(self, account_id: str) -> threading.RLock:
         return self._locks.setdefault(account_id, threading.RLock())
@@ -387,6 +437,447 @@ class ExecutionSubstrate:
 
     def account(self, account_id: str) -> AccountExecutionState:
         return self._accounts.setdefault(account_id, AccountExecutionState(account_id))
+
+    def runtime_interlock(self, account_id: str) -> RuntimeInterlockDecision:
+        """Return the account-local exposure decision and its evidence."""
+        account = self.account(account_id)
+        return RuntimeInterlockDecision(
+            account_id=account_id,
+            status=account.runtime_interlock,
+            reasons=account.interlock_reasons,
+            evidence=dict(account.interlock_evidence),
+            requires_custodian_command=account.quarantine_requires_command,
+        )
+
+    def _set_runtime_interlock(
+        self,
+        account_id: str,
+        *,
+        reasons: Iterable[str],
+        evidence: dict[str, Any] | None = None,
+        persistent: bool = False,
+        now: datetime | None = None,
+    ) -> RuntimeInterlockDecision:
+        account = self.account(account_id)
+        normalized = tuple(dict.fromkeys(reason for reason in reasons if reason))
+        if not normalized:
+            raise ValueError("runtime interlock requires a reason")
+        if account.quarantine_requires_command and not persistent:
+            return self.runtime_interlock(account_id)
+        account.runtime_interlock = "QUARANTINED" if persistent else "BLOCKED"
+        account.interlock_reasons = tuple(dict.fromkeys((*account.interlock_reasons, *normalized)))
+        account.interlock_evidence = {
+            **account.interlock_evidence,
+            **dict(evidence or {}),
+        }
+        account.quarantine_requires_command = (
+            account.quarantine_requires_command or persistent
+        )
+        account.interlock_updated_at = now or _now()
+        account.exposure_gate = "QUARANTINED"
+        return self.runtime_interlock(account_id)
+
+    def _remove_runtime_interlock_reasons(
+        self, account_id: str, reason_codes: Iterable[str]
+    ) -> None:
+        account = self.account(account_id)
+        removed = set(reason_codes)
+        account.interlock_reasons = tuple(
+            reason for reason in account.interlock_reasons if reason not in removed
+        )
+        if not account.interlock_reasons:
+            self._restore_runtime_interlock_if_safe(account_id)
+
+    def block_new_exposure(
+        self,
+        account_id: str,
+        reason_code: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        persistent: bool = False,
+        now: datetime | None = None,
+    ) -> RuntimeInterlockDecision:
+        """Close only one account's entry gate for a runtime safety reason."""
+        return self._set_runtime_interlock(
+            account_id,
+            reasons=(reason_code,),
+            evidence=evidence,
+            persistent=persistent,
+            now=now,
+        )
+
+    set_runtime_interlock = block_new_exposure
+
+    def critical_alerts(self, account_id: str) -> list[dict[str, Any]]:
+        """Return open account-local critical alerts for dashboard projection."""
+        return [
+            {
+                **alert.__dict__,
+                "created_at": alert.created_at.isoformat(),
+                "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
+            }
+            for alert in self._critical_alerts.values()
+            if alert.account_id == account_id and alert.status == "OPEN"
+        ]
+
+    def _raise_critical_alert(
+        self,
+        account_id: str,
+        reason_code: str,
+        *,
+        detail: str,
+        evidence: dict[str, Any] | None = None,
+    ) -> CriticalAlert:
+        existing = next(
+            (
+                alert for alert in self._critical_alerts.values()
+                if alert.account_id == account_id
+                and alert.reason_code == reason_code
+                and alert.status == "OPEN"
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+        alert = CriticalAlert(
+            id=str(uuid4()),
+            account_id=account_id,
+            reason_code=reason_code,
+            detail=detail,
+            evidence=dict(evidence or {}),
+        )
+        self._critical_alerts[alert.id] = alert
+        audit = getattr(self, "_audit", None)
+        if callable(audit):
+            audit(
+                account_id,
+                "critical.runtime_interlock",
+                reason_code=reason_code,
+                alert_id=alert.id,
+                evidence=alert.evidence,
+            )
+        return alert
+
+    def observe_runtime_health(
+        self,
+        account_id: str,
+        *,
+        connector_healthy: bool | None = None,
+        connector_gap: bool = False,
+        broker_facts_fresh: bool = True,
+        reconciliation_healthy: bool = True,
+        risk_state_known: bool = True,
+        reservation_consistent: bool = True,
+        ordering_safe: bool = True,
+        backup_observed_at: datetime | None = None,
+        alert_delivery_observed_at: datetime | None = None,
+        now: datetime | None = None,
+        freshness_window: timedelta = timedelta(minutes=5),
+        escalation_deadline: timedelta = timedelta(minutes=15),
+    ) -> RuntimeInterlockDecision:
+        """Project account-local runtime facts into the exposure interlock."""
+        at = now or _now()
+        reasons: list[str] = []
+        evidence: dict[str, Any] = {"observed_at": at.isoformat()}
+        if connector_healthy is False:
+            reasons.append("CONNECTOR_UNAVAILABLE")
+        if connector_gap:
+            reasons.append("CONNECTOR_GAP")
+        if not broker_facts_fresh:
+            reasons.append("BROKER_FACTS_STALE")
+        if not reconciliation_healthy:
+            reasons.append("RECONCILIATION_FAILED")
+        if not risk_state_known:
+            reasons.append("RISK_STATE_UNCERTAIN")
+        if not reservation_consistent:
+            reasons.append("RESERVATION_INCONSISTENT")
+        if not ordering_safe:
+            reasons.append("ORDERING_OVERLOAD")
+
+        persistent = False
+        for name, observed_at, reason in (
+            ("backup", backup_observed_at, "BACKUP_RECOVERY_POINT_STALE"),
+            ("critical_alert_delivery", alert_delivery_observed_at, "CRITICAL_ALERT_DELIVERY_STALE"),
+        ):
+            if observed_at is None:
+                continue
+            age = at - observed_at
+            evidence[f"{name}_observed_at"] = observed_at.isoformat()
+            evidence[f"{name}_age_seconds"] = age.total_seconds()
+            if age > freshness_window:
+                reasons.append(reason)
+            if age > escalation_deadline:
+                persistent = True
+                self._raise_critical_alert(
+                    account_id,
+                    reason,
+                    detail=f"{name} freshness deadline exceeded",
+                    evidence=evidence,
+                )
+
+        if reasons:
+            return self._set_runtime_interlock(
+                account_id,
+                reasons=reasons,
+                evidence=evidence,
+                persistent=persistent,
+                now=at,
+            )
+        account = self.account(account_id)
+        if account.runtime_interlock == "QUARANTINED":
+            return self.runtime_interlock(account_id)
+        health_reasons = {
+            "CONNECTOR_UNAVAILABLE", "CONNECTOR_GAP", "BROKER_FACTS_STALE",
+            "RECONCILIATION_FAILED", "RISK_STATE_UNCERTAIN",
+            "RESERVATION_INCONSISTENT", "ORDERING_OVERLOAD",
+            "BACKUP_RECOVERY_POINT_STALE", "CRITICAL_ALERT_DELIVERY_STALE",
+        }
+        self._remove_runtime_interlock_reasons(account_id, health_reasons)
+        if self.runtime_interlock(account_id).status == "ELIGIBLE":
+            self.account(account_id).interlock_evidence = dict(evidence)
+        return self.runtime_interlock(account_id)
+
+    def observe_connector_health(
+        self,
+        account_id: str,
+        *,
+        healthy: bool,
+        gap: bool = False,
+        now: datetime | None = None,
+    ) -> RuntimeInterlockDecision:
+        """Update connector facts without clearing unrelated account interlocks."""
+        if not healthy or gap:
+            reasons = []
+            if not healthy:
+                reasons.append("CONNECTOR_UNAVAILABLE")
+            if gap:
+                reasons.append("CONNECTOR_GAP")
+            return self._set_runtime_interlock(
+                account_id,
+                reasons=reasons,
+                evidence={"healthy": healthy, "gap": gap},
+                now=now,
+            )
+        self._remove_runtime_interlock_reasons(
+            account_id, {"CONNECTOR_UNAVAILABLE", "CONNECTOR_GAP"}
+        )
+        return self.runtime_interlock(account_id)
+
+    update_runtime_health = observe_runtime_health
+
+    def recover_runtime_interlock(
+        self,
+        account_id: str,
+        *,
+        evidence: dict[str, Any],
+        custodian_command: bool = False,
+        now: datetime | None = None,
+    ) -> RuntimeInterlockDecision:
+        """Clear a persistent quarantine only after evidence and command."""
+        account = self.account(account_id)
+        if account.runtime_interlock != "QUARANTINED":
+            self._restore_runtime_interlock_if_safe(account_id, evidence)
+            return self.runtime_interlock(account_id)
+        if not custodian_command:
+            raise ExecutionError("QUARANTINE_RECOVERY_COMMAND_REQUIRED")
+        if not evidence.get("broker_reconciled") and not evidence.get("verified"):
+            raise ExecutionError("QUARANTINE_RECOVERY_EVIDENCE_REQUIRED")
+        if any(
+            position.account_id == account_id
+            and position.stage != "CLOSED"
+            and position.protection_status != "CONFIRMED"
+            for position in self.positions.values()
+        ):
+            raise ExecutionError("NATIVE_PROTECTION_UNVERIFIED")
+        account.quarantine_requires_command = False
+        account.runtime_interlock = "ELIGIBLE"
+        account.interlock_reasons = ()
+        account.interlock_evidence = dict(evidence)
+        account.interlock_updated_at = now or _now()
+        if account.exposure_gate == "QUARANTINED":
+            account.exposure_gate = "OPEN"
+        for alert in self._critical_alerts.values():
+            if alert.account_id == account_id and alert.status == "OPEN":
+                alert.status = "RESOLVED"
+                alert.resolved_at = now or _now()
+        audit = getattr(self, "_audit", None)
+        if callable(audit):
+            audit(account_id, "execution.interlock.recovered", evidence=evidence)
+        return self.runtime_interlock(account_id)
+
+    clear_runtime_interlock = recover_runtime_interlock
+
+    @staticmethod
+    def _payload_currencies(order_payload: dict[str, Any]) -> set[str]:
+        supplied = order_payload.get("currencies") or order_payload.get("currency")
+        if isinstance(supplied, str):
+            currencies = {supplied.upper()}
+        else:
+            currencies = {str(item).upper() for item in (supplied or ())}
+        pair = str(order_payload.get("symbol", order_payload.get("pair", ""))).upper()
+        if len(pair) == 6 and pair.isalpha():
+            currencies.update((pair[:3], pair[3:]))
+        return currencies
+
+    def _calendar_blocks_entry(
+        self,
+        account_id: str,
+        order_payload: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        pair = str(order_payload.get("symbol", order_payload.get("pair", ""))).upper()
+        currencies = self._payload_currencies(order_payload)
+        at = now or _now()
+        for block in self.calendar_blocks.get(account_id, []):
+            if not block.get("active", True):
+                continue
+            expires_at = block.get("expires_at")
+            if expires_at is not None:
+                expires = _state_datetime(expires_at)
+                if at >= expires:
+                    continue
+            blackout_start = block.get("blackout_start")
+            if blackout_start is not None and at < _state_datetime(blackout_start):
+                continue
+            blackout_end = block.get("blackout_end")
+            if blackout_end is not None and at >= _state_datetime(blackout_end):
+                continue
+            if not block.get("scope_known", False):
+                return True
+            if block.get("pair") and str(block["pair"]).upper() == pair:
+                return True
+            if currencies.intersection({str(item).upper() for item in block.get("currencies", ())}):
+                return True
+        return False
+
+    def set_calendar_interlock(
+        self,
+        account_id: str,
+        *,
+        blackout: bool = True,
+        pair: str | None = None,
+        currencies: Iterable[str] = (),
+        scope_known: bool = True,
+        reason_code: str = "CALENDAR_BLACKOUT_ACTIVE",
+        expires_at: datetime | None = None,
+        blackout_start: datetime | None = None,
+        blackout_end: datetime | None = None,
+        now: datetime | None = None,
+    ) -> RuntimeInterlockDecision:
+        """Apply calendar impact to one account, preserving known scope."""
+        normalized_pair = pair.upper() if pair else None
+        normalized_currencies = tuple(sorted({str(item).upper() for item in currencies}))
+        blocks = self.calendar_blocks.setdefault(account_id, [])
+        matching = [
+            block for block in blocks
+            if block.get("pair") == normalized_pair
+            and tuple(block.get("currencies", ())) == normalized_currencies
+            and block.get("scope_known", False) == scope_known
+        ]
+        if blackout:
+            block = matching[0] if matching else {
+                "pair": normalized_pair,
+                "currencies": normalized_currencies,
+                "scope_known": scope_known,
+                "reason_code": reason_code,
+                "active": True,
+            }
+            block.update({
+                "active": True,
+                "reason_code": reason_code,
+                "expires_at": expires_at,
+                "blackout_start": blackout_start,
+                "blackout_end": blackout_end,
+                "updated_at": (now or _now()).isoformat(),
+            })
+            if not matching:
+                blocks.append(block)
+            if not scope_known or (normalized_pair is None and not normalized_currencies):
+                return self._set_runtime_interlock(
+                    account_id,
+                    reasons=(reason_code,),
+                    evidence={
+                        "scope_known": scope_known,
+                        "pair": normalized_pair,
+                        "currencies": normalized_currencies,
+                    },
+                    now=now,
+                )
+            return self.runtime_interlock(account_id)
+
+        for block in matching:
+            block["active"] = False
+        if self.account(account_id).runtime_interlock != "QUARANTINED":
+            if not any(
+                block.get("active", True)
+                and not block.get("scope_known", False)
+                and (
+                    block.get("expires_at") is None
+                    or (now or _now()) < _state_datetime(block["expires_at"])
+                )
+                for block in blocks
+            ):
+                self._remove_runtime_interlock_reasons(
+                    account_id, {reason_code, "CALENDAR_BLACKOUT_ACTIVE"}
+                )
+            self._restore_runtime_interlock_if_safe(account_id)
+        return self.runtime_interlock(account_id)
+
+    def add_manual_economic_event_override(
+        self,
+        account_id: str,
+        *,
+        blackout_start: datetime,
+        blackout_end: datetime,
+        reason: str,
+        pair: str | None = None,
+        currencies: Iterable[str] = (),
+        expires_at: datetime | None = None,
+        override_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or extend a blackout; this method never shortens one."""
+        if blackout_end <= blackout_start:
+            raise ValueError("blackout_end must be after blackout_start")
+        key = override_id or str(uuid4())
+        prior = self.calendar_overrides.get(key)
+        if prior is not None:
+            blackout_start = min(blackout_start, _state_datetime(prior["blackout_start"]))
+            blackout_end = max(blackout_end, _state_datetime(prior["blackout_end"]))
+        record = {
+            "id": key,
+            "account_id": account_id,
+            "pair": pair.upper() if pair else None,
+            "currencies": tuple(sorted({str(item).upper() for item in currencies})),
+            "blackout_start": blackout_start.isoformat(),
+            "blackout_end": blackout_end.isoformat(),
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "reason": reason,
+        }
+        self.calendar_overrides[key] = record
+        self.set_calendar_interlock(
+            account_id,
+            pair=record["pair"],
+            currencies=record["currencies"],
+            scope_known=bool(record["pair"] or record["currencies"]),
+            expires_at=expires_at,
+            blackout_start=blackout_start,
+            blackout_end=blackout_end,
+        )
+        audit = getattr(self, "_audit", None)
+        if callable(audit):
+            audit(
+                account_id,
+                "calendar.manual_override.created",
+                override_id=record["id"],
+                pair=record["pair"],
+                currencies=record["currencies"],
+                blackout_start=record["blackout_start"],
+                blackout_end=record["blackout_end"],
+            )
+        return record
+
+    add_calendar_override = add_manual_economic_event_override
 
     def _assessment_is_fresh(
         self,
@@ -410,6 +901,75 @@ class ExecutionSubstrate:
             raise ExecutionError("RISK_ASSESSMENT_NOT_FRESH")
         if now < assessment.assessed_at or now >= assessment.valid_until:
             raise ExecutionError("RISK_ASSESSMENT_EXPIRED")
+
+    def _reservation_state_is_consistent(self, account_id: str) -> bool:
+        for reservation in self.reservations.values():
+            if reservation.account_id != account_id:
+                continue
+            if reservation.status not in {"ACTIVE", "CONSUMED", "RELEASED"}:
+                return False
+            if self._decimal(reservation.amount) < 0:
+                return False
+        for order_id, reservation_id in self._order_reservations.items():
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                continue
+            reservation = self.reservations.get(reservation_id)
+            if reservation is None or reservation.account_id != account_id:
+                return False
+        return True
+
+    def _entry_interlock_reasons(
+        self,
+        account_id: str,
+        order_payload: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        account = self.account(account_id)
+        at = now or _now()
+        broad_calendar_reasons = {
+            str(block.get("reason_code", "CALENDAR_BLACKOUT_ACTIVE"))
+            for block in self.calendar_blocks.get(account_id, [])
+            if not block.get("scope_known", False)
+        }
+        active_broad_calendar_reasons = {
+            str(block.get("reason_code", "CALENDAR_BLACKOUT_ACTIVE"))
+            for block in self.calendar_blocks.get(account_id, [])
+            if not block.get("scope_known", False)
+            and block.get("active", True)
+            and (
+                block.get("expires_at") is None
+                or at < _state_datetime(block["expires_at"])
+            )
+            and (
+                block.get("blackout_start") is None
+                or at >= _state_datetime(block["blackout_start"])
+            )
+            and (
+                block.get("blackout_end") is None
+                or at < _state_datetime(block["blackout_end"])
+            )
+        }
+        expired_calendar_reasons = broad_calendar_reasons - active_broad_calendar_reasons
+        if expired_calendar_reasons:
+            self._remove_runtime_interlock_reasons(
+                account_id, expired_calendar_reasons
+            )
+            account = self.account(account_id)
+        reasons = list(account.interlock_reasons)
+        if account.runtime_interlock != "ELIGIBLE" and not reasons:
+            reasons.append("RUNTIME_INTERLOCK_ACTIVE")
+        if not self._reservation_state_is_consistent(account_id):
+            self._set_runtime_interlock(
+                account_id,
+                reasons=("RESERVATION_INCONSISTENT",),
+                evidence={"account_id": account_id},
+            )
+            reasons.append("RESERVATION_INCONSISTENT")
+        if order_payload is not None and self._calendar_blocks_entry(account_id, order_payload, now=at):
+            reasons.append("CALENDAR_BLACKOUT_ACTIVE")
+        return tuple(dict.fromkeys(reasons))
 
     def _idempotent_result(
         self, account_id: str, idempotency_key: str, canonical_hash: str
@@ -476,6 +1036,13 @@ class ExecutionSubstrate:
                 return prior
             if risk_assessment is None:
                 raise ExecutionError("PRE_ORDER_ASSESSMENT_REQUIRED")
+            interlock_reasons = self._entry_interlock_reasons(
+                account_id, order_payload, now=now
+            )
+            if interlock_reasons:
+                if "CALENDAR_BLACKOUT_ACTIVE" in interlock_reasons:
+                    raise ExecutionError("CALENDAR_BLACKOUT_ACTIVE")
+                raise ExecutionError("EXPOSURE_GATE_CLOSED")
             self._assessment_is_fresh(
                 account_id, signal_id, risk_assessment, now or _now(), signal_revision
             )
@@ -1141,15 +1708,20 @@ class ExecutionSubstrate:
             self._reservation_for(order_id).status = "CONSUMED"
             payload = order.payload
             position = self.positions.get((account_id, order_id))
+            has_native_stop = payload.get("stop_loss") is not None
             if position is None:
-                protection = "CONFIRMED" if native_protection_confirmed else "UNCONFIRMED"
+                protection = (
+                    "CONFIRMED"
+                    if native_protection_confirmed and has_native_stop
+                    else "UNCONFIRMED"
+                )
                 side = str(payload.get("side", "BUY")).upper()
                 position = Position(
                     account_id=account_id,
                     order_id=order_id,
                     volume=str(volume),
                     protection_status=protection,
-                    native_stop_loss=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
+                    native_stop_loss=str(payload.get("stop_loss")) if has_native_stop else None,
                     native_take_profit=str(payload.get("take_profit")) if payload.get("take_profit") is not None else None,
                     last_confirmed_stop=str(payload.get("stop_loss")) if payload.get("stop_loss") is not None else None,
                     accounting_mode=accounting_mode,
@@ -1166,13 +1738,197 @@ class ExecutionSubstrate:
                     self._decimal(position.remaining_volume or "0")
                     + self._decimal(volume)
                 )
-                if not native_protection_confirmed:
+                if not native_protection_confirmed or not has_native_stop:
                     position.protection_status = "UNCONFIRMED"
-            if not native_protection_confirmed:
+            if position.protection_status != "CONFIRMED":
                 self.account(account_id).exposure_gate = "QUARANTINED"
                 self.install_fence(account_id, "SAFETY_FENCE")
                 position.protection_status = "UNCONFIRMED"
+                self._set_runtime_interlock(
+                    account_id,
+                    reasons=("NATIVE_PROTECTION_UNCONFIRMED",),
+                    evidence={"position_id": order_id, "order_id": order_id},
+                )
             return fill
+
+    @staticmethod
+    def _protection_stop(response: Any) -> str | None:
+        value = ExecutionSubstrate._response_value(
+            response,
+            "stop_loss", "sl", "native_stop_loss", "confirmed_stop",
+        )
+        return str(value) if value is not None else None
+
+    def _protection_response_verified(self, response: Any, expected_stop: str) -> bool:
+        status = self._response_status(response)
+        if status not in {"CONFIRMED", "EXECUTED", "FILLED", "ACCEPTED"}:
+            return False
+        confirmed = self._protection_stop(response)
+        if confirmed is not None:
+            return confirmed == expected_stop
+        return bool(self._response_value(response, "protection_confirmed", "native_protection_confirmed"))
+
+    def repair_native_protection(
+        self,
+        account_id: str,
+        position_id: str,
+        connector: Any,
+        *,
+        max_attempts: int | None = None,
+        now: datetime | None = None,
+    ) -> ProtectionRepairResult:
+        """Reapply and verify a Position's native StopLoss within a fixed bound."""
+        with self._lock_for(account_id):
+            position = self.position(account_id, position_id)
+            expected_stop = position.native_stop_loss or position.last_confirmed_stop
+            if position.protection_status == "CONFIRMED" and expected_stop is not None:
+                return ProtectionRepairResult(
+                    account_id, position_id, "RECOVERED", 0,
+                    evidence={"confirmed_stop_loss": expected_stop},
+                )
+            if expected_stop is None:
+                position.protection_status = "QUARANTINED"
+                self.install_fence(account_id, "SAFETY_FENCE")
+                self._set_runtime_interlock(
+                    account_id,
+                    reasons=("NATIVE_PROTECTION_UNVERIFIED",),
+                    evidence={"position_id": position_id, "reason": "STOP_LOSS_MISSING"},
+                    persistent=True,
+                    now=now,
+                )
+                self._raise_critical_alert(
+                    account_id,
+                    "NATIVE_PROTECTION_UNVERIFIED",
+                    detail="native StopLoss cannot be reconstructed",
+                    evidence={"position_id": position_id},
+                )
+                return ProtectionRepairResult(
+                    account_id, position_id, "QUARANTINED", 0,
+                    "NATIVE_PROTECTION_UNVERIFIED",
+                )
+
+            attempts_limit = max_attempts if max_attempts is not None else 3
+            if attempts_limit < 1:
+                raise ValueError("max_attempts must be positive")
+            attempts = 0
+            evidence: dict[str, Any] = {"requested_stop_loss": expected_stop}
+            while attempts < attempts_limit:
+                attempts += 1
+                response: Any = None
+                for name in (
+                    "modify_position_protection",
+                    "modify_protection",
+                    "set_stop_loss",
+                ):
+                    method = getattr(connector, name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        response = method(position, expected_stop)
+                    except TypeError:
+                        response = method(account_id, position_id, expected_stop)
+                    except Exception:
+                        response = None
+                    break
+                if not self._protection_response_verified(response, expected_stop):
+                    continue
+                verified: Any = response
+                for name in (
+                    "position_protection",
+                    "position_state",
+                    "broker_position",
+                ):
+                    method = getattr(connector, name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        verified = method(position)
+                    except TypeError:
+                        verified = method(account_id, position_id)
+                    except Exception:
+                        verified = None
+                    break
+                if not self._protection_response_verified(verified, expected_stop):
+                    continue
+                confirmed_stop = self._protection_stop(verified) or expected_stop
+                position.native_stop_loss = confirmed_stop
+                position.last_confirmed_stop = confirmed_stop
+                position.protection_status = "CONFIRMED"
+                evidence.update({
+                    "confirmed_stop_loss": confirmed_stop,
+                    "attempts": attempts,
+                    "verified": True,
+                })
+                self.protection_repairs[(account_id, position_id)] = {
+                    "attempts": attempts,
+                    "status": "RECOVERED",
+                    "evidence": evidence,
+                }
+                self._remove_runtime_interlock_reasons(
+                    account_id,
+                    {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"},
+                )
+                if self.runtime_interlock(account_id).status == "ELIGIBLE":
+                    self.account(account_id).interlock_evidence = dict(evidence)
+                return ProtectionRepairResult(
+                    account_id, position_id, "RECOVERED", attempts, evidence=evidence,
+                )
+
+            position.protection_status = "QUARANTINED"
+            self.install_fence(account_id, "SAFETY_FENCE")
+            evidence["attempts"] = attempts
+            evidence["verified"] = False
+            self.protection_repairs[(account_id, position_id)] = {
+                "attempts": attempts,
+                "status": "QUARANTINED",
+                "evidence": evidence,
+            }
+            self._set_runtime_interlock(
+                account_id,
+                reasons=("NATIVE_PROTECTION_UNVERIFIED",),
+                evidence={"position_id": position_id, **evidence},
+                persistent=True,
+                now=now,
+            )
+            self._raise_critical_alert(
+                account_id,
+                "NATIVE_PROTECTION_UNVERIFIED",
+                detail="bounded native StopLoss repair could not be verified",
+                evidence={"position_id": position_id, **evidence},
+            )
+            return ProtectionRepairResult(
+                account_id, position_id, "QUARANTINED", attempts,
+                "NATIVE_PROTECTION_UNVERIFIED", evidence,
+            )
+
+    repair_protection = repair_native_protection
+
+    def _restore_runtime_interlock_if_safe(
+        self, account_id: str, evidence: dict[str, Any] | None = None
+    ) -> None:
+        account = self.account(account_id)
+        if account.quarantine_requires_command or account.interlock_reasons:
+            return
+        if any(
+            position.account_id == account_id
+            and position.stage != "CLOSED"
+            and position.protection_status != "CONFIRMED"
+            for position in self.positions.values()
+        ):
+            return
+        prior_gates = {
+            work.entry_gate_before
+            for work in getattr(self, "reconciliation_work", {}).values()
+            if work.account_id == account_id
+        }
+        if prior_gates.intersection({"FENCE_PENDING", "STOPPED"}):
+            return
+        account.runtime_interlock = "ELIGIBLE"
+        account.interlock_reasons = ()
+        account.interlock_evidence = dict(evidence or {})
+        account.interlock_updated_at = _now()
+        if account.exposure_gate == "QUARANTINED":
+            account.exposure_gate = "OPEN"
 
     def stage_exit(
         self,
@@ -1290,6 +2046,11 @@ class ExecutionSubstrate:
             position.protection_status = "QUARANTINED"
             self.account(account_id).exposure_gate = "QUARANTINED"
             self.install_fence(account_id, "PROTECTION_RECONCILIATION")
+            self._set_runtime_interlock(
+                account_id,
+                reasons=("NATIVE_PROTECTION_UNCONFIRMED",),
+                evidence={"position_id": order_id},
+            )
             return position
 
     def mark_position_command_unknown(self, account_id: str, command_id: str) -> PositionCommand:
@@ -1308,8 +2069,18 @@ class ExecutionSubstrate:
             if position.protection_status != "CONFIRMED":
                 position.protection_status = "QUARANTINED"
                 self.account(account_id).exposure_gate = "QUARANTINED"
+                self._set_runtime_interlock(
+                    account_id,
+                    reasons=("NATIVE_PROTECTION_UNCONFIRMED",),
+                    evidence={"position_id": order_id},
+                )
             else:
                 self.install_fence(account_id, "CONNECTOR_DISCONNECTED")
+                self._set_runtime_interlock(
+                    account_id,
+                    reasons=("CONNECTOR_UNAVAILABLE",),
+                    evidence={"position_id": order_id},
+                )
             return position
 
     def confirm_protection(self, account_id: str, order_id: str) -> Position:
@@ -1317,8 +2088,10 @@ class ExecutionSubstrate:
         with self._lock_for(account_id):
             position = self.position(account_id, order_id)
             position.protection_status = "CONFIRMED"
-            if self.account(account_id).exposure_gate == "QUARANTINED":
-                self.account(account_id).exposure_gate = "OPEN"
+            self._remove_runtime_interlock_reasons(
+                account_id,
+                {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"},
+            )
             return position
 
     def emergency_stop(self, account_id: str) -> SafetyFence:
@@ -1455,10 +2228,13 @@ class ExecutionCoordinator(ExecutionSubstrate):
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
         reconciliation_deadline: timedelta = timedelta(minutes=5),
+        max_protection_repair_attempts: int = 3,
     ) -> None:
         super().__init__()
         if reconciliation_deadline <= timedelta(0):
             raise ValueError("reconciliation_deadline must be positive")
+        if max_protection_repair_attempts < 1:
+            raise ValueError("max_protection_repair_attempts must be positive")
         configured_stores = sum(
             value is not None for value in (state_store, state_path, database_url)
         )
@@ -1474,6 +2250,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self._state_store = None
         self._mutation_depth = 0
         self.reconciliation_deadline = reconciliation_deadline
+        self.max_protection_repair_attempts = max_protection_repair_attempts
         self.reconciliation_work: dict[str, ReconciliationWork] = {}
         self.audit_events: list[AuditEvent] = []
         self.risk_assessments: dict[str, dict[str, Any]] = {}
@@ -1513,6 +2290,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     key: value.__dict__
                     for key, value in self.reconciliation_work.items()
                 },
+                "critical_alerts": {
+                    key: value.__dict__ for key, value in self._critical_alerts.items()
+                },
+                "protection_repairs": {
+                    f"{account_id}|{position_id}": value
+                    for (account_id, position_id), value in self.protection_repairs.items()
+                },
+                "calendar_blocks": self.calendar_blocks,
+                "calendar_overrides": self.calendar_overrides,
                 "global_emergencies": {
                     key: {
                         **value.__dict__,
@@ -1550,6 +2336,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             return
         state = _deserialize_state_value(state)
         for key, value in state.get("accounts", {}).items():
+            value["interlock_reasons"] = tuple(value.get("interlock_reasons", ()))
             self._accounts[key] = AccountExecutionState(**value)
         for key, value in state.get("reservations", {}).items():
             self.reservations[key] = RiskReservation(**value)
@@ -1590,6 +2377,16 @@ class ExecutionCoordinator(ExecutionSubstrate):
             if value.get("last_attempt_at") is not None:
                 value["last_attempt_at"] = _state_datetime(value["last_attempt_at"])
             self.reconciliation_work[key] = ReconciliationWork(**value)
+        for key, value in state.get("critical_alerts", {}).items():
+            value["created_at"] = _state_datetime(value["created_at"])
+            if value.get("resolved_at") is not None:
+                value["resolved_at"] = _state_datetime(value["resolved_at"])
+            self._critical_alerts[key] = CriticalAlert(**value)
+        for key, value in state.get("protection_repairs", {}).items():
+            account_id, position_id = key.split("|", 1)
+            self.protection_repairs[(account_id, position_id)] = value
+        self.calendar_blocks = state.get("calendar_blocks", {})
+        self.calendar_overrides = state.get("calendar_overrides", {})
         for key, value in state.get("global_emergencies", {}).items():
             targets = {
                 target_id: GlobalEmergencyTarget(**target)
@@ -1706,6 +2503,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
         self.reconciliation_work[work.id] = work
         account.exposure_gate = "QUARANTINED"
         self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
+        self._set_runtime_interlock(
+            account_id,
+            reasons=("RECONCILIATION_PENDING",),
+            evidence={"subject_id": order_id, "subject_kind": subject_kind},
+        )
         self._audit(
             account_id, "execution.reconciliation.pending", order_id=order_id,
             deadline_at=work.deadline_at.isoformat(), subject_kind=subject_kind,
@@ -1735,9 +2537,16 @@ class ExecutionCoordinator(ExecutionSubstrate):
             prior_gate = "FENCE_PENDING"
         else:
             prior_gate = "OPEN"
-        if not unresolved and not protection_unconfirmed and account.exposure_gate == "QUARANTINED":
+        if (
+            not unresolved
+            and not protection_unconfirmed
+            and not account.interlock_reasons
+            and not account.quarantine_requires_command
+            and account.exposure_gate == "QUARANTINED"
+        ):
             if prior_gate == "OPEN":
                 account.exposure_gate = "OPEN"
+                account.runtime_interlock = "ELIGIBLE"
                 self._audit(account_id, "execution.reconciliation.recovered")
             elif prior_gate in {"FENCE_PENDING", "STOPPED"}:
                 account.exposure_gate = prior_gate
@@ -1749,6 +2558,9 @@ class ExecutionCoordinator(ExecutionSubstrate):
         work = self._work_for(account_id, order_id, "ORDER")
         if work is not None and work.status == "PENDING":
             work.status = "RECOVERED"
+            self._remove_runtime_interlock_reasons(
+                account_id, {"RECONCILIATION_PENDING"}
+            )
             self._audit(
                 account_id, "execution.reconciliation.converged",
                 order_id=order_id, status=order.status,
@@ -1763,6 +2575,9 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if work is None or work.status != "PENDING":
             return
         work.status = "RECOVERED"
+        self._remove_runtime_interlock_reasons(
+            account_id, {"RECONCILIATION_PENDING"}
+        )
         self._audit(
             account_id, "execution.reconciliation.converged",
             subject_id=subject_id, subject_kind=subject_kind,
@@ -2051,6 +2866,57 @@ class ExecutionCoordinator(ExecutionSubstrate):
         with self._mutation():
             return super().record_fill(*args, **kwargs)
 
+    def observe_runtime_health(self, *args: Any, **kwargs: Any) -> RuntimeInterlockDecision:
+        with self._mutation():
+            decision = super().observe_runtime_health(*args, **kwargs)
+            self._audit(
+                decision.account_id,
+                "execution.interlock.observed",
+                status=decision.status,
+                reasons=decision.reasons,
+                evidence=decision.evidence,
+            )
+            return decision
+
+    def observe_connector_health(self, *args: Any, **kwargs: Any) -> RuntimeInterlockDecision:
+        with self._mutation():
+            decision = super().observe_connector_health(*args, **kwargs)
+            self._audit(
+                decision.account_id,
+                "execution.connector.health",
+                status=decision.status,
+                reasons=decision.reasons,
+            )
+            return decision
+
+    def recover_runtime_interlock(self, *args: Any, **kwargs: Any) -> RuntimeInterlockDecision:
+        with self._mutation():
+            return super().recover_runtime_interlock(*args, **kwargs)
+
+    def repair_native_protection(
+        self, account_id: str, position_id: str, connector: Any, **kwargs: Any
+    ) -> ProtectionRepairResult:
+        with self._mutation():
+            result = super().repair_native_protection(
+                account_id,
+                position_id,
+                connector,
+                max_attempts=kwargs.pop(
+                    "max_attempts", self.max_protection_repair_attempts
+                ),
+                **kwargs,
+            )
+            self._audit(
+                account_id,
+                "execution.protection.repair",
+                position_id=position_id,
+                status=result.status,
+                attempts=result.attempts,
+                reason_code=result.reason_code,
+                evidence=result.evidence,
+            )
+            return result
+
     def record_exit_fill(self, *args: Any, **kwargs: Any) -> PositionCommand:
         with self._mutation():
             return super().record_exit_fill(*args, **kwargs)
@@ -2173,13 +3039,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
         key = self._find_position_key(account_id, position_id, pair, mode)
         position = self.positions.get(key)
         volume = str(item.get("volume", item.get("remaining_volume", "0")))
-        protection = "CONFIRMED" if item.get("sl") is not None or item.get("stop_loss") is not None else "UNCONFIRMED"
+        observed_stop = item.get("sl", item.get("stop_loss"))
+        protection = "CONFIRMED" if observed_stop is not None else "UNCONFIRMED"
         if position is None:
             side = str(item.get("side", item.get("direction", "BUY"))).upper()
             position = Position(
                 account_id=account_id, order_id=order_id, volume=volume,
                 remaining_volume=volume, protection_status=protection,
-                native_stop_loss=str(item.get("sl", item.get("stop_loss"))) if item.get("sl", item.get("stop_loss")) is not None else None,
+                native_stop_loss=str(observed_stop) if observed_stop is not None else None,
+                last_confirmed_stop=str(observed_stop) if observed_stop is not None else None,
                 native_take_profit=str(item.get("tp", item.get("take_profit"))) if item.get("tp", item.get("take_profit")) is not None else None,
                 accounting_mode=mode if mode in {"NETTING", "HEDGING"} else "NETTING",
                 external_position_id=position_id, pair=pair,
@@ -2190,14 +3058,27 @@ class ExecutionCoordinator(ExecutionSubstrate):
             )
             self.positions[key] = position
         else:
+            expected_stop = position.last_confirmed_stop or position.native_stop_loss
+            if observed_stop is None or (
+                expected_stop is not None and str(observed_stop) != str(expected_stop)
+            ):
+                protection = "UNCONFIRMED"
             position.volume = volume
             position.remaining_volume = str(item.get("remaining_volume", volume))
             position.protection_status = protection
             position.data_status = "CONFIRMED"
+            if protection == "CONFIRMED":
+                position.native_stop_loss = str(observed_stop)
+                position.last_confirmed_stop = str(observed_stop)
             if item.get("current_pnl") is not None:
                 position.current_pnl = str(item["current_pnl"])
         if protection != "CONFIRMED":
             self.account(account_id).exposure_gate = "QUARANTINED"
+            self._set_runtime_interlock(
+                account_id,
+                reasons=("NATIVE_PROTECTION_CHANGED",),
+                evidence={"position_id": position_id, "observed_stop_loss": observed_stop},
+            )
         return position
 
     @staticmethod

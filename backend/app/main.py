@@ -292,6 +292,40 @@ class CalendarHealthRequest(BaseModel):
     source_revision: str = Field(min_length=1, max_length=100)
 
 
+class RuntimeHealthRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    connector_healthy: bool | None = None
+    connector_gap: bool = False
+    broker_facts_fresh: bool = True
+    reconciliation_healthy: bool = True
+    risk_state_known: bool = True
+    reservation_consistent: bool = True
+    ordering_safe: bool = True
+    backup_observed_at: datetime | None = None
+    alert_delivery_observed_at: datetime | None = None
+    observed_at: datetime | None = None
+    freshness_window_seconds: int = Field(default=300, ge=1)
+    escalation_deadline_seconds: int = Field(default=900, ge=1)
+
+
+class RuntimeInterlockRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(min_length=1, max_length=500)
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class CalendarOverrideRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blackout_start: datetime
+    blackout_end: datetime
+    expires_at: datetime | None = None
+    pair: str | None = Field(default=None, min_length=1, max_length=40)
+    currencies: tuple[str, ...] = ()
+    reason: str = Field(min_length=1, max_length=500)
+    override_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class ActivationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     connector_capabilities: dict[str, bool] = Field(default_factory=dict)
@@ -382,6 +416,29 @@ def _control_state(account: BrokerAccount) -> dict[str, Any]:
         "execution_mode": account.execution_mode,
         "live_execution_enabled": account.live_execution_enabled,
         "runtime_interlock": account.runtime_interlock,
+    }
+
+
+def _execution_interlock_payload(account_id: str) -> dict[str, Any]:
+    decision = execution.runtime_interlock(account_id)
+    protections = [
+        {
+            "position_id": position.external_position_id or position.order_id,
+            "order_id": position.order_id,
+            "status": position.protection_status,
+            "native_stop_loss": position.native_stop_loss,
+            "last_confirmed_stop": position.last_confirmed_stop,
+        }
+        for position in execution.positions.values()
+        if position.account_id == account_id and position.stage != "CLOSED"
+    ]
+    return {
+        "status": decision.status,
+        "reasons": list(decision.reasons),
+        "evidence": decision.evidence,
+        "requires_custodian_command": decision.requires_custodian_command,
+        "protection": protections,
+        "critical_alerts": execution.critical_alerts(account_id),
     }
 
 
@@ -493,13 +550,16 @@ def system_status(account_id: str | None = None) -> SystemStatus:
     }
     if account_id is not None:
         account = accounts.accounts[account_id]
+        interlock = _execution_interlock_payload(account_id)
         account_payload = {
             "account_id": account.id,
             "state": account.bot_state,
             "mode": account.execution_mode,
             "lifecycle_status": account.lifecycle_status,
             "live_execution_enabled": account.live_execution_enabled,
-            "runtime_interlock": account.runtime_interlock,
+            "runtime_interlock": interlock["status"],
+            "interlock_reasons": interlock["reasons"],
+            "interlock_evidence": interlock["evidence"],
             "version": account.version,
         }
         freshness["connector"] = "healthy" if account.last_heartbeat_at else "unknown"
@@ -651,6 +711,7 @@ def submit_pairing_candidate(request: PairingCandidateRequest) -> dict[str, Any]
 
 def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
     account = accounts.accounts[account_id]
+    interlock = _execution_interlock_payload(account_id)
     execution_audit = [
         event.__dict__
         for event in execution.audit_events
@@ -691,6 +752,8 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
         ],
         "stream_watermark": dashboard_hub.watermark("account", account_id),
         "recovery": recovery,
+        "runtime_interlock": interlock,
+        "critical_alerts": interlock["critical_alerts"],
         "freshness": {
             "dashboard_stream": "healthy",
             "connector": "healthy" if account.connector_healthy else "unknown",
@@ -711,6 +774,8 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
                 "lifecycle_status": account.lifecycle_status,
                 "bot_state": account.bot_state,
                 "execution_mode": account.execution_mode,
+                "runtime_interlock": execution.runtime_interlock(account.id).status,
+                "interlock_reasons": list(execution.runtime_interlock(account.id).reasons),
                 "open_positions": sum(
                     1
                     for position in execution.positions.values()
@@ -738,6 +803,15 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
                 for record in execution.recovery_records(account.id)
                 if record["critical"]
             ],
+            *[
+                {
+                    **alert,
+                    "broker_account_id": account.id,
+                    "event_type": alert["reason_code"],
+                }
+                for account in available
+                for alert in execution.critical_alerts(account.id)
+            ],
         ],
         "global_emergency": [_global_emergency_payload(operation) for operation in execution.global_emergencies.values()],
         "account_watermarks": {
@@ -754,6 +828,72 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
 def dashboard_snapshot(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return _account_dashboard_payload(account_id)
+
+
+@app.get("/api/v1/broker-accounts/{account_id}/runtime-interlock", tags=["execution"])
+def runtime_interlock_snapshot(account_id: str) -> dict[str, Any]:
+    _require_account(account_id)
+    return {"account_id": account_id, "runtime_interlock": _execution_interlock_payload(account_id)}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/runtime-interlock/health", tags=["execution"])
+def observe_runtime_health(
+    account_id: str, request: RuntimeHealthRequest,
+) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        decision = execution.observe_runtime_health(
+            account_id,
+            connector_healthy=request.connector_healthy,
+            connector_gap=request.connector_gap,
+            broker_facts_fresh=request.broker_facts_fresh,
+            reconciliation_healthy=request.reconciliation_healthy,
+            risk_state_known=request.risk_state_known,
+            reservation_consistent=request.reservation_consistent,
+            ordering_safe=request.ordering_safe,
+            backup_observed_at=request.backup_observed_at,
+            alert_delivery_observed_at=request.alert_delivery_observed_at,
+            now=request.observed_at,
+            freshness_window=timedelta(seconds=request.freshness_window_seconds),
+            escalation_deadline=timedelta(seconds=request.escalation_deadline_seconds),
+        )
+    except (ExecutionError, ValueError) as error:
+        code = getattr(error, "code", str(error))
+        raise HTTPException(status_code=409, detail={"code": code}) from error
+    dashboard_hub.publish(
+        "account", account_id, "runtime_interlock.updated",
+        {"status": decision.status, "reasons": list(decision.reasons), "evidence": decision.evidence},
+    )
+    return {"account_id": account_id, "runtime_interlock": _execution_interlock_payload(account_id)}
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/runtime-interlock/recover", tags=["execution"])
+def recover_runtime_interlock(
+    account_id: str, request: RuntimeInterlockRecoveryRequest,
+) -> dict[str, Any]:
+    _require_account(account_id)
+    account = accounts.accounts[account_id]
+    _require_expected_version(account, request.expected_version)
+    evidence = dict(request.evidence)
+    evidence["custodian_reason"] = request.reason
+    try:
+        decision = execution.recover_runtime_interlock(
+            account_id, evidence=evidence, custodian_command=True,
+        )
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    _audit(
+        account_id,
+        "runtime_interlock.recovery.commanded",
+        request.reason,
+        {"evidence": evidence, "result": decision.status},
+        actor="custodian",
+    )
+    dashboard_hub.publish(
+        "account", account_id, "runtime_interlock.updated",
+        {"status": decision.status, "reasons": list(decision.reasons), "evidence": decision.evidence},
+    )
+    return {"account_id": account_id, "runtime_interlock": _execution_interlock_payload(account_id)}
 
 
 @app.get("/api/v1/broker-accounts/{account_id}/positions/{position_id}", tags=["positions"])
@@ -1090,6 +1230,37 @@ def set_calendar_health(account_id: str, request: CalendarHealthRequest) -> dict
         "observed_at": health.observed_at.isoformat(),
         "fence": fence.__dict__ if fence else None,
     }
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/calendar/overrides", status_code=status.HTTP_201_CREATED, tags=["calendar"])
+def create_calendar_override(
+    account_id: str, request: CalendarOverrideRequest,
+) -> dict[str, Any]:
+    _require_account(account_id)
+    try:
+        override = execution.add_manual_economic_event_override(
+            account_id,
+            blackout_start=request.blackout_start,
+            blackout_end=request.blackout_end,
+            expires_at=request.expires_at,
+            pair=request.pair,
+            currencies=request.currencies,
+            reason=request.reason,
+            override_id=request.override_id,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail={"code": str(error)}) from error
+    _audit(
+        account_id,
+        "calendar.manual_override.created",
+        request.reason,
+        override,
+        actor="custodian",
+    )
+    dashboard_hub.publish(
+        "account", account_id, "event.blackout.changed", {"override": override},
+    )
+    return {"account_id": account_id, "override": override}
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/strategy-configs/{config_id}/enrichment-policies", status_code=status.HTTP_201_CREATED, tags=["strategies"])
@@ -1768,6 +1939,7 @@ async def quote_stream(websocket: WebSocket) -> None:
 @app.websocket("/ws/v1/connector")
 async def connector_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    bound_account: BrokerAccount | None = None
     try:
         hello = await websocket.receive_json()
         if hello.get("type") == "pairing_candidate":
@@ -1851,9 +2023,11 @@ async def connector_stream(websocket: WebSocket) -> None:
         if not account or requested_identity != account.identity:
             await websocket.close(code=1008, reason="WRONG_ACCOUNT")
             return
+        bound_account = account
         try:
             accounts.authenticate(hello["account_id"], hello["key_id"], hello["secret"], hello["generation"])
             accounts.heartbeat(hello["account_id"], hello["generation"], hello["session_id"])
+            execution.observe_connector_health(account.id, healthy=True)
         except AccountError as error:
             await websocket.close(code=1008, reason=error.code)
             return
@@ -1875,6 +2049,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 continue
             if message.get("type") == "heartbeat":
                 accounts.heartbeat(account.id, account.connector_generation, message.get("session_id", ""))
+                execution.observe_connector_health(account.id, healthy=True)
                 await websocket.send_json({"type": "heartbeat_ack", "account_id": account.id, "generation": account.connector_generation})
             elif message.get("type") == "reconciliation_observation":
                 observation = message.get("observation")
@@ -1904,5 +2079,8 @@ async def connector_stream(websocket: WebSocket) -> None:
                 })
             else:
                 await websocket.send_json({"type": "error", "code": "READ_ONLY_FOUNDATION"})
-    except WebSocketDisconnect:
+    except WebSocketDisconnect as error:
+        if bound_account is not None and error.code not in {1000, 1001}:
+            accounts.mark_connector_unhealthy(bound_account.id)
+            execution.observe_connector_health(bound_account.id, healthy=False)
         return

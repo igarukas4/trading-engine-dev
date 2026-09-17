@@ -391,6 +391,14 @@ class AccountRegistry:
         self._persist_account(account)
         return account
 
+    def mark_connector_unhealthy(self, account_id: str) -> BrokerAccount:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
+        account.connector_healthy = False
+        self._persist_account(account)
+        return account
+
     def set_execution_mode(
         self,
         account_id: str,

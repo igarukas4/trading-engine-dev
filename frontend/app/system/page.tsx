@@ -39,6 +39,19 @@ type Recovery = {
   attempts?: number;
   critical?: boolean;
 };
+type RuntimeInterlock = {
+  status: string;
+  reasons: string[];
+  evidence: Record<string, unknown>;
+  requires_custodian_command: boolean;
+  protection: Array<{ position_id: string; status: string; native_stop_loss?: string | null }>;
+  critical_alerts: Array<{ id: string; reason_code: string; detail: string }>;
+};
+type DashboardSnapshot = {
+  audit_events?: AuditEvent[];
+  recovery?: Recovery[];
+  runtime_interlock?: RuntimeInterlock;
+};
 type Target = { account_id: string; status: string; detail?: string | null };
 type Emergency = {
   id: string;
@@ -94,6 +107,7 @@ export default function SystemPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [recovery, setRecovery] = useState<Recovery[]>([]);
+  const [interlock, setInterlock] = useState<RuntimeInterlock | null>(null);
   const [emergencies, setEmergencies] = useState<Emergency[]>([]);
   const [message, setMessage] = useState("");
   const [pairing, setPairing] = useState<Pairing | null>(null);
@@ -106,15 +120,16 @@ export default function SystemPage() {
       fetchJson<Status>(`${apiBase}/api/v1/system/status${query}`),
       fetchJson<{ global_emergency?: Emergency[] }>(`${apiBase}/api/v1/dashboard-summary-snapshot`),
       account
-        ? fetchJson<{ audit_events?: AuditEvent[]; recovery?: Recovery[] }>(
+        ? fetchJson<DashboardSnapshot>(
             `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
           )
-        : Promise.resolve({ audit_events: [], recovery: [] }),
+        : Promise.resolve<DashboardSnapshot>({ audit_events: [], recovery: [] }),
     ]).then(([nextStatus, summary, snapshot]) => {
       setStatus(nextStatus);
       setEmergencies(summary.global_emergency ?? []);
       setAudit(snapshot.audit_events ?? []);
       setRecovery(snapshot.recovery ?? []);
+      setInterlock(snapshot.runtime_interlock ?? null);
     }).catch(() => setStatus(null));
   }, []);
 
@@ -129,13 +144,14 @@ export default function SystemPage() {
       const message = JSON.parse(event.data) as { type?: string; broker_account_id?: string };
       if (
         message.broker_account_id === account
-        && (message.type?.startsWith("execution.reconciliation") || message.type?.startsWith("critical.reconciliation"))
+        && (message.type?.startsWith("execution.reconciliation") || message.type?.startsWith("execution.interlock") || message.type?.startsWith("critical.reconciliation"))
       ) {
-        fetchJson<{ audit_events?: AuditEvent[]; recovery?: Recovery[] }>(
+        fetchJson<DashboardSnapshot>(
           `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
         ).then((snapshot) => {
           setAudit(snapshot.audit_events ?? []);
           setRecovery(snapshot.recovery ?? []);
+          setInterlock(snapshot.runtime_interlock ?? null);
         }).catch(() => undefined);
       }
     };
@@ -226,6 +242,13 @@ export default function SystemPage() {
             </p>
           ))}
           {status.account && <p>State: {status.account.state} · Mode: {status.account.mode} · Lifecycle: {status.account.lifecycle_status}</p>}
+          {interlock && <>
+            <p>Runtime interlock: {interlock.status}</p>
+            <p>Interlock reasons: {interlock.reasons.length ? interlock.reasons.join(", ") : "none"}</p>
+            <p>Protection: {interlock.protection.map(item => `${item.position_id}:${item.status}`).join(", ") || "none"}</p>
+            <p>Critical alerts: {interlock.critical_alerts.length}</p>
+            {interlock.requires_custodian_command && <p>Recovery requires an audited custodian command.</p>}
+          </>}
           <p>Execution available: {status.execution_available ? "Ya" : "Tidak"}</p>
           <p>{status.message}</p>
         </section>
