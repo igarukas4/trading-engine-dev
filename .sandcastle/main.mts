@@ -165,8 +165,8 @@ const reviewerAgent = sandcastle.codex("gpt-5.6-luna", {
   captureSessions: false,
 });
 
-const mergerAgent = sandcastle.codex("gpt-5.6-terra", {
-  effort: "high",
+const mergerAgent = sandcastle.codex("gpt-5.6-sol", {
+  effort: "low",
   captureSessions: false,
 });
 

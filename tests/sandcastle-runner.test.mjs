@@ -83,7 +83,7 @@ test("Sandcastle uses the canonical role-specific Codex profiles", () => {
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.codex\("gpt-5\.6-terra", \{\s+effort: "high",/,
+    /const mergerAgent = sandcastle\.codex\("gpt-5\.6-sol", \{\s+effort: "low",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);
