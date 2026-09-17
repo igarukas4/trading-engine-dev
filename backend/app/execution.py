@@ -53,6 +53,9 @@ CONNECTOR_HEALTH_REASONS = frozenset(
 PROTECTION_INTERLOCK_REASONS = frozenset(
     {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"}
 )
+RESTART_RECOVERY_REASON = "RESTART_RECONCILIATION_REQUIRED"
+UNRESOLVED_RECONCILIATION_STATUSES = frozenset({"PENDING", "ESCALATED"})
+COMPLETE_RECONCILIATION_SECTIONS = frozenset({"orders", "fills", "positions"})
 
 
 def canonical_order_hash(
@@ -2487,8 +2490,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self._audit(
                 account.account_id,
                 "execution.recovery.started",
-                reason="RESTART_RECONCILIATION_REQUIRED",
+                reason=RESTART_RECOVERY_REASON,
             )
+
+    def _has_unresolved_reconciliation(self, account_id: str) -> bool:
+        return any(
+            work.account_id == account_id
+            and work.status in UNRESOLVED_RECONCILIATION_STATUSES
+            for work in self.reconciliation_work.values()
+        )
 
     def _complete_restart_recovery(
         self, account_id: str, *, observed_at: datetime | None = None
@@ -2496,18 +2506,14 @@ class ExecutionCoordinator(ExecutionSubstrate):
         account = self.account(account_id)
         if not account.recovery_required:
             return
-        if any(
-            work.account_id == account_id
-            and work.status in {"PENDING", "ESCALATED"}
-            for work in self.reconciliation_work.values()
-        ):
+        if self._has_unresolved_reconciliation(account_id):
             return
         if account.quarantine_requires_command:
             return
         account.interlock_reasons = tuple(
             reason
             for reason in account.interlock_reasons
-            if reason != "RESTART_RECONCILIATION_REQUIRED"
+            if reason != RESTART_RECOVERY_REASON
         )
         account.recovery_status = "READY"
         account.recovery_required = False
@@ -2536,7 +2542,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             "runtime_interlock": account.runtime_interlock,
             "reasons": list(account.interlock_reasons),
             "recovery_reason": (
-                "RESTART_RECONCILIATION_REQUIRED"
+                RESTART_RECOVERY_REASON
                 if account.recovery_required
                 else None
             ),
@@ -2600,7 +2606,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 item for item in self.reconciliation_work.values()
                 if item.account_id == account_id and item.subject_id == subject_id
                 and (subject_kind is None or item.subject_kind == subject_kind)
-                and item.status in {"PENDING", "ESCALATED"}
+                and item.status in UNRESOLVED_RECONCILIATION_STATUSES
             ),
             None,
         )
@@ -2648,10 +2654,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             item for item in self.reconciliation_work.values()
             if item.account_id == account_id
         ]
-        unresolved = any(
-            item.account_id == account_id and item.status in {"PENDING", "ESCALATED"}
-            for item in self.reconciliation_work.values()
-        )
+        unresolved = self._has_unresolved_reconciliation(account_id)
         protection_unconfirmed = any(
             position.account_id == account_id
             and position.protection_status != "CONFIRMED"
@@ -3106,11 +3109,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def confirm_protection(self, *args: Any, **kwargs: Any) -> Position:
         with self._mutation():
             account_id = args[0] if args else kwargs["account_id"]
-            recovery_pending = any(
-                item.account_id == account_id
-                and item.status in {"PENDING", "ESCALATED"}
-                for item in self.reconciliation_work.values()
-            )
+            recovery_pending = self._has_unresolved_reconciliation(account_id)
             result = super().confirm_protection(*args, **kwargs)
             if recovery_pending:
                 self.account(account_id).exposure_gate = "QUARANTINED"
@@ -3240,8 +3239,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if observed_account is not None and str(observed_account) != account_id:
             raise ExecutionError("WRONG_ACCOUNT")
         if observation.get("complete"):
-            required_sections = {"orders", "fills", "positions"}
-            if not required_sections.issubset(observation):
+            if not COMPLETE_RECONCILIATION_SECTIONS.issubset(observation):
                 raise ExecutionError("INCOMPLETE_RECONCILIATION")
         applied: list[str] = []
         duplicates: list[str] = []

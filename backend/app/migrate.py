@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
@@ -43,14 +43,6 @@ def validate_schema_compatibility(
             "DATABASE_SCHEMA_NEWER_THAN_IMAGE",
             f"database contains migrations unavailable to this image: {versions}",
         )
-    if applied and available:
-        applied_head = max(_migration_number(version) for version in applied)
-        image_head = max(_migration_number(version) for version in available)
-        if applied_head > image_head:
-            raise SchemaCompatibilityError(
-                "DATABASE_SCHEMA_NEWER_THAN_IMAGE",
-                "database schema is newer than the migration set in this image",
-            )
 
 
 def database_url_from_environment() -> str:
