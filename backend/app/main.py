@@ -768,6 +768,7 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
         ],
         "stream_watermark": dashboard_hub.watermark("account", account_id),
         "recovery": recovery,
+        "restart_recovery": execution.recovery_snapshot(account_id),
         "runtime_interlock": interlock,
         "critical_alerts": interlock["critical_alerts"],
         "freshness": {
@@ -792,6 +793,7 @@ def dashboard_summary_snapshot() -> dict[str, Any]:
                 "execution_mode": account.execution_mode,
                 "runtime_interlock": execution.runtime_interlock(account.id).status,
                 "interlock_reasons": list(execution.runtime_interlock(account.id).reasons),
+                "restart_recovery": execution.recovery_snapshot(account.id),
                 "open_positions": sum(
                     1
                     for position in execution.positions.values()

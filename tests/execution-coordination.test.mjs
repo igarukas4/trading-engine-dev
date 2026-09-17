@@ -429,7 +429,8 @@ with TemporaryDirectory() as directory:
     assert restarted.orders[unknown.id].status == "SUBMITTED"
     assert restarted.account("account-a").exposure_gate == "OPEN"
     assert restarted.recovery_records("account-a")[0]["status"] == "RECOVERED"
-    assert restarted.account("account-b").exposure_gate == "OPEN"
+    assert restarted.account("account-b").exposure_gate == "FENCE_PENDING"
+    assert restarted.recovery_snapshot("account-b")["status"] == "RECOVERING"
 
     stuck = accept(restarted, "account-a", "signal-stuck")
     restarted.dispatch_next("account-a", Broker())
@@ -438,7 +439,7 @@ with TemporaryDirectory() as directory:
     escalated = [item for item in restarted.recovery_records("account-a") if item["subject_id"] == stuck.id][0]
     assert escalated["status"] == "ESCALATED" and escalated["critical"]
     assert restarted.account("account-a").exposure_gate == "QUARANTINED"
-    assert restarted.account("account-b").exposure_gate == "OPEN"
+    assert restarted.account("account-b").exposure_gate == "FENCE_PENDING"
     try:
         accept(restarted, "account-a", "signal-after-deadline")
     except ExecutionError as error: assert error.code == "EXPOSURE_GATE_CLOSED"

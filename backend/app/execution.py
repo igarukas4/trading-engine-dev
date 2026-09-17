@@ -89,6 +89,13 @@ class AccountExecutionState:
     interlock_evidence: dict[str, Any] = field(default_factory=dict)
     quarantine_requires_command: bool = False
     interlock_updated_at: datetime | None = None
+    recovery_status: Literal["READY", "RECOVERING"] = "READY"
+    recovery_required: bool = False
+    recovery_gate_before: Literal[
+        "OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"
+    ] = "OPEN"
+    recovery_started_at: datetime | None = None
+    recovery_completed_at: datetime | None = None
 
 
 @dataclass
@@ -2283,6 +2290,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if self._state_store is not None:
             self._restore(self._state_store.load())
             with self._mutation():
+                self._begin_restart_recovery()
                 self._recover_inflight_dispatches()
 
     def _snapshot(self) -> dict[str, Any]:
@@ -2363,6 +2371,13 @@ class ExecutionCoordinator(ExecutionSubstrate):
         state = _deserialize_state_value(state)
         for key, value in state.get("accounts", {}).items():
             value["interlock_reasons"] = tuple(value.get("interlock_reasons", ()))
+            for timestamp_key in (
+                "interlock_updated_at",
+                "recovery_started_at",
+                "recovery_completed_at",
+            ):
+                if value.get(timestamp_key) is not None:
+                    value[timestamp_key] = _state_datetime(value[timestamp_key])
             self._accounts[key] = AccountExecutionState(**value)
         for key, value in state.get("reservations", {}).items():
             self.reservations[key] = RiskReservation(**value)
@@ -2450,6 +2465,93 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self._recover_inflight_subject(command, "POSITION_COMMAND")
         for command in self.commands.values():
             self._recover_inflight_subject(command, "COMMAND")
+
+    def _begin_restart_recovery(self) -> None:
+        """Fence every restored account until its complete broker snapshot arrives."""
+        for account in self._accounts.values():
+            if account.recovery_status == "RECOVERING":
+                continue
+            account.recovery_status = "RECOVERING"
+            account.recovery_required = True
+            account.recovery_gate_before = account.exposure_gate
+            account.recovery_started_at = _now()
+            account.recovery_completed_at = None
+            account.interlock_evidence = {
+                **account.interlock_evidence,
+                "recovery_started_at": account.recovery_started_at.isoformat(),
+            }
+            if account.runtime_interlock != "QUARANTINED":
+                account.runtime_interlock = "BLOCKED"
+            if account.exposure_gate == "OPEN":
+                account.exposure_gate = "FENCE_PENDING"
+            self._audit(
+                account.account_id,
+                "execution.recovery.started",
+                reason="RESTART_RECONCILIATION_REQUIRED",
+            )
+
+    def _complete_restart_recovery(
+        self, account_id: str, *, observed_at: datetime | None = None
+    ) -> None:
+        account = self.account(account_id)
+        if not account.recovery_required:
+            return
+        if any(
+            work.account_id == account_id
+            and work.status in {"PENDING", "ESCALATED"}
+            for work in self.reconciliation_work.values()
+        ):
+            return
+        if account.quarantine_requires_command:
+            return
+        account.interlock_reasons = tuple(
+            reason
+            for reason in account.interlock_reasons
+            if reason != "RESTART_RECONCILIATION_REQUIRED"
+        )
+        account.recovery_status = "READY"
+        account.recovery_required = False
+        account.recovery_completed_at = _as_utc(observed_at or _now())
+        if not account.interlock_reasons:
+            account.runtime_interlock = "ELIGIBLE"
+            if account.recovery_gate_before == "OPEN":
+                account.exposure_gate = "OPEN"
+            elif account.exposure_gate != "OPEN":
+                account.exposure_gate = account.recovery_gate_before
+        self._audit(
+            account_id,
+            "execution.recovery.completed",
+            completed_at=account.recovery_completed_at.isoformat(),
+            exposure_gate=account.exposure_gate,
+        )
+
+    def recovery_snapshot(self, account_id: str) -> dict[str, Any]:
+        """Return restart recovery progress without exposing another account."""
+        account = self.account(account_id)
+        return {
+            "account_id": account_id,
+            "status": account.recovery_status,
+            "required": account.recovery_required,
+            "exposure_gate": account.exposure_gate,
+            "runtime_interlock": account.runtime_interlock,
+            "reasons": list(account.interlock_reasons),
+            "recovery_reason": (
+                "RESTART_RECONCILIATION_REQUIRED"
+                if account.recovery_required
+                else None
+            ),
+            "started_at": (
+                account.recovery_started_at.isoformat()
+                if account.recovery_started_at
+                else None
+            ),
+            "completed_at": (
+                account.recovery_completed_at.isoformat()
+                if account.recovery_completed_at
+                else None
+            ),
+            "pending_work": self.recovery_records(account_id),
+        }
 
     def _recover_inflight_subject(
         self,
@@ -2812,6 +2914,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             result = super().recover(account_id, order_id, connector)
             if result.status != "UNKNOWN":
                 self._complete_work_if_converged(account_id, order_id)
+                self._complete_restart_recovery(account_id)
             self._audit(
                 account_id,
                 "execution.reconciled",
@@ -2829,6 +2932,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 self._complete_non_order_work_if_converged(
                     account_id, command_id, "POSITION_COMMAND",
                 )
+                self._complete_restart_recovery(account_id)
             self._audit(
                 account_id, "execution.position_command.reconciled",
                 command_id=command_id, status=result.status,
@@ -2844,6 +2948,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 self._complete_non_order_work_if_converged(
                     account_id, command_id, "COMMAND",
                 )
+                self._complete_restart_recovery(account_id)
             self._audit(
                 account_id, "execution.command.reconciled",
                 command_id=command_id, status=result.status,
@@ -3134,6 +3239,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
         observed_account = observation.get("account_id", observation.get("broker_account_id"))
         if observed_account is not None and str(observed_account) != account_id:
             raise ExecutionError("WRONG_ACCOUNT")
+        if observation.get("complete"):
+            required_sections = {"orders", "fills", "positions"}
+            if not required_sections.issubset(observation):
+                raise ExecutionError("INCOMPLETE_RECONCILIATION")
         applied: list[str] = []
         duplicates: list[str] = []
         position_ids: list[str] = []
@@ -3263,6 +3372,13 @@ class ExecutionCoordinator(ExecutionSubstrate):
             for order_id in reconciled_order_ids:
                 self._complete_work_if_converged(account_id, order_id)
             self._restore_temporary_entry_eligibility(account_id)
+            if observation.get("complete"):
+                self._complete_restart_recovery(
+                    account_id,
+                    observed_at=_state_datetime(observation["observed_at"])
+                    if observation.get("observed_at")
+                    else None,
+                )
             return ReconciliationResult(
                 account_id,
                 status,
