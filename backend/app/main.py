@@ -1309,6 +1309,11 @@ def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str,
     if account.execution_mode != "FULL_AUTO" or signal.as_dict()["status"] != "ELIGIBLE":
         return None
     opportunity = signal.opportunity
+    if getattr(signal, "account_id", account.id) != account.id:
+        raise ExecutionError("WRONG_ACCOUNT")
+    opportunity_account = opportunity.get("account_id")
+    if opportunity_account is not None and str(opportunity_account) != account.id:
+        raise ExecutionError("WRONG_ACCOUNT")
     payload = {
         "symbol": str(opportunity.get("pair", "")),
         "side": "BUY" if opportunity.get("direction") == "LONG" else "SELL",
@@ -1336,6 +1341,7 @@ def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str,
             execution_epoch=execution.account(account.id).execution_epoch,
             risk_amount=str(signal.risk_context["requested_risk"]),
             order_payload=payload,
+            account_ready=account.lifecycle_status == "ENABLED" and account.can_enable,
         )
     _audit(
         account.id, "execution.full_auto.scheduled", "eligible Signal scheduled",
@@ -1582,6 +1588,7 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
                     execution_epoch=execution.account(account_id).execution_epoch,
                     risk_amount=str(signal.risk_context["requested_risk"]),
                     order_payload=semi_auto_payload,
+                    account_ready=account.lifecycle_status == "ENABLED" and account.can_enable,
                 )
         except ExecutionError as error:
             raise HTTPException(status_code=409, detail={"code": error.code}) from error
@@ -1851,15 +1858,15 @@ async def connector_stream(websocket: WebSocket) -> None:
             await websocket.close(code=1008, reason=error.code)
             return
         await websocket.send_json({"type": "snapshot", "snapshot": accounts.read_only_snapshot(account.id)})
-        pending_recovery = [
+        recovery = [
             record for record in execution.recovery_records(account.id)
-            if record["recovery_legal"]
+            if record["status"] in {"PENDING", "ESCALATED"}
         ]
-        if pending_recovery:
+        if recovery:
             await websocket.send_json({
                 "type": "reconciliation.required",
                 "account_id": account.id,
-                "recovery": pending_recovery,
+                "recovery": recovery,
             })
         while True:
             message = await websocket.receive_json()
@@ -1886,12 +1893,14 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "status": result.status,
                         "applied_fill_ids": result.applied_fill_ids,
                         "duplicate_fill_ids": result.duplicate_fill_ids,
+                        "recovery": execution.recovery_records(account.id),
                     },
                 )
                 await websocket.send_json({
                     "type": "reconciliation_observed",
                     "account_id": account.id,
                     "status": result.status,
+                    "recovery": execution.recovery_records(account.id),
                 })
             else:
                 await websocket.send_json({"type": "error", "code": "READ_ONLY_FOUNDATION"})

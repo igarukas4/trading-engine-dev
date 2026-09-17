@@ -311,6 +311,16 @@ accepted = engine.schedule_automated_signal(
     live_lock=True, execution_epoch=1, order_payload=payload,
 )
 assert accepted.order.risk_assessment_id in engine.risk_assessments
+try:
+    engine.schedule_automated_signal(
+        account_id="account-a", signal_id="ready-signal", idempotency_key="not-ready",
+        mode="FULL_AUTO", signal_created_at=now, signal_revision=1,
+        signal_eligible=True, signal_approved=False, mode_changed_at=now,
+        risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_ready=False,
+        account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload=payload,
+    )
+except ExecutionError as error: assert error.code == "EXECUTION_GATE_UNSAFE"
+else: raise AssertionError("FULL_AUTO bypassed account readiness")
 print("ok")
 `);
   assert.match(output, /ok/);
@@ -497,15 +507,384 @@ test("ambiguous close-all and position commands stay UNKNOWN until broker observ
 from backend.app.execution import ExecutionCoordinator
 
 class Broker:
-    def close_all(self, account_id): return None
+    def __init__(self): self.close_calls = 0; self.command_status = None
+    def close_all(self, account_id): self.close_calls += 1; return "TIMEOUT"
+    def command_state(self, command): return self.command_status
 
 engine = ExecutionCoordinator()
-close = engine.close_all(account_id="a", idempotency_key="close", reason="operator", confirmed=True, connector=Broker())
+broker = Broker()
+close = engine.close_all(account_id="a", idempotency_key="close", reason="operator", confirmed=True, connector=broker)
 assert close.status == "UNKNOWN"
 work = engine.recovery_records("a")[0]
 assert work["subject_id"] == close.id and work["kind"] == "COMMAND"
-engine.reconcile_observation("a", {"commands": [{"command_id": close.id, "status": "CONFIRMED"}]})
+broker.command_status = {"status": "EXECUTED"}
+assert engine.reconcile_due("a", broker)[0].status == "EXECUTED"
+assert broker.close_calls == 1
 assert close.status == "EXECUTED" and engine.recovery_records("a")[0]["status"] == "RECOVERED"
+engine.reconcile_observation("a", {"commands": [{"command_id": close.id, "status": "UNKNOWN"}]})
+assert close.status == "EXECUTED" and len(engine.recovery_records("a")) == 1
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("ambiguous pending-order cancellation is recovered without a second cancel", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def __init__(self): self.send_calls = 0; self.cancel_calls = 0; self.command_status = None
+    def order_check(self, order): return True
+    def order_send(self, order): self.send_calls += 1; return "SUBMITTED"
+    def cancel_order(self, order): self.cancel_calls += 1; return "TIMEOUT"
+    def command_state(self, command): return self.command_status
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+broker = Broker()
+assert engine.dispatch_next("a", broker).status == "SUBMITTED"
+cancel = engine.cancel_order(account_id="a", order_id=entry.order.id, idempotency_key="cancel",
+    reason="risk change", confirmed=True, connector=broker)
+assert cancel.status == "UNKNOWN" and broker.cancel_calls == 1
+broker.command_status = {"status": "EXECUTED"}
+assert engine.reconcile_due("a", broker)[0].status == "EXECUTED"
+assert broker.cancel_calls == 1
+assert entry.order.status == "CANCELLED" and entry.reservation.status == "RELEASED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("automatic reconciliation resolves ambiguous position commands without resending", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def __init__(self): self.modify_calls = 0; self.command_status = None
+    def modify_position(self, command):
+        self.modify_calls += 1
+        return "TIMEOUT"
+    def command_state(self, command):
+        return self.command_status
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator(reconciliation_deadline=timedelta(minutes=1))
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1", "symbol": "EURUSD", "stop_loss": "95"}, now=now)
+engine.record_fill("a", entry.order.id, "deal", "1", native_protection_confirmed=True)
+engine.record_exit_fill("a", entry.order.id, "tp1", "TP1", "0.1")
+engine.record_exit_fill("a", entry.order.id, "tp2", "TP2", "0.1")
+command = engine.request_trailing("a", entry.order.id, "96", direction="LONG",
+    closed_candle=True, atomic_capability=True)
+broker = Broker()
+assert engine.dispatch_position_command("a", command.id, broker).status == "UNKNOWN"
+assert broker.modify_calls == 1
+assert engine.recovery_records("a")[0]["subject_id"] == command.id
+broker.command_status = {"status": "CONFIRMED", "stop": "96"}
+result = engine.reconcile_due("a", broker, now=now + timedelta(seconds=1))
+assert result[0].status == "CONFIRMED"
+assert broker.modify_calls == 1
+assert command.status == "CONFIRMED"
+assert engine.recovery_records("a")[0]["status"] == "RECOVERED"
+assert engine.account("a").exposure_gate == "OPEN"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("broker UNKNOWN observations create recoverable account-local work", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def journal(self, order): return None
+    def broker_state(self, order): return {"status": "SUBMITTED", "external_id": "broker-1"}
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+observation = {"orders": [{"order_id": entry.order.id, "status": "UNKNOWN"}]}
+engine.reconcile_observation("a", observation)
+records = engine.recovery_records("a")
+assert len(records) == 1 and records[0]["subject_id"] == entry.order.id
+assert records[0]["status"] == "PENDING"
+assert engine.account("a").exposure_gate == "QUARANTINED"
+assert engine.reconcile_due("a", Broker(), now=now + timedelta(seconds=1))[0].status == "SUBMITTED"
+assert engine.recovery_records("a")[0]["status"] == "RECOVERED"
+assert engine.account("a").exposure_gate == "OPEN"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("unknown recovery preserves an independent account fence", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def order_check(self, order): return True
+    def order_send(self, order): return "TIMEOUT"
+    def broker_state(self, order): return {"status": "SUBMITTED"}
+    def journal(self, order): return None
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+engine.install_fence("a", "EMERGENCY_STOP")
+assert engine.dispatch_next("a", Broker()).status == "UNKNOWN"
+assert engine.reconcile_due("a", Broker(), now=now + timedelta(seconds=1))[0].status == "SUBMITTED"
+assert engine.account("a").exposure_gate == "FENCE_PENDING"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("recovery does not replace an independent fence installed after an earlier recovery", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Broker:
+    def order_check(self, order): return True
+    def order_send(self, order): return "TIMEOUT"
+    def journal(self, order): return None
+    def broker_state(self, order): return {"status": "SUBMITTED"}
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+def assessment(signal_id):
+    return RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id=signal_id)
+first = engine.accept_execution(account_id="a", signal_id="first", idempotency_key="first",
+    canonical_hash="first", execution_epoch=1, risk_assessment=assessment("first"),
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+assert engine.dispatch_next("a", Broker()).status == "UNKNOWN"
+assert engine.reconcile_due("a", Broker(), now=now + timedelta(seconds=1))[0].status == "SUBMITTED"
+second = engine.accept_execution(account_id="a", signal_id="second", idempotency_key="second",
+    canonical_hash="second", execution_epoch=engine.account("a").execution_epoch,
+    risk_assessment=assessment("second"),
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+engine.install_fence("a", "EMERGENCY_STOP")
+assert engine.dispatch_next("a", Broker()).status == "UNKNOWN"
+assert engine.reconcile_due("a", Broker(), now=now + timedelta(seconds=2))[0].status == "SUBMITTED"
+assert engine.account("a").exposure_gate == "FENCE_PENDING"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("protection confirmation cannot reopen an account with unresolved UNKNOWN work", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1", "stop_loss": "95"}, now=now)
+engine.record_fill("a", entry.order.id, "deal", "1", native_protection_confirmed=True)
+engine.record_exit_fill("a", entry.order.id, "tp1", "TP1", "0.1")
+engine.record_exit_fill("a", entry.order.id, "tp2", "TP2", "0.1")
+command = engine.request_trailing("a", entry.order.id, "96", direction="LONG",
+    closed_candle=True, atomic_capability=True)
+engine.mark_position_command_unknown("a", command.id)
+engine.confirm_protection("a", entry.order.id)
+assert engine.account("a").exposure_gate == "QUARANTINED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("durable dispatch checkpoints the journal before broker invocation", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class Store:
+    def __init__(self): self.state = None; self.saves = []
+    def load(self): return self.state
+    def save(self, state): self.state = state; self.saves.append(state)
+
+class Broker:
+    def __init__(self, store, order_id): self.store = store; self.order_id = order_id
+    def order_check(self, order):
+        assert self.store.state["orders"][self.order_id]["status"] == "DISPATCHING"
+        assert self.store.state["journal"][self.order_id]["state"] == "DISPATCHING"
+        return True
+    def order_send(self, order): return {"status": "SUBMITTED", "external_id": "broker-1"}
+
+now = datetime.now(timezone.utc)
+store = Store()
+engine = ExecutionCoordinator(state_store=store)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+assert engine.dispatch_next("a", Broker(store, entry.order.id)).status == "SUBMITTED"
+assert len(store.saves) >= 2
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("reconciliation ignores stale order states after a terminal broker result", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+engine = ExecutionCoordinator()
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+    canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"volume": "1"}, now=now)
+engine.reconcile_observation("a", {
+    "orders": [{"order_id": entry.order.id, "status": "FILLED"}],
+    "fills": [{"deal_id": "deal", "order_id": entry.order.id, "volume": "1", "entry": "IN"}],
+})
+engine.reconcile_observation("a", {
+    "orders": [{"order_id": entry.order.id, "status": "SUBMITTED"}],
+    "fills": [{"deal_id": "deal", "order_id": entry.order.id, "volume": "1", "entry": "IN"}],
+})
+assert entry.order.status == "FILLED"
+assert entry.reservation.status == "CONSUMED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("FULL_AUTO uses account readiness instead of bypassing lifecycle gates", () => {
+  const output = run(`
+from datetime import timedelta
+from types import SimpleNamespace
+
+import backend.app.main as main
+from backend.app.broker_accounts import BrokerAccount
+from backend.app.execution import ExecutionCoordinator, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
+
+account = BrokerAccount("mt5", "demo", "full-auto", "full-auto")
+account.execution_mode = "FULL_AUTO"
+account.bot_state = "RUNNING"
+account.connector_bound = True
+account.connector_healthy = True
+account.reconciliation_complete = True
+account.risk_limits_active = True
+account.mappings_valid = True
+signal = SimpleNamespace(
+    id="signal", account_id=account.id, revision=1, created_at=account.mode_changed_at,
+    expires_at=account.mode_changed_at + timedelta(minutes=1),
+    strategy_config_version_id="config", stop_loss="95", take_profit=("105",),
+    opportunity={"account_id": account.id, "pair": "EURUSD", "direction": "LONG"},
+    risk_context={"requested_risk": "0.1"},
+    as_dict=lambda: {"status": "ELIGIBLE"},
+)
+assessment = RiskAssessment(account.id, 1, True, purpose="PRE_ORDER",
+    assessed_at=account.mode_changed_at,
+    valid_until=account.mode_changed_at + timedelta(minutes=1),
+    signal_revision=1, signal_id=signal.id)
+original_execution = main.execution
+original_assessment = main._pre_order_risk_assessment
+main.execution = ExecutionCoordinator()
+main._pre_order_risk_assessment = lambda *args, **kwargs: assessment
+try:
+    signal.account_id = "other-account"
+    try:
+        main._schedule_full_auto_signal(signal, account)
+    except ExecutionError as error: assert error.code == "WRONG_ACCOUNT"
+    else: raise AssertionError("FULL_AUTO accepted a foreign Signal")
+    signal.account_id = account.id
+    try:
+        main._schedule_full_auto_signal(signal, account)
+    except ExecutionError as error: assert error.code == "EXECUTION_GATE_UNSAFE"
+    else: raise AssertionError("FULL_AUTO scheduled for a disabled account")
+    account.lifecycle_status = "ENABLED"
+    first = main._schedule_full_auto_signal(signal, account)
+    second = main._schedule_full_auto_signal(signal, account)
+    assert first["order_id"] == second["order_id"]
+finally:
+    main.execution = original_execution
+    main._pre_order_risk_assessment = original_assessment
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("restart converts a persisted DISPATCHING order into UNKNOWN recovery", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+from tempfile import TemporaryDirectory
+
+from backend.app.execution import ExecutionCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+class CrashBroker:
+    def order_check(self, order): raise KeyboardInterrupt()
+    def order_send(self, order): raise AssertionError("order_send must not run")
+
+class TruthBroker:
+    def order_check(self, order): raise AssertionError("recovery must not check")
+    def order_send(self, order): raise AssertionError("recovery must not send")
+    def journal(self, order): return None
+    def broker_state(self, order): return {"status": "SUBMITTED", "external_id": "broker-1"}
+
+now = datetime.now(timezone.utc)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
+with TemporaryDirectory() as directory:
+    path = f"{directory}/execution.json"
+    engine = ExecutionCoordinator(state_path=path)
+    entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
+        canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
+        signal_revision=1, order_payload={"volume": "1"}, now=now)
+    try: engine.dispatch_next("a", CrashBroker())
+    except KeyboardInterrupt: pass
+    restarted = ExecutionCoordinator(state_path=path)
+    assert restarted.orders[entry.order.id].status == "UNKNOWN"
+    assert restarted.recovery_records("a")[0]["status"] == "PENDING"
+    assert restarted.reconcile_due("a", TruthBroker(), now=now + timedelta(seconds=1))[0].status == "SUBMITTED"
+    assert restarted.recovery_records("a")[0]["status"] == "RECOVERED"
 print("ok")
 `);
   assert.match(output, /ok/);

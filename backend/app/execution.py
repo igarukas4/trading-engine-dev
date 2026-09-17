@@ -165,7 +165,7 @@ class PositionCommand:
     command_type: Literal["TP1", "TP2", "TRAIL", "CLOSE"]
     requested_volume: str | None
     reduce_only: bool = True
-    status: Literal["RECEIVED", "CONFIRMED", "UNKNOWN", "REJECTED"] = "RECEIVED"
+    status: Literal["RECEIVED", "DISPATCHING", "CONFIRMED", "UNKNOWN", "REJECTED"] = "RECEIVED"
     requested_stop: str | None = None
     confirmed_stop: str | None = None
     reason: str | None = None
@@ -237,6 +237,7 @@ class ReconciliationWork:
     attempts: int = 0
     last_attempt_at: datetime | None = None
     reason: str = "CONNECTOR_RESULT_AMBIGUOUS"
+    entry_gate_before: Literal["OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"] = "OPEN"
 
 
 class ExecutionStateStore(Protocol):
@@ -310,7 +311,9 @@ class PostgresExecutionStore:
                 )
 
 
-OperatorCommandKind = Literal["APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL"]
+OperatorCommandKind = Literal[
+    "APPROVE_SIGNAL", "EXECUTE_SIGNAL", "CLOSE_ALL", "CANCEL_ORDER"
+]
 
 
 @dataclass
@@ -343,7 +346,7 @@ class OperatorCommand:
     idempotency_key: str
     reason: str
     confirmed: bool
-    status: Literal["ACCEPTED", "REJECTED", "EXECUTED", "UNKNOWN"]
+    status: Literal["ACCEPTED", "DISPATCHING", "REJECTED", "EXECUTED", "UNKNOWN"]
     rejection_code: str | None = None
     order_id: str | None = None
 
@@ -616,6 +619,7 @@ class ExecutionSubstrate:
         account_state: str, live_lock: bool, execution_epoch: int,
         order_payload: dict[str, Any], risk_amount: str = "0",
         risk_assessment: RiskAssessment | None = None,
+        account_ready: bool = True,
     ) -> PreOrderResult:
         """Schedule exactly one account-local order for an eligible Signal."""
         with self._lock_for(account_id):
@@ -635,7 +639,7 @@ class ExecutionSubstrate:
                 raise ExecutionError("SIGNAL_NOT_ELIGIBLE")
             if mode == "SEMI_AUTO" and not signal_approved:
                 raise ExecutionError("SIGNAL_APPROVAL_REQUIRED")
-            if not all((signal_fresh, fence_safe, live_lock)):
+            if not all((signal_fresh, fence_safe, live_lock, account_ready)):
                 raise ExecutionError("EXECUTION_GATE_UNSAFE")
             if account_state != "RUNNING":
                 raise ExecutionError("ACCOUNT_STATE_UNSAFE")
@@ -707,18 +711,85 @@ class ExecutionSubstrate:
                 confirmed=confirmed,
             )
             if command.status == "ACCEPTED" and connector is not None:
+                command.status = "DISPATCHING"
+                self._before_connector_call(command)
+                close_all = getattr(connector, "close_all", None)
+                if not callable(close_all):
+                    command.status = "REJECTED"
+                    command.rejection_code = "CONNECTOR_CAPABILITY_UNAVAILABLE"
+                    return command
                 try:
-                    response = connector.close_all(account_id)
+                    response = close_all(account_id)
                 except Exception:
                     response = None
-                response_is_ambiguous = response is None or (
-                    isinstance(response, dict) and response.get("status") == "UNKNOWN"
-                )
-                if response_is_ambiguous:
+                if self._response_is_ambiguous(response):
                     command.status = "UNKNOWN"
                     command.rejection_code = "RECONCILIATION_PENDING"
-                else:
+                elif self._response_status(response) in {
+                    "ACCEPTED", "CONFIRMED", "EXECUTED", "FILLED", "CLOSED"
+                }:
                     command.status = "EXECUTED"
+                else:
+                    command.status = "REJECTED"
+                    command.rejection_code = "CONNECTOR_REJECTED"
+            return command
+
+    def _apply_cancel_order(self, order_id: str) -> None:
+        order = self.orders.get(order_id)
+        if order is None:
+            return
+        order.status = "CANCELLED"
+        self._reservation_for(order_id).status = "RELEASED"
+        event = self._event_for(order_id)
+        if event.status in {"PENDING", "DISPATCHING"}:
+            event.status = "ABORTED"
+
+    def cancel_order(
+        self, *, account_id: str, order_id: str, idempotency_key: str,
+        reason: str, confirmed: bool, connector: Any | None = None,
+    ) -> OperatorCommand:
+        """Cancel one pending entry with durable ambiguity handling."""
+        with self._lock_for(account_id):
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            if order.status == "UNKNOWN":
+                raise ExecutionError("RECONCILIATION_PENDING")
+            if order.status not in {"INTENT", "SUBMITTED", "PARTIALLY_FILLED"}:
+                raise ExecutionError("ORDER_NOT_CANCELLABLE")
+            command = self._command(
+                account_id=account_id,
+                signal_id=order.signal_id,
+                kind="CANCEL_ORDER",
+                idempotency_key=idempotency_key,
+                reason=reason,
+                confirmed=confirmed,
+            )
+            command.order_id = order_id
+            if command.status != "ACCEPTED" or connector is None:
+                return command
+            command.status = "DISPATCHING"
+            self._before_connector_call(command)
+            cancel_order = getattr(connector, "cancel_order", None)
+            if not callable(cancel_order):
+                command.status = "REJECTED"
+                command.rejection_code = "CONNECTOR_CAPABILITY_UNAVAILABLE"
+                return command
+            try:
+                response = cancel_order(order)
+            except Exception:
+                response = None
+            if self._response_is_ambiguous(response):
+                command.status = "UNKNOWN"
+                command.rejection_code = "RECONCILIATION_PENDING"
+            elif self._response_status(response) in {
+                "ACCEPTED", "CONFIRMED", "EXECUTED", "CANCELLED", "CLOSED"
+            }:
+                command.status = "EXECUTED"
+                self._apply_cancel_order(order_id)
+            else:
+                command.status = "REJECTED"
+                command.rejection_code = "CONNECTOR_REJECTED"
             return command
 
     def outbox(self, account_id: str) -> list[OutboxEvent]:
@@ -762,6 +833,64 @@ class ExecutionSubstrate:
         reservation.status = "RELEASED"
         return DispatchResult(order.id, "REJECTED", reason)
 
+    def _before_connector_call(self, subject: Any) -> None:
+        """Hook for durable coordinators to checkpoint before broker I/O."""
+
+    @staticmethod
+    def _connector_method(
+        connector: Any, names: tuple[str, ...], subject: Any,
+    ) -> Any:
+        for name in names:
+            method = getattr(connector, name, None)
+            if callable(method):
+                return method(subject)
+        raise AttributeError("connector capability is unavailable")
+
+    @staticmethod
+    def _connector_query(
+        connector: Any, names: tuple[str, ...], subject: Any, account_id: str,
+    ) -> Any:
+        for name in names:
+            method = getattr(connector, name, None)
+            if not callable(method):
+                continue
+            try:
+                response = method(subject)
+            except TypeError:
+                try:
+                    response = method(account_id)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if response is not None:
+                return response
+        return None
+
+    @staticmethod
+    def _response_status(response: Any) -> str | None:
+        if response is None:
+            return None
+        if isinstance(response, dict):
+            value = response.get("status")
+            return str(value).upper() if value is not None else None
+        return str(response).upper()
+
+    @staticmethod
+    def _response_is_ambiguous(response: Any) -> bool:
+        return ExecutionSubstrate._response_status(response) in {
+            None, "UNKNOWN", "TIMEOUT", "AMBIGUOUS", "UNAVAILABLE"
+        }
+
+    @staticmethod
+    def _response_value(response: Any, *names: str) -> Any:
+        if not isinstance(response, dict):
+            return None
+        for name in names:
+            if response.get(name) is not None:
+                return response[name]
+        return None
+
     def dispatch_next(self, account_id: str, connector: Any) -> DispatchResult:
         with self._lock_for(account_id):
             if any(
@@ -785,6 +914,7 @@ class ExecutionSubstrate:
             )
             self.journal[order.id] = journal
             order.status = "DISPATCHING"
+            self._before_connector_call(order)
             try:
                 checked = connector.order_check(order)
             except Exception:
@@ -797,15 +927,16 @@ class ExecutionSubstrate:
                 response = connector.order_send(order)
             except Exception:
                 response = "TIMEOUT"
-            if response == "TIMEOUT" or response is None:
+            if self._response_is_ambiguous(response):
                 order.status = "UNKNOWN"
                 return DispatchResult(order.id, "UNKNOWN", "CONNECTOR_RESULT_AMBIGUOUS")
-            accepted = response if isinstance(response, dict) else {"status": str(response)}
-            if accepted.get("status") not in {"ACCEPTED", "SUBMITTED", "FILLED"}:
+            response_status = self._response_status(response)
+            accepted = response if isinstance(response, dict) else {"status": response_status}
+            if response_status not in {"ACCEPTED", "SUBMITTED", "FILLED"}:
                 return self._reject_dispatch(
                     event, order, reservation, journal, "CONNECTOR_REJECTED"
                 )
-            if accepted.get("status") == "FILLED":
+            if response_status == "FILLED":
                 order.status = "FILLED"
             else:
                 order.status = "SUBMITTED"
@@ -814,6 +945,120 @@ class ExecutionSubstrate:
             journal.external_id = order.external_id
             event.status = "PUBLISHED"
             return DispatchResult(order.id, order.status)
+
+    def dispatch_position_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        """Send one reduce-only position command after durable preparation."""
+        with self._lock_for(account_id):
+            command = next(
+                (item for item in self.position_commands if item.id == command_id),
+                None,
+            )
+            if command is None or command.account_id != account_id:
+                raise ExecutionError("POSITION_COMMAND_NOT_FOUND")
+            if command.status == "UNKNOWN":
+                raise ExecutionError("RECONCILIATION_PENDING")
+            if command.status != "RECEIVED":
+                return DispatchResult(command.id, command.status)
+            capability_names = (
+                ("modify_position", "modify")
+                if command.command_type == "TRAIL"
+                else ("close_position", "close")
+            )
+            if not any(callable(getattr(connector, name, None)) for name in capability_names):
+                command.status = "REJECTED"
+                command.reason = "CONNECTOR_CAPABILITY_UNAVAILABLE"
+                return DispatchResult(command.id, "REJECTED", "CONNECTOR_CAPABILITY_UNAVAILABLE")
+            command.status = "DISPATCHING"
+            self._before_connector_call(command)
+            try:
+                response = self._connector_method(connector, capability_names, command)
+            except Exception:
+                response = None
+            status = self._response_status(response)
+            if status is None or status == "UNKNOWN" or status == "TIMEOUT":
+                command.status = "UNKNOWN"
+                return DispatchResult(command.id, "UNKNOWN", "CONNECTOR_RESULT_AMBIGUOUS")
+            if status in {"ACCEPTED", "CONFIRMED", "EXECUTED", "FILLED", "CLOSED"}:
+                command.status = "CONFIRMED"
+                if command.command_type == "TRAIL":
+                    confirmed_stop = self._response_value(
+                        response, "confirmed_stop", "stop", "requested_stop"
+                    )
+                    if confirmed_stop is not None:
+                        command.confirmed_stop = str(confirmed_stop)
+                        self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
+                return DispatchResult(command.id, "CONFIRMED")
+            command.status = "REJECTED"
+            command.reason = f"CONNECTOR_{status}"
+            return DispatchResult(command.id, "REJECTED", "CONNECTOR_REJECTED")
+
+    def recover_position_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        """Read broker truth for an UNKNOWN position command without resending."""
+        with self._lock_for(account_id):
+            command = next(
+                (item for item in self.position_commands if item.id == command_id),
+                None,
+            )
+            if command is None or command.account_id != account_id:
+                raise ExecutionError("POSITION_COMMAND_NOT_FOUND")
+            if command.status != "UNKNOWN":
+                return DispatchResult(command.id, command.status)
+            response = self._connector_query(
+                connector,
+                ("position_command_state", "command_state", "broker_command_state"),
+                command,
+                account_id,
+            )
+            status = self._response_status(response)
+            if status in {"CONFIRMED", "EXECUTED", "FILLED", "CLOSED", "ACCEPTED"}:
+                command.status = "CONFIRMED"
+                if command.command_type == "TRAIL":
+                    confirmed_stop = self._response_value(
+                        response, "confirmed_stop", "stop", "requested_stop"
+                    )
+                    if confirmed_stop is not None:
+                        command.confirmed_stop = str(confirmed_stop)
+                        self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
+                return DispatchResult(command.id, "CONFIRMED")
+            if status in {"REJECTED", "NOT_FOUND", "CANCELLED"}:
+                command.status = "REJECTED"
+                return DispatchResult(command.id, "REJECTED", "CONNECTOR_REJECTED")
+            return DispatchResult(command.id, "UNKNOWN", "RECONCILIATION_PENDING")
+
+    def recover_operator_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        """Read broker truth for an UNKNOWN operator command without resending."""
+        with self._lock_for(account_id):
+            command = self.commands.get(command_id)
+            if command is None or command.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            if command.status != "UNKNOWN":
+                return DispatchResult(command.id, command.status)
+            response = self._connector_query(
+                connector,
+                ("command_state", "close_all_state", "broker_command_state"),
+                command,
+                account_id,
+            )
+            status = self._response_status(response)
+            if status in {"CONFIRMED", "EXECUTED", "FILLED", "CLOSED", "ACCEPTED"}:
+                command.status = "EXECUTED"
+                command.rejection_code = None
+                self._apply_operator_command(command)
+                return DispatchResult(command.id, "EXECUTED")
+            if status in {"REJECTED", "NOT_FOUND", "CANCELLED"}:
+                command.status = "REJECTED"
+                return DispatchResult(command.id, "REJECTED", "CONNECTOR_REJECTED")
+            return DispatchResult(command.id, "UNKNOWN", "RECONCILIATION_PENDING")
+
+    def _apply_operator_command(self, command: OperatorCommand) -> None:
+        if command.kind == "CANCEL_ORDER" and command.order_id is not None:
+            self._apply_cancel_order(command.order_id)
 
     def recover(self, account_id: str, order_id: str, connector: Any) -> DispatchResult:
         with self._lock_for(account_id):
@@ -825,36 +1070,36 @@ class ExecutionSubstrate:
             journal = self.journal.get(order.id)
             if journal is None:
                 raise ExecutionError("JOURNAL_MISSING")
-            observed = None
-            try:
-                observed = connector.journal(order)
-            except Exception:
-                observed = None
+            observed = self._connector_query(
+                connector, ("journal",), order, account_id
+            )
             if not observed:
-                try:
-                    observed = connector.broker_state(order)
-                except Exception:
-                    observed = None
+                observed = self._connector_query(
+                    connector, ("broker_state",), order, account_id
+                )
             if not observed:
                 return DispatchResult(order.id, "UNKNOWN", "RECONCILIATION_PENDING")
             if isinstance(observed, dict):
-                status = observed.get("status")
+                status = self._response_status(observed)
                 external_id = observed.get("external_id")
             else:
-                status = str(observed)
+                status = self._response_status(observed)
                 external_id = None
             if status == "FILLED":
                 order.status = "FILLED"
                 order.external_id = external_id
                 journal.state = "ACCEPTED"
+                self._event_for(order.id).status = "PUBLISHED"
                 self._reservation_for(order.id).status = "CONSUMED"
             elif status in {"ACCEPTED", "SUBMITTED", "PARTIALLY_FILLED"}:
                 order.status = "PARTIALLY_FILLED" if status == "PARTIALLY_FILLED" else "SUBMITTED"
                 order.external_id = external_id
                 journal.state = "ACCEPTED"
+                self._event_for(order.id).status = "PUBLISHED"
             elif status in {"REJECTED", "NOT_FOUND"}:
                 order.status = "REJECTED"
                 journal.state = "REJECTED"
+                self._event_for(order.id).status = "ABORTED"
                 self._reservation_for(order.id).status = "RELEASED"
             return DispatchResult(order.id, order.status)
 
@@ -1227,6 +1472,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
         self.risk_assessments: dict[str, dict[str, Any]] = {}
         if self._state_store is not None:
             self._restore(self._state_store.load())
+            with self._mutation():
+                self._recover_inflight_dispatches()
 
     def _snapshot(self) -> dict[str, Any]:
         return _serialize_state_value(
@@ -1363,10 +1610,56 @@ class ExecutionCoordinator(ExecutionSubstrate):
             if command.kind == "APPROVE_SIGNAL" and command.signal_id:
                 self._approved_signals[(command.account_id, command.signal_id)] = command.id
 
+    def _recover_inflight_dispatches(self) -> None:
+        """Turn pre-crash side-effect checkpoints into journal-first recovery work."""
+        for order in self.orders.values():
+            journal = self.journal.get(order.id)
+            if order.status == "DISPATCHING" or (
+                journal is not None and journal.state == "DISPATCHING"
+            ):
+                order.status = "UNKNOWN"
+                self._record_unknown(
+                    order.account_id,
+                    order.id,
+                    now=journal.observed_at if journal is not None else None,
+                )
+            elif order.status == "UNKNOWN" and self._work_for(
+                order.account_id, order.id, "ORDER"
+            ) is None:
+                self._record_unknown(order.account_id, order.id)
+        for command in self.position_commands:
+            if command.status == "DISPATCHING":
+                command.status = "UNKNOWN"
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="POSITION_COMMAND"
+                )
+            elif command.status == "UNKNOWN" and self._work_for(
+                command.account_id, command.id, "POSITION_COMMAND"
+            ) is None:
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="POSITION_COMMAND"
+                )
+        for command in self.commands.values():
+            if command.status == "DISPATCHING":
+                command.status = "UNKNOWN"
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="COMMAND"
+                )
+            elif command.status == "UNKNOWN" and self._work_for(
+                command.account_id, command.id, "COMMAND"
+            ) is None:
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="COMMAND"
+                )
+
     def _audit(self, account_id: str, event_type: str, **payload: Any) -> None:
         self.audit_events.append(
             AuditEvent(str(uuid4()), account_id, event_type, payload, _now())
         )
+
+    def _before_connector_call(self, subject: Any) -> None:
+        """Make the journal/checkpoint visible before invoking broker I/O."""
+        self._save()
 
     def _work_for(
         self, account_id: str, subject_id: str,
@@ -1391,13 +1684,22 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if existing is not None:
             return existing
         observed_at = now or _now()
+        account = self.account(account_id)
+        if subject_kind == "ORDER" and order_id not in self.journal:
+            order = self.orders.get(order_id)
+            if order is not None:
+                self.journal[order_id] = ConnectorJournalEntry(
+                    str(uuid4()), account_id, order_id, order.dispatch_sequence,
+                    "DISPATCHING", observed_at=observed_at,
+                )
         work = ReconciliationWork(
             id=str(uuid4()), account_id=account_id, subject_id=order_id,
             subject_kind=subject_kind, first_seen_at=observed_at,
             deadline_at=observed_at + self.reconciliation_deadline,
+            entry_gate_before=account.exposure_gate,
         )
         self.reconciliation_work[work.id] = work
-        self.account(account_id).exposure_gate = "QUARANTINED"
+        account.exposure_gate = "QUARANTINED"
         self.install_fence(account_id, "UNKNOWN_RECONCILIATION")
         self._audit(
             account_id, "execution.reconciliation.pending", order_id=order_id,
@@ -1407,6 +1709,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def _restore_temporary_entry_eligibility(self, account_id: str) -> None:
         """Reopen only the temporary UNKNOWN fence after all local facts converge."""
+        account_work = [
+            item for item in self.reconciliation_work.values()
+            if item.account_id == account_id
+        ]
         unresolved = any(
             item.account_id == account_id and item.status in {"PENDING", "ESCALATED"}
             for item in self.reconciliation_work.values()
@@ -1417,16 +1723,25 @@ class ExecutionCoordinator(ExecutionSubstrate):
             for position in self.positions.values()
         )
         account = self.account(account_id)
+        prior_gates = {item.entry_gate_before for item in account_work}
+        prior_gate = (
+            "STOPPED" if "STOPPED" in prior_gates
+            else "FENCE_PENDING" if "FENCE_PENDING" in prior_gates
+            else "OPEN"
+        )
         if not unresolved and not protection_unconfirmed and account.exposure_gate == "QUARANTINED":
-            account.exposure_gate = "OPEN"
-            self._audit(account_id, "execution.reconciliation.recovered")
+            if prior_gate == "OPEN":
+                account.exposure_gate = "OPEN"
+                self._audit(account_id, "execution.reconciliation.recovered")
+            elif prior_gate in {"FENCE_PENDING", "STOPPED"}:
+                account.exposure_gate = prior_gate
 
     def _complete_work_if_converged(self, account_id: str, order_id: str) -> None:
         order = self.orders.get(order_id)
         if order is None or order.account_id != account_id or order.status == "UNKNOWN":
             return
         work = self._work_for(account_id, order_id, "ORDER")
-        if work is not None:
+        if work is not None and work.status == "PENDING":
             work.status = "RECOVERED"
             self._audit(
                 account_id, "execution.reconciliation.converged",
@@ -1439,7 +1754,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         subject_kind: Literal["POSITION_COMMAND", "COMMAND"],
     ) -> None:
         work = self._work_for(account_id, subject_id, subject_kind)
-        if work is None:
+        if work is None or work.status != "PENDING":
             return
         work.status = "RECOVERED"
         self._audit(
@@ -1449,14 +1764,18 @@ class ExecutionCoordinator(ExecutionSubstrate):
         self._restore_temporary_entry_eligibility(account_id)
 
     def advance_recovery_deadlines(
-        self, *, now: datetime | None = None,
+        self, *, now: datetime | None = None, account_id: str | None = None,
     ) -> tuple[ReconciliationWork, ...]:
         """Escalate overdue work even while its connector is disconnected."""
         at = now or _now()
         escalated: list[ReconciliationWork] = []
         with self._mutation():
             for work in self.reconciliation_work.values():
-                if work.status == "PENDING" and at >= work.deadline_at:
+                if (
+                    (account_id is None or work.account_id == account_id)
+                    and work.status == "PENDING"
+                    and at >= work.deadline_at
+                ):
                     work.status = "ESCALATED"
                     escalated.append(work)
                     self._audit(
@@ -1622,6 +1941,25 @@ class ExecutionCoordinator(ExecutionSubstrate):
             )
             return result
 
+    def dispatch_position_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        with self._mutation():
+            result = super().dispatch_position_command(account_id, command_id, connector)
+            if result.status == "UNKNOWN":
+                self._record_unknown(
+                    account_id, command_id, subject_kind="POSITION_COMMAND",
+                )
+            else:
+                self._complete_non_order_work_if_converged(
+                    account_id, command_id, "POSITION_COMMAND",
+                )
+            self._audit(
+                account_id, "execution.position_command.dispatch",
+                command_id=command_id, status=result.status,
+            )
+            return result
+
     def recover(self, account_id: str, order_id: str, connector: Any) -> DispatchResult:
         with self._mutation():
             result = super().recover(account_id, order_id, connector)
@@ -1632,6 +1970,36 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 "execution.reconciled",
                 order_id=order_id,
                 status=result.status,
+            )
+            return result
+
+    def recover_position_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        with self._mutation():
+            result = super().recover_position_command(account_id, command_id, connector)
+            if result.status != "UNKNOWN":
+                self._complete_non_order_work_if_converged(
+                    account_id, command_id, "POSITION_COMMAND",
+                )
+            self._audit(
+                account_id, "execution.position_command.reconciled",
+                command_id=command_id, status=result.status,
+            )
+            return result
+
+    def recover_operator_command(
+        self, account_id: str, command_id: str, connector: Any,
+    ) -> DispatchResult:
+        with self._mutation():
+            result = super().recover_operator_command(account_id, command_id, connector)
+            if result.status != "UNKNOWN":
+                self._complete_non_order_work_if_converged(
+                    account_id, command_id, "COMMAND",
+                )
+            self._audit(
+                account_id, "execution.command.reconciled",
+                command_id=command_id, status=result.status,
             )
             return result
 
@@ -1653,13 +2021,21 @@ class ExecutionCoordinator(ExecutionSubstrate):
             ]
             for work in due:
                 if at >= work.deadline_at:
-                    self.advance_recovery_deadlines(now=at)
+                    self.advance_recovery_deadlines(account_id=account_id, now=at)
                     results.append(DispatchResult(work.subject_id, "UNKNOWN", "ESCALATION_DEADLINE_EXCEEDED"))
                     continue
                 work.attempts += 1
                 work.last_attempt_at = at
                 if work.subject_kind != "ORDER":
-                    results.append(DispatchResult(work.subject_id, "UNKNOWN", "RECONCILIATION_PENDING"))
+                    if work.subject_kind == "POSITION_COMMAND":
+                        result = self.recover_position_command(
+                            account_id, work.subject_id, connector,
+                        )
+                    else:
+                        result = self.recover_operator_command(
+                            account_id, work.subject_id, connector,
+                        )
+                    results.append(result)
                     continue
                 result = self.recover(account_id, work.subject_id, connector)
                 results.append(result)
@@ -1680,6 +2056,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def close_all(self, **kwargs: Any) -> OperatorCommand:
         with self._mutation():
             command = super().close_all(**kwargs)
+            if command.status == "UNKNOWN":
+                self._record_unknown(
+                    command.account_id, command.id, subject_kind="COMMAND",
+                )
+            return command
+
+    def cancel_order(self, **kwargs: Any) -> OperatorCommand:
+        with self._mutation():
+            command = super().cancel_order(**kwargs)
             if command.status == "UNKNOWN":
                 self._record_unknown(
                     command.account_id, command.id, subject_kind="COMMAND",
@@ -1717,7 +2102,18 @@ class ExecutionCoordinator(ExecutionSubstrate):
 
     def confirm_protection(self, *args: Any, **kwargs: Any) -> Position:
         with self._mutation():
-            return super().confirm_protection(*args, **kwargs)
+            account_id = args[0] if args else kwargs["account_id"]
+            recovery_pending = any(
+                item.account_id == account_id
+                and item.status in {"PENDING", "ESCALATED"}
+                for item in self.reconciliation_work.values()
+            )
+            result = super().confirm_protection(*args, **kwargs)
+            if recovery_pending:
+                self.account(account_id).exposure_gate = "QUARANTINED"
+            else:
+                self._restore_temporary_entry_eligibility(account_id)
+            return result
 
     def request_position_close(self, *args: Any, **kwargs: Any) -> PositionCommand:
         with self._mutation():
@@ -1798,6 +2194,26 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self.account(account_id).exposure_gate = "QUARANTINED"
         return position
 
+    @staticmethod
+    def _apply_order_observation(order: OrderIntent, observed_status: str) -> bool:
+        """Apply broker status without allowing an older snapshot to regress it."""
+        if order.status == "FILLED" and observed_status != "FILLED":
+            return False
+        if order.status in {"REJECTED", "CANCELLED"} and observed_status not in {
+            order.status, "FILLED"
+        }:
+            return False
+        if order.status == "PARTIALLY_FILLED" and observed_status in {
+            "SUBMITTED", "CHECKED", "DISPATCHING", "INTENT"
+        }:
+            return False
+        if observed_status == "UNKNOWN" and order.status not in {
+            "UNKNOWN", "INTENT", "CHECKED", "DISPATCHING"
+        }:
+            return False
+        order.status = observed_status
+        return True
+
     def reconcile_observation(
         self, account_id: str, observation: dict[str, Any]
     ) -> ReconciliationResult:
@@ -1808,14 +2224,22 @@ class ExecutionCoordinator(ExecutionSubstrate):
         applied: list[str] = []
         duplicates: list[str] = []
         position_ids: list[str] = []
+        unknown_order_ids: list[str] = []
         with self._mutation(), self._lock_for(account_id):
             for item in observation.get("orders", ()):
                 order_id = str(item.get("order_id", ""))
                 order = self.orders.get(order_id)
                 if order is None or order.account_id != account_id:
                     raise ExecutionError("WRONG_ACCOUNT")
-                if item.get("status") in {"SUBMITTED", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "UNKNOWN"}:
-                    order.status = item["status"]
+                observed_status = str(item.get("status", "")).upper()
+                if observed_status in {"SUBMITTED", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "UNKNOWN"}:
+                    applied_status = self._apply_order_observation(order, observed_status)
+                    if applied_status and observed_status == "UNKNOWN":
+                        unknown_order_ids.append(order_id)
+                    if applied_status and observed_status == "FILLED":
+                        self._reservation_for(order_id).status = "CONSUMED"
+                    elif applied_status and observed_status in {"REJECTED", "CANCELLED"}:
+                        self._reservation_for(order_id).status = "RELEASED"
                 if item.get("external_id") is not None:
                     order.external_id = str(item["external_id"])
             for item in observation.get("commands", ()):
@@ -1823,12 +2247,21 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 command = self.commands.get(command_id)
                 if command is None or command.account_id != account_id:
                     raise ExecutionError("WRONG_ACCOUNT")
-                observed_status = str(item.get("status", ""))
+                observed_status = str(item.get("status", "")).upper()
+                if command.status in {"EXECUTED", "REJECTED"} and observed_status not in {
+                    "CONFIRMED", "EXECUTED"
+                }:
+                    continue
                 if observed_status in {"CONFIRMED", "EXECUTED"}:
                     command.status = "EXECUTED"
+                    command.rejection_code = None
+                    self._apply_operator_command(command)
                     self._complete_non_order_work_if_converged(
                         account_id, command.id, "COMMAND"
                     )
+                elif observed_status == "UNKNOWN":
+                    command.status = "UNKNOWN"
+                    self._record_unknown(account_id, command.id, subject_kind="COMMAND")
                 elif observed_status in {"REJECTED", "CANCELLED", "NOT_FOUND"}:
                     command.status = "REJECTED"
                     self._complete_non_order_work_if_converged(
@@ -1842,11 +2275,25 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 )
                 if command is None or command.account_id != account_id:
                     raise ExecutionError("WRONG_ACCOUNT")
-                observed_status = str(item.get("status", ""))
-                if observed_status == "CONFIRMED":
+                observed_status = str(item.get("status", "")).upper()
+                if command.status in {"CONFIRMED", "REJECTED"} and observed_status not in {
+                    "CONFIRMED", "EXECUTED"
+                }:
+                    continue
+                if observed_status in {"CONFIRMED", "EXECUTED"}:
                     command.status = "CONFIRMED"
+                    if command.command_type == "TRAIL":
+                        confirmed_stop = item.get("confirmed_stop", item.get("stop"))
+                        if confirmed_stop is not None:
+                            command.confirmed_stop = str(confirmed_stop)
+                            self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
                     self._complete_non_order_work_if_converged(
                         account_id, command.id, "POSITION_COMMAND"
+                    )
+                elif observed_status == "UNKNOWN":
+                    command.status = "UNKNOWN"
+                    self._record_unknown(
+                        account_id, command.id, subject_kind="POSITION_COMMAND"
                     )
                 elif observed_status in {"REJECTED", "CANCELLED", "NOT_FOUND"}:
                     command.status = "REJECTED"
@@ -1887,6 +2334,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
             for item in observation.get("positions", ()):
                 position = self._project_position(account_id, item)
                 position_ids.append(position.external_position_id or position.order_id)
+            for order_id in unknown_order_ids:
+                self._record_unknown(account_id, order_id)
             order_ids = {str(item.get("order_id")) for item in observation.get("fills", ())}
             statuses = [self.orders[item].status for item in order_ids if item in self.orders]
             status = statuses[0] if statuses else "RECONCILED"
@@ -1902,6 +2351,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             )
             for order_id in reconciled_order_ids:
                 self._complete_work_if_converged(account_id, order_id)
+            self._restore_temporary_entry_eligibility(account_id)
             return ReconciliationResult(
                 account_id,
                 status,
