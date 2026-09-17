@@ -891,6 +891,23 @@ class ExecutionSubstrate:
                 return response[name]
         return None
 
+    def _apply_confirmed_trailing_stop(
+        self,
+        account_id: str,
+        command: PositionCommand,
+        response: Any,
+        *response_fields: str,
+    ) -> None:
+        if command.command_type != "TRAIL":
+            return
+        confirmed_stop = self._response_value(response, *response_fields)
+        if confirmed_stop is None:
+            return
+        confirmed_stop = str(confirmed_stop)
+        command.confirmed_stop = confirmed_stop
+        position = self.position(account_id, command.order_id)
+        position.last_confirmed_stop = confirmed_stop
+
     def dispatch_next(self, account_id: str, connector: Any) -> DispatchResult:
         with self._lock_for(account_id):
             if any(
@@ -982,13 +999,10 @@ class ExecutionSubstrate:
                 return DispatchResult(command.id, "UNKNOWN", "CONNECTOR_RESULT_AMBIGUOUS")
             if status in {"ACCEPTED", "CONFIRMED", "EXECUTED", "FILLED", "CLOSED"}:
                 command.status = "CONFIRMED"
-                if command.command_type == "TRAIL":
-                    confirmed_stop = self._response_value(
-                        response, "confirmed_stop", "stop", "requested_stop"
-                    )
-                    if confirmed_stop is not None:
-                        command.confirmed_stop = str(confirmed_stop)
-                        self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
+                self._apply_confirmed_trailing_stop(
+                    account_id, command, response,
+                    "confirmed_stop", "stop", "requested_stop",
+                )
                 return DispatchResult(command.id, "CONFIRMED")
             command.status = "REJECTED"
             command.reason = f"CONNECTOR_{status}"
@@ -1016,13 +1030,10 @@ class ExecutionSubstrate:
             status = self._response_status(response)
             if status in {"CONFIRMED", "EXECUTED", "FILLED", "CLOSED", "ACCEPTED"}:
                 command.status = "CONFIRMED"
-                if command.command_type == "TRAIL":
-                    confirmed_stop = self._response_value(
-                        response, "confirmed_stop", "stop", "requested_stop"
-                    )
-                    if confirmed_stop is not None:
-                        command.confirmed_stop = str(confirmed_stop)
-                        self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
+                self._apply_confirmed_trailing_stop(
+                    account_id, command, response,
+                    "confirmed_stop", "stop", "requested_stop",
+                )
                 return DispatchResult(command.id, "CONFIRMED")
             if status in {"REJECTED", "NOT_FOUND", "CANCELLED"}:
                 command.status = "REJECTED"
@@ -1079,12 +1090,8 @@ class ExecutionSubstrate:
                 )
             if not observed:
                 return DispatchResult(order.id, "UNKNOWN", "RECONCILIATION_PENDING")
-            if isinstance(observed, dict):
-                status = self._response_status(observed)
-                external_id = observed.get("external_id")
-            else:
-                status = self._response_status(observed)
-                external_id = None
+            status = self._response_status(observed)
+            external_id = self._response_value(observed, "external_id")
             if status == "FILLED":
                 order.status = "FILLED"
                 order.external_id = external_id
@@ -1613,44 +1620,42 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def _recover_inflight_dispatches(self) -> None:
         """Turn pre-crash side-effect checkpoints into journal-first recovery work."""
         for order in self.orders.values():
-            journal = self.journal.get(order.id)
-            if order.status == "DISPATCHING" or (
-                journal is not None and journal.state == "DISPATCHING"
-            ):
-                order.status = "UNKNOWN"
-                self._record_unknown(
-                    order.account_id,
-                    order.id,
-                    now=journal.observed_at if journal is not None else None,
-                )
-            elif order.status == "UNKNOWN" and self._work_for(
-                order.account_id, order.id, "ORDER"
-            ) is None:
-                self._record_unknown(order.account_id, order.id)
+            self._recover_inflight_subject(
+                order, "ORDER", journal=self.journal.get(order.id)
+            )
         for command in self.position_commands:
-            if command.status == "DISPATCHING":
-                command.status = "UNKNOWN"
-                self._record_unknown(
-                    command.account_id, command.id, subject_kind="POSITION_COMMAND"
-                )
-            elif command.status == "UNKNOWN" and self._work_for(
-                command.account_id, command.id, "POSITION_COMMAND"
-            ) is None:
-                self._record_unknown(
-                    command.account_id, command.id, subject_kind="POSITION_COMMAND"
-                )
+            self._recover_inflight_subject(command, "POSITION_COMMAND")
         for command in self.commands.values():
-            if command.status == "DISPATCHING":
-                command.status = "UNKNOWN"
-                self._record_unknown(
-                    command.account_id, command.id, subject_kind="COMMAND"
-                )
-            elif command.status == "UNKNOWN" and self._work_for(
-                command.account_id, command.id, "COMMAND"
-            ) is None:
-                self._record_unknown(
-                    command.account_id, command.id, subject_kind="COMMAND"
-                )
+            self._recover_inflight_subject(command, "COMMAND")
+
+    def _recover_inflight_subject(
+        self,
+        subject: OrderIntent | PositionCommand | OperatorCommand,
+        subject_kind: Literal["ORDER", "POSITION_COMMAND", "COMMAND"],
+        *,
+        journal: ConnectorJournalEntry | None = None,
+    ) -> None:
+        journal_is_inflight = (
+            subject_kind == "ORDER"
+            and journal is not None
+            and journal.state == "DISPATCHING"
+        )
+        if subject.status == "DISPATCHING" or journal_is_inflight:
+            subject.status = "UNKNOWN"
+            observed_at = journal.observed_at if journal is not None else None
+            self._record_unknown(
+                subject.account_id,
+                subject.id,
+                now=observed_at if subject_kind == "ORDER" else None,
+                subject_kind=subject_kind,
+            )
+            return
+        if subject.status == "UNKNOWN" and self._work_for(
+            subject.account_id, subject.id, subject_kind
+        ) is None:
+            self._record_unknown(
+                subject.account_id, subject.id, subject_kind=subject_kind
+            )
 
     def _audit(self, account_id: str, event_type: str, **payload: Any) -> None:
         self.audit_events.append(
@@ -1724,11 +1729,12 @@ class ExecutionCoordinator(ExecutionSubstrate):
         )
         account = self.account(account_id)
         prior_gates = {item.entry_gate_before for item in account_work}
-        prior_gate = (
-            "STOPPED" if "STOPPED" in prior_gates
-            else "FENCE_PENDING" if "FENCE_PENDING" in prior_gates
-            else "OPEN"
-        )
+        if "STOPPED" in prior_gates:
+            prior_gate = "STOPPED"
+        elif "FENCE_PENDING" in prior_gates:
+            prior_gate = "FENCE_PENDING"
+        else:
+            prior_gate = "OPEN"
         if not unresolved and not protection_unconfirmed and account.exposure_gate == "QUARANTINED":
             if prior_gate == "OPEN":
                 account.exposure_gate = "OPEN"
@@ -2282,11 +2288,9 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     continue
                 if observed_status in {"CONFIRMED", "EXECUTED"}:
                     command.status = "CONFIRMED"
-                    if command.command_type == "TRAIL":
-                        confirmed_stop = item.get("confirmed_stop", item.get("stop"))
-                        if confirmed_stop is not None:
-                            command.confirmed_stop = str(confirmed_stop)
-                            self.position(account_id, command.order_id).last_confirmed_stop = str(confirmed_stop)
+                    self._apply_confirmed_trailing_stop(
+                        account_id, command, item, "confirmed_stop", "stop"
+                    )
                     self._complete_non_order_work_if_converged(
                         account_id, command.id, "POSITION_COMMAND"
                     )
