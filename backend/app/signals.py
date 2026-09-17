@@ -138,15 +138,17 @@ class SignalStore:
         opportunity = _freeze(deepcopy(opportunity))
         at = created_at or _now()
         expires_at = at + ttl
+        signal_id = f"signal-{uuid4()}"
         assessment = self.risk_engine.assess(
             account_id,
             limits,
             now=at,
             signal_expires_at=expires_at,
+            signal_id=signal_id,
             **(risk_kwargs or {}),
         )
         signal = Signal(
-            id=f"signal-{uuid4()}",
+            id=signal_id,
             account_id=account_id,
             opportunity=opportunity,
             market_snapshot_id=market_snapshot_id,
@@ -216,7 +218,11 @@ class SignalStore:
             created,
             revision=prior.revision + 1,
             supersedes_signal_id=signal_id,
-            risk_assessment=replace(created.risk_assessment, signal_revision=prior.revision + 1),
+            risk_assessment=replace(
+                created.risk_assessment,
+                signal_revision=prior.revision + 1,
+                signal_id=created.id,
+            ),
         )
         self.signals[revised.id] = revised
         return revised

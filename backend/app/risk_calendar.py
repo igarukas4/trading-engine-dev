@@ -156,6 +156,7 @@ class RiskAssessment:
     valid_until: datetime | None = None
     purpose: Literal["INITIAL", "PRE_ORDER"] = "INITIAL"
     signal_revision: int | None = None
+    signal_id: str | None = None
     assessed_at: datetime | None = None
     evidence: tuple[tuple[str, str], ...] = ()
 
@@ -181,6 +182,7 @@ class RiskEngine:
         spread_multiple: Decimal | None = None,
         volatility_multiple: Decimal | None = None,
         account_state: str = "RUNNING",
+        signal_id: str | None = None,
         signal_revision: int | None = None,
         approved_revision: int | None = None,
     ) -> RiskAssessment:
@@ -236,6 +238,7 @@ class RiskEngine:
             reason_codes=tuple(dict.fromkeys(reasons)),
             valid_until=valid_until,
             purpose=purpose,
+            signal_id=signal_id,
             signal_revision=signal_revision,
             assessed_at=assessed_at,
             evidence=evidence,

@@ -7,26 +7,50 @@ const run = (script) => execFileSync(process.execPath, ["tests/python.mjs", "-c"
 
 test("pre-order is atomic, account-scoped, idempotent, and ordered", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id, *, valid_until=None):
+    return RiskAssessment(
+        account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=valid_until or now + timedelta(seconds=20),
+        signal_revision=1, signal_id=signal_id,
+    )
 engine = ExecutionSubstrate()
+try:
+    engine.pre_order(
+        account_id="account-a", signal_id="signal-a", idempotency_key="missing-risk",
+        canonical_hash="missing-risk", execution_epoch=1, risk_assessment=None,
+        signal_revision=1, order_payload={}, now=now,
+    )
+except ExecutionError as error:
+    assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
+else:
+    raise AssertionError("pre-order accepted no PRE_ORDER assessment")
 created = engine.pre_order(
     account_id="account-a", signal_id="signal-a", idempotency_key="idem-1",
-    canonical_hash="hash-1", risk_approved=True, execution_epoch=1,
-    order_payload={"symbol": "EURUSD", "volume": "0.10"},
+    canonical_hash="hash-1", execution_epoch=1,
+    risk_assessment=assessment("account-a", "signal-a"), signal_revision=1,
+    order_payload={"symbol": "EURUSD", "volume": "0.10"}, now=now,
 )
 assert created.order.account_id == "account-a"
 assert created.order.dispatch_sequence == 1
 assert created.reservation.status == "ACTIVE"
 assert len(engine.outbox("account-a")) == 1
+engine.install_fence("account-a", "review")
 assert engine.pre_order(
     account_id="account-a", signal_id="signal-a", idempotency_key="idem-1",
-    canonical_hash="hash-1", risk_approved=True, execution_epoch=1,
-    order_payload={"symbol": "EURUSD", "volume": "0.10"},
+    canonical_hash="hash-1", execution_epoch=1,
+    risk_assessment=assessment("account-a", "signal-a", valid_until=now), signal_revision=1,
+    order_payload={"symbol": "EURUSD", "volume": "0.10"}, now=now + timedelta(seconds=30),
 ).order.id == created.order.id
 try:
     engine.pre_order(account_id="account-a", signal_id="signal-b", idempotency_key="idem-1",
-        canonical_hash="different-hash", risk_approved=True, execution_epoch=1, order_payload={})
+        canonical_hash="different-hash", execution_epoch=1,
+        risk_assessment=assessment("account-a", "signal-b", valid_until=now), signal_revision=1,
+        order_payload={}, now=now + timedelta(seconds=30))
 except ExecutionError as error:
     assert error.code == "IDEMPOTENCY_KEY_REUSED"
 else:
@@ -38,7 +62,9 @@ print("ok")
 
 test("order_check failure releases reservation and timeout becomes journaled UNKNOWN", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
 
 class Connector:
     def __init__(self, check=True, send="TIMEOUT"):
@@ -48,13 +74,17 @@ class Connector:
     def journal(self, order): return None
     def broker_state(self, order): return {"status": "FILLED", "external_id": "mt5-1"}
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 failed = engine.pre_order(account_id="a", signal_id="s1", idempotency_key="i1", canonical_hash="h1",
-    risk_approved=True, execution_epoch=1, order_payload={})
+    execution_epoch=1, risk_assessment=assessment("a", "s1"), signal_revision=1, order_payload={})
 engine.dispatch_next("a", Connector(check=False))
 assert failed.reservation.status == "RELEASED"
 unknown = engine.pre_order(account_id="a", signal_id="s2", idempotency_key="i2", canonical_hash="h2",
-    risk_approved=True, execution_epoch=1, order_payload={})
+    execution_epoch=1, risk_assessment=assessment("a", "s2"), signal_revision=1, order_payload={})
 connector = Connector()
 result = engine.dispatch_next("a", connector)
 assert result.status == "UNKNOWN" and connector.sent == 1
@@ -67,11 +97,17 @@ print("ok")
 
 test("fill without native protection quarantines exposure and emergency fence blocks entries", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
-    risk_approved=True, execution_epoch=1, order_payload={})
+    execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1, order_payload={})
 engine.record_fill("a", entry.order.id, "deal-1", "0.10", native_protection_confirmed=False)
 assert engine.account("a").exposure_gate == "QUARANTINED"
 assert engine.position("a", entry.order.id).protection_status == "UNCONFIRMED"
@@ -79,7 +115,7 @@ fence = engine.install_fence("a", "EMERGENCY_STOP")
 assert fence.status == "FENCE_PENDING"
 try:
     engine.pre_order(account_id="a", signal_id="s2", idempotency_key="i2", canonical_hash="h2",
-        risk_approved=True, execution_epoch=1, order_payload={})
+        execution_epoch=1, risk_assessment=assessment("a", "s2"), signal_revision=1, order_payload={})
 except ExecutionError as error:
     assert error.code == "EXPOSURE_GATE_CLOSED"
 else:
@@ -91,11 +127,17 @@ print("ok")
 
 test("protective position stages exits only on confirmed fills and preserves rounding residual", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
-    risk_approved=True, execution_epoch=1,
+    execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"symbol": "EURUSD", "volume": "0.38", "side": "BUY", "stop_loss": "1.09000", "take_profit": "1.11000"})
 engine.record_fill("a", entry.order.id, "deal-entry", "0.38", native_protection_confirmed=True)
 position = engine.position("a", entry.order.id)
@@ -134,11 +176,17 @@ test("execution migration contains durable account-local safety records", () => 
 
 test("trailing is monotonic, closed-candle gated, and capability safe", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
-    risk_approved=True, execution_epoch=1,
+    execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
 engine.record_fill("a", entry.order.id, "entry", "1", native_protection_confirmed=True)
 engine.record_exit_fill("a", entry.order.id, "tp1", "TP1", "0.4")
@@ -167,11 +215,18 @@ print("ok")
 
 test("partial entry fills accumulate in one account-scoped position", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
-    risk_approved=True, execution_epoch=1, order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
+    execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
+    order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
 engine.record_fill("a", entry.order.id, "deal-1", "0.4", native_protection_confirmed=True)
 engine.record_fill("a", entry.order.id, "deal-2", "0.6", native_protection_confirmed=True)
 position = engine.position("a", entry.order.id)
@@ -185,12 +240,18 @@ print("ok")
 
 test("fill idempotency is scoped to the broker account", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 orders = [
     engine.pre_order(account_id=account, signal_id="s", idempotency_key="i", canonical_hash="h",
-        risk_approved=True, execution_epoch=1, order_payload={})
+        execution_epoch=1, risk_assessment=assessment(account, "s"), signal_revision=1, order_payload={})
     for account in ("account-a", "account-b")
 ]
 fills = [
@@ -208,11 +269,17 @@ print("ok")
 
 test("positions expose account-local operational facts and protected reduce commands", () => {
   const output = run(`
+from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionSubstrate, ExecutionError
+from backend.app.risk_calendar import RiskAssessment
 
+now = datetime.now(timezone.utc)
+def assessment(account_id, signal_id):
+    return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
-    risk_approved=True, execution_epoch=1,
+    execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"symbol": "EURUSD", "volume": "1", "side": "BUY", "entry_price": "1.10"})
 engine.record_fill("a", entry.order.id, "deal", "1", native_protection_confirmed=False)
 view = engine.position_view("a", entry.order.id)

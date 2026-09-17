@@ -21,7 +21,7 @@ now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 assessment = RiskAssessment(
     broker_account_id="account-a", risk_limits_version=4, approved=True,
     purpose="PRE_ORDER", assessed_at=now,
-    valid_until=now + timedelta(seconds=20), signal_revision=2,
+    valid_until=now + timedelta(seconds=20), signal_revision=2, signal_id="signal-a",
 )
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
@@ -42,6 +42,7 @@ with TemporaryDirectory() as directory:
     assert reloaded.orders[created.order.id].command_id in reloaded.commands
     assert created.order.risk_assessment_id in reloaded.risk_assessments
     assert reloaded.risk_assessments[created.order.risk_assessment_id]["assessed_at"] == now
+    assert reloaded.risk_assessments[created.order.risk_assessment_id]["signal_revision"] == 2
     first = reloaded.reconcile_observation("account-a", {
         "orders": [{"order_id": created.order.id, "status": "PARTIALLY_FILLED"}],
         "fills": [{"deal_id": "deal-1", "order_id": created.order.id, "volume": "0.4", "position_id": "position-1", "entry": "IN"}],
@@ -78,25 +79,25 @@ from backend.app.execution import ExecutionCoordinator, ExecutionError
 from backend.app.risk_calendar import RiskAssessment
 
 now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-def assessment(account):
-    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1)
+def assessment(account, signal_id):
+    return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1, signal_id=signal_id)
 
 engine = ExecutionCoordinator()
 try:
     engine.accept_execution(account_id="a", signal_id="s", idempotency_key="bad", canonical_hash="h", execution_epoch=1,
-        risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1), signal_revision=1,
+        risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1, signal_id="s"), signal_revision=1,
         order_payload={"volume": "1"}, now=now)
 except ExecutionError as error: assert error.code == "PRE_ORDER_RISK_REJECTED"
 else: raise AssertionError("rejected assessment accepted")
 try:
     engine.accept_execution(account_id="a", signal_id="s", idempotency_key="stale-revision", canonical_hash="stale", execution_epoch=1,
-        risk_assessment=assessment("a"), signal_revision=2, order_payload={"volume": "1"}, now=now)
+        risk_assessment=assessment("a", "s"), signal_revision=2, order_payload={"volume": "1"}, now=now)
 except ExecutionError as error: assert error.code == "SIGNAL_REVISION_CHANGED"
 else: raise AssertionError("assessment from another revision accepted")
 
 def order(account, key):
     return engine.accept_execution(account_id=account, signal_id=key, idempotency_key=key, canonical_hash=key,
-        execution_epoch=1, risk_assessment=assessment(account), signal_revision=1, order_payload={"symbol": "EURUSD", "volume": "1"}, now=now).order
+        execution_epoch=1, risk_assessment=assessment(account, key), signal_revision=1, order_payload={"symbol": "EURUSD", "volume": "1"}, now=now).order
 
 net_a = order("a", "net-a")
 net_b = order("a", "net-b")
@@ -137,12 +138,12 @@ engine.approve_signal(
 )
 expired = RiskAssessment(
     "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now - timedelta(seconds=20),
-    valid_until=now - timedelta(seconds=10), signal_revision=1,
+    valid_until=now - timedelta(seconds=10), signal_revision=1, signal_id="signal-a",
 )
 try:
     engine.execute_signal(
         account_id="account-a", signal_id="signal-a", idempotency_key="execute-a",
-        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        reason="execute", confirmed=True, signal_revision=1,
         risk_assessment=expired, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1,
         order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
@@ -157,12 +158,12 @@ engine.approve_signal(
 )
 initial = RiskAssessment(
     "account-a", 1, True, purpose="INITIAL", assessed_at=now,
-    valid_until=now + timedelta(seconds=20), signal_revision=1,
+    valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="signal-initial",
 )
 try:
     engine.execute_signal(
         account_id="account-a", signal_id="signal-initial", idempotency_key="execute-initial",
-        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        reason="execute", confirmed=True, signal_revision=1,
         risk_assessment=initial, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1,
         order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
@@ -177,12 +178,12 @@ engine.approve_signal(
 )
 fresh = RiskAssessment(
     "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
-    valid_until=now + timedelta(seconds=20), signal_revision=1,
+    valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="signal-b",
 )
 try:
     engine.execute_signal(
         account_id="account-a", signal_id="signal-b", idempotency_key="execute-stale-revision",
-        reason="execute", confirmed=True, signal_revision=2, risk_approved=True,
+        reason="execute", confirmed=True, signal_revision=2,
         risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1,
         order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 2},
@@ -192,12 +193,70 @@ else: raise AssertionError("assessment from another Signal revision created an o
 assert not engine.orders and not engine.reservations
 accepted = engine.execute_signal(
     account_id="account-a", signal_id="signal-b", idempotency_key="execute-b",
-    reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+    reason="execute", confirmed=True, signal_revision=1,
     risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
     live_lock=True, execution_epoch=1,
     order_payload={"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1},
 )
 assert accepted.order.risk_assessment_id in engine.risk_assessments
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("pre-order risk recomputes account-local exposure and uses the correct risk source", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from types import SimpleNamespace
+
+import backend.app.main as main
+from backend.app.execution import ExecutionSubstrate, RiskReservation
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+captured = []
+class CapturingRiskEngine:
+    def assess(self, account_id, limits, **context):
+        captured.append(context)
+        return RiskAssessment(
+            account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+            valid_until=now + timedelta(seconds=20), signal_id=context["signal_id"],
+            signal_revision=context["signal_revision"],
+        )
+
+original_execution = main.execution
+original_risk_engine = main.signals.risk_engine
+try:
+    engine = ExecutionSubstrate()
+    engine.positions[("account-a", "position-a")] = SimpleNamespace(
+        account_id="account-a", stage="ENTRY", data_status="CONFIRMED",
+    )
+    engine.positions[("account-b", "position-b")] = SimpleNamespace(
+        account_id="account-b", stage="ENTRY", data_status="CONFIRMED",
+    )
+    engine.reservations["active-a"] = RiskReservation("active-a", "account-a", "s", "2.5")
+    engine.reservations["released-a"] = RiskReservation("released-a", "account-a", "s", "9", "RELEASED")
+    engine.reservations["active-b"] = RiskReservation("active-b", "account-b", "s", "7")
+    main.execution = engine
+    main.signals.risk_engine = CapturingRiskEngine()
+    signal = SimpleNamespace(
+        id="signal-a", revision=3, expires_at=now + timedelta(minutes=1),
+        strategy_config_version_id="config-a", risk_context={
+            "requested_risk": Decimal("1.25"), "open_positions": 99, "open_risk": Decimal("99"),
+        },
+    )
+    account = SimpleNamespace(bot_state="RUNNING")
+    main._pre_order_risk_assessment("account-a", signal, account, requested_risk=Decimal("0.75"))
+    manual = captured[-1]
+    assert manual["requested_risk"] == Decimal("0.75")
+    assert manual["open_positions"] == 1 and manual["open_risk"] == Decimal("2.5")
+    main._pre_order_risk_assessment("account-a", signal, account)
+    semi_auto = captured[-1]
+    assert semi_auto["requested_risk"] == Decimal("1.25")
+finally:
+    main.execution = original_execution
+    main.signals.risk_engine = original_risk_engine
 print("ok")
 `);
   assert.match(output, /ok/);
@@ -215,13 +274,13 @@ engine = ExecutionCoordinator()
 payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
 fresh = RiskAssessment(
     "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
-    valid_until=now + timedelta(seconds=20), signal_revision=1,
+    valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="new-signal",
 )
 try:
     engine.schedule_automated_signal(
         account_id="account-a", signal_id="old-signal", idempotency_key="old-order",
         mode="SEMI_AUTO", signal_created_at=now - timedelta(seconds=1), signal_revision=1,
-        signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+        signal_eligible=True, signal_approved=True, mode_changed_at=now,
         risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1, order_payload=payload,
     )
@@ -230,13 +289,13 @@ else: raise AssertionError("Signal from before the mode change was scheduled")
 
 foreign = RiskAssessment(
     "account-b", 1, True, purpose="PRE_ORDER", assessed_at=now,
-    valid_until=now + timedelta(seconds=20), signal_revision=1,
+    valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="new-signal",
 )
 try:
     engine.schedule_automated_signal(
         account_id="account-a", signal_id="new-signal", idempotency_key="foreign-order",
         mode="SEMI_AUTO", signal_created_at=now, signal_revision=1,
-        signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+        signal_eligible=True, signal_approved=True, mode_changed_at=now,
         risk_assessment=foreign, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1, order_payload=payload,
     )
@@ -247,7 +306,7 @@ assert not engine.orders and not engine.reservations
 accepted = engine.schedule_automated_signal(
     account_id="account-a", signal_id="new-signal", idempotency_key="fresh-order",
     mode="SEMI_AUTO", signal_created_at=now, signal_revision=1,
-    signal_eligible=True, signal_approved=True, mode_changed_at=now, risk_approved=True,
+    signal_eligible=True, signal_approved=True, mode_changed_at=now,
     risk_assessment=fresh, signal_fresh=True, fence_safe=True, account_state="RUNNING",
     live_lock=True, execution_epoch=1, order_payload=payload,
 )
@@ -283,7 +342,7 @@ class Broker:
     def broker_state(self, order): return {"status": "FILLED", "external_id": "mt5-order-reconciled"}
 
 now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1, signal_id="s")
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path)

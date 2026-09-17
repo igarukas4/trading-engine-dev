@@ -32,7 +32,13 @@ from .risk_calendar import (
     RiskLimitsStore,
 )
 from .signals import SignalStore
-from .execution import ExecutionCoordinator, ExecutionError, GlobalEmergencyOperation, OperatorCommand
+from .execution import (
+    ExecutionCoordinator,
+    ExecutionError,
+    GlobalEmergencyOperation,
+    OperatorCommand,
+    canonical_order_hash,
+)
 from .dashboard import audit_hub, dashboard_hub
 
 
@@ -1214,17 +1220,46 @@ def _backend_risk_context(
 
 
 def _pre_order_risk_assessment(
-    account_id: str, signal: Any, account: BrokerAccount
+    account_id: str,
+    signal: Any,
+    account: BrokerAccount,
+    requested_risk: Decimal | None = None,
 ) -> RiskAssessment:
     """Reassess a Signal against the current account-local execution context."""
+    signal_requested_risk = signal.risk_context.get("requested_risk")
+    if signal_requested_risk is None and requested_risk is None:
+        raise ExecutionError("RISK_CONTEXT_UNAVAILABLE")
     policy = enrichment_policies.get((account_id, signal.strategy_config_version_id))
     context = dict(signal.risk_context)
     context.update(_backend_risk_context(account.bot_state, policy, account_id))
+    positions = [
+        position for position in execution.positions.values()
+        if position.account_id == account_id and position.stage != "CLOSED"
+    ]
+    if any(position.data_status != "CONFIRMED" for position in positions):
+        raise ExecutionError("RISK_CONTEXT_UNAVAILABLE")
+    reserved_risk = sum(
+        (
+            Decimal(reservation.amount)
+            for reservation in execution.reservations.values()
+            if reservation.account_id == account_id
+            and reservation.status in {"ACTIVE", "CONSUMED"}
+        ),
+        Decimal("0"),
+    )
+    context.update(
+        open_positions=len(positions),
+        open_risk=reserved_risk,
+        requested_risk=(
+            signal_requested_risk if requested_risk is None else requested_risk
+        ),
+    )
     return signals.risk_engine.assess(
         account_id,
         risk_limits.active(account_id),
         purpose="PRE_ORDER",
         signal_expires_at=signal.expires_at,
+        signal_id=signal.id,
         signal_revision=signal.revision,
         approved_revision=signal.revision,
         **context,
@@ -1274,6 +1309,23 @@ def _accepted_command_response(
     }
 
 
+def _command_for_idempotency(
+    account_id: str, signal_id: str, idempotency_key: str
+) -> OperatorCommand:
+    command = next(
+        (
+            command for command in execution.commands.values()
+            if command.account_id == account_id
+            and command.signal_id == signal_id
+            and command.idempotency_key == idempotency_key
+        ),
+        None,
+    )
+    if command is None:
+        raise ExecutionError("IDEMPOTENCY_COMMAND_NOT_FOUND")
+    return command
+
+
 @app.get("/api/v1/broker-accounts/{account_id}/opportunities", tags=["strategies"])
 def list_opportunities(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
@@ -1314,6 +1366,15 @@ def create_signal(account_id: str, request: SignalEnrichmentRequest) -> dict[str
     limits = risk_limits.active(account_id)
     account = accounts.accounts[account_id]
     risk_kwargs = _backend_risk_context(account.bot_state, policy, account_id)
+    risk_kwargs.update({
+        "baseline_samples": request.baseline_samples,
+        "daily_loss": request.daily_loss,
+        "open_positions": request.open_positions,
+        "open_risk": request.open_risk,
+        "requested_risk": request.requested_risk,
+        "spread_multiple": request.spread_multiple,
+        "volatility_multiple": request.volatility_multiple,
+    })
     try:
         signal = signals.create(
             account_id=account_id,
@@ -1367,6 +1428,28 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
         signal = signals.get(signal_id)
         if signal.account_id != account_id:
             raise ValueError("SIGNAL_NOT_FOUND")
+        semi_auto_payload = {
+            "stop_loss": str(signal.stop_loss) or "native",
+            "take_profit": [str(value) for value in signal.take_profit] or ["native"],
+            "signal_revision": signal.revision,
+        }
+        if account.execution_mode == "SEMI_AUTO":
+            prior = execution.existing_pre_order(
+                account_id=account_id,
+                idempotency_key=f"{request.idempotency_key}:order",
+                canonical_hash=canonical_order_hash(
+                    semi_auto_payload,
+                    signal.revision,
+                    str(signal.risk_context["requested_risk"]),
+                ),
+            )
+            if prior is not None:
+                command = _command_for_idempotency(
+                    account_id, signal_id, request.idempotency_key
+                )
+                return _accepted_command_response(
+                    account_id, command, signal=signal.as_dict(), order=prior.order.__dict__
+                )
         if not _account_data_status(account_id)["can_approve"]:
             raise ExecutionError("ACCOUNT_DATA_UNSAFE")
         command = execution.approve_signal(
@@ -1382,30 +1465,27 @@ def approve_signal(account_id: str, signal_id: str, request: OperatorActionReque
         raise HTTPException(status_code=409, detail={"code": code}) from error
     if account.execution_mode == "SEMI_AUTO":
         try:
-            assessment = _pre_order_risk_assessment(account_id, signal, account)
-            scheduled = execution.schedule_automated_signal(
-                account_id=account_id,
-                signal_id=signal_id,
-                idempotency_key=f"{request.idempotency_key}:order",
-                mode="SEMI_AUTO",
-                signal_created_at=signal.created_at,
-                signal_revision=signal.revision,
-                signal_eligible=True,
-                signal_approved=True,
-                mode_changed_at=account.mode_changed_at,
-                risk_approved=assessment.approved,
-                risk_assessment=assessment,
-                signal_fresh=signal.as_dict()["status"] == "APPROVED",
-                fence_safe=execution.account(account_id).exposure_gate == "OPEN",
-                account_state=account.bot_state,
-                live_lock=account.connector_healthy and account.connector_bound,
-                execution_epoch=execution.account(account_id).execution_epoch,
-                order_payload={
-                    "stop_loss": str(signal.stop_loss) or "native",
-                    "take_profit": [str(value) for value in signal.take_profit] or ["native"],
-                    "signal_revision": signal.revision,
-                },
-            )
+            with execution.account_lock(account_id):
+                assessment = _pre_order_risk_assessment(account_id, signal, account)
+                scheduled = execution.schedule_automated_signal(
+                    account_id=account_id,
+                    signal_id=signal_id,
+                    idempotency_key=f"{request.idempotency_key}:order",
+                    mode="SEMI_AUTO",
+                    signal_created_at=signal.created_at,
+                    signal_revision=signal.revision,
+                    signal_eligible=True,
+                    signal_approved=True,
+                    mode_changed_at=account.mode_changed_at,
+                    risk_assessment=assessment,
+                    signal_fresh=signal.as_dict()["status"] == "APPROVED",
+                    fence_safe=execution.account(account_id).exposure_gate == "OPEN",
+                    account_state=account.bot_state,
+                    live_lock=account.connector_healthy and account.connector_bound,
+                    execution_epoch=execution.account(account_id).execution_epoch,
+                    risk_amount=str(signal.risk_context["requested_risk"]),
+                    order_payload=semi_auto_payload,
+                )
         except ExecutionError as error:
             raise HTTPException(status_code=409, detail={"code": error.code}) from error
         return _accepted_command_response(account_id, command, signal=signal.as_dict(), order=scheduled.order.__dict__)
@@ -1419,27 +1499,37 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
         signal = signals.get(signal_id)
         if signal.account_id != account_id:
             raise ValueError("SIGNAL_NOT_FOUND")
-        account = accounts.accounts[account_id]
-        assessment = _pre_order_risk_assessment(account_id, signal, account)
-        result = execution.execute_signal(
-            account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
-            reason=request.reason, confirmed=request.confirmed, signal_revision=request.signal_revision,
-            risk_approved=assessment.approved, signal_fresh=signal.as_dict()["status"] == "APPROVED",
-            risk_assessment=assessment,
-            fence_safe=execution.account(account_id).exposure_gate == "OPEN",
-            account_state=account.bot_state, live_lock=account.connector_healthy and account.connector_bound,
-            execution_epoch=execution.account(account_id).execution_epoch,
-            order_payload=request.order_payload, risk_amount=str(request.risk_amount),
+        prior = execution.existing_pre_order(
+            account_id=account_id,
+            idempotency_key=request.idempotency_key,
+            canonical_hash=canonical_order_hash(
+                request.order_payload, request.signal_revision, request.risk_amount
+            ),
         )
+        if prior is not None:
+            command = _command_for_idempotency(
+                account_id, signal_id, request.idempotency_key
+            )
+            return _accepted_command_response(account_id, command, order=prior.order.__dict__)
+        account = accounts.accounts[account_id]
+        with execution.account_lock(account_id):
+            assessment = _pre_order_risk_assessment(
+                account_id, signal, account, requested_risk=request.risk_amount
+            )
+            result = execution.execute_signal(
+                account_id=account_id, signal_id=signal_id, idempotency_key=request.idempotency_key,
+                reason=request.reason, confirmed=request.confirmed, signal_revision=request.signal_revision,
+                signal_fresh=signal.as_dict()["status"] == "APPROVED",
+                risk_assessment=assessment,
+                fence_safe=execution.account(account_id).exposure_gate == "OPEN",
+                account_state=account.bot_state, live_lock=account.connector_healthy and account.connector_bound,
+                execution_epoch=execution.account(account_id).execution_epoch,
+                order_payload=request.order_payload, risk_amount=str(request.risk_amount),
+            )
     except (KeyError, ValueError, ExecutionError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    command = next(
-        command for command in execution.commands.values()
-        if command.account_id == account_id
-        and command.signal_id == signal_id
-        and command.idempotency_key == request.idempotency_key
-    )
+    command = _command_for_idempotency(account_id, signal_id, request.idempotency_key)
     return _accepted_command_response(account_id, command, order=result.order.__dict__)
 
 

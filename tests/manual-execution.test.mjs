@@ -22,7 +22,7 @@ approved = engine.approve_signal(account_id="a", signal_id="s", idempotency_key=
 assert approved.status == "ACCEPTED"
 assert engine.approve_signal(account_id="a", signal_id="s", idempotency_key="a3", reason="manual review", confirmed=True, signal_revision=1).id == approved.id
 try:
-    engine.execute_signal(account_id="b", signal_id="s", idempotency_key="e1", reason="go", confirmed=True, signal_revision=1, risk_approved=True, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload={"stop_loss":"1", "take_profit":["2"]})
+    engine.execute_signal(account_id="b", signal_id="s", idempotency_key="e1", reason="go", confirmed=True, signal_revision=1, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1, order_payload={"stop_loss":"1", "take_profit":["2"]})
 except ExecutionError as error:
     assert error.code == "SIGNAL_APPROVAL_REQUIRED"
 else: raise AssertionError("approval crossed account boundary")
@@ -45,30 +45,30 @@ engine.approve_signal(account_id="account-a", signal_id="manual", idempotency_ke
 try:
     engine.execute_signal(
         account_id="account-a", signal_id="manual", idempotency_key="missing-risk",
-        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        reason="execute", confirmed=True, signal_revision=1,
         signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True,
         execution_epoch=1, order_payload=payload,
     )
 except ExecutionError as error: assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
 else: raise AssertionError("manual execution accepted no PRE_ORDER assessment")
 
-initial = RiskAssessment("account-a", 1, True, purpose="INITIAL", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
+initial = RiskAssessment("account-a", 1, True, purpose="INITIAL", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="manual")
 try:
     engine.execute_signal(
         account_id="account-a", signal_id="manual", idempotency_key="initial-risk",
-        reason="execute", confirmed=True, signal_revision=1, risk_approved=True,
+        reason="execute", confirmed=True, signal_revision=1,
         risk_assessment=initial, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1, order_payload=payload,
     )
 except ExecutionError as error: assert error.code == "PRE_ORDER_ASSESSMENT_REQUIRED"
 else: raise AssertionError("INITIAL assessment created a manual order")
 
-foreign = RiskAssessment("account-b", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
+foreign = RiskAssessment("account-b", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="semi")
 try:
     engine.schedule_automated_signal(
         account_id="account-a", signal_id="semi", idempotency_key="foreign-risk",
         mode="SEMI_AUTO", signal_created_at=now, signal_revision=1, signal_eligible=True,
-        signal_approved=True, mode_changed_at=now, risk_approved=True,
+        signal_approved=True, mode_changed_at=now,
         risk_assessment=foreign, signal_fresh=True, fence_safe=True, account_state="RUNNING",
         live_lock=True, execution_epoch=1, order_payload=payload,
     )
@@ -88,13 +88,20 @@ from backend.app.risk_calendar import RiskAssessment
 engine = ExecutionSubstrate()
 engine.approve_signal(account_id="a", signal_id="s", idempotency_key="a1", reason="reviewed", confirmed=True, signal_revision=1)
 now = datetime.now(timezone.utc)
-assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1)
-kwargs = dict(account_id="a", signal_id="s", idempotency_key="e1", reason="confirmed execution", confirmed=True, signal_revision=1, risk_approved=True, risk_assessment=assessment, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1)
+assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="s")
+kwargs = dict(account_id="a", signal_id="s", idempotency_key="e1", reason="confirmed execution", confirmed=True, signal_revision=1, risk_assessment=assessment, signal_fresh=True, fence_safe=True, account_state="RUNNING", live_lock=True, execution_epoch=1)
 try: engine.execute_signal(**kwargs, order_payload={})
 except ExecutionError as error: assert error.code == "NATIVE_PROTECTION_REQUIRED"
 else: raise AssertionError("unprotected entry accepted")
 result = engine.execute_signal(**kwargs, order_payload={"stop_loss":"1", "take_profit":["2"], "signal_revision":1})
 assert result.order.status == "INTENT" and result.order.payload["stop_loss"] == "1"
+try:
+    engine.execute_signal(
+        **kwargs, risk_amount="1",
+        order_payload={"stop_loss":"1", "take_profit":["2"], "signal_revision":1},
+    )
+except ExecutionError as error: assert error.code == "IDEMPOTENCY_KEY_REUSED"
+else: raise AssertionError("changed risk amount reused the prior order")
 print("ok")
 `);
   assert.match(output, /ok/);
