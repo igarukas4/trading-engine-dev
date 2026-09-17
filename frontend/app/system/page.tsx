@@ -103,6 +103,19 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await response.json()) as T;
 }
 
+function loadDashboardSnapshot(account: string): Promise<DashboardSnapshot> {
+  return fetchJson<DashboardSnapshot>(
+    `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
+  );
+}
+
+function recoveryStatusLabel(item: Recovery): string {
+  if (item.status === "RECOVERED") return "· Pemulihan otomatis selesai";
+  if (item.critical) return `· ${ATTENTION_REQUIRED}`;
+  if (item.recovery_legal) return "· Recovery otomatis berjalan";
+  return `· ${ATTENTION_REQUIRED}`;
+}
+
 export default function SystemPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [audit, setAudit] = useState<AuditEvent[]>([]);
@@ -120,9 +133,7 @@ export default function SystemPage() {
       fetchJson<Status>(`${apiBase}/api/v1/system/status${query}`),
       fetchJson<{ global_emergency?: Emergency[] }>(`${apiBase}/api/v1/dashboard-summary-snapshot`),
       account
-        ? fetchJson<DashboardSnapshot>(
-            `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
-          )
+        ? loadDashboardSnapshot(account)
         : Promise.resolve<DashboardSnapshot>({ audit_events: [], recovery: [] }),
     ]).then(([nextStatus, summary, snapshot]) => {
       setStatus(nextStatus);
@@ -144,11 +155,10 @@ export default function SystemPage() {
       const message = JSON.parse(event.data) as { type?: string; broker_account_id?: string };
       if (
         message.broker_account_id === account
-        && (message.type?.startsWith("execution.reconciliation") || message.type?.startsWith("execution.interlock") || message.type?.startsWith("critical.reconciliation"))
+        && ["execution.reconciliation", "execution.interlock", "critical.reconciliation"]
+          .some(prefix => message.type?.startsWith(prefix))
       ) {
-        fetchJson<DashboardSnapshot>(
-          `${apiBase}/api/v1/broker-accounts/${encodeURIComponent(account)}/dashboard-snapshot`,
-        ).then((snapshot) => {
+        loadDashboardSnapshot(account).then((snapshot) => {
           setAudit(snapshot.audit_events ?? []);
           setRecovery(snapshot.recovery ?? []);
           setInterlock(snapshot.runtime_interlock ?? null);
@@ -281,13 +291,7 @@ export default function SystemPage() {
         {recovery.length ? recovery.map((item) => (
           <p key={item.order_id} className="warning">
             {item.kind} · {item.subject_id ?? item.order_id} · {item.status} · {item.reason}{" "}
-            {item.status === "RECOVERED"
-              ? "· Pemulihan otomatis selesai"
-              : item.critical
-                ? `· ${ATTENTION_REQUIRED}`
-                : item.recovery_legal
-                  ? "· Recovery otomatis berjalan"
-                  : `· ${ATTENTION_REQUIRED}`}
+            {recoveryStatusLabel(item)}
             {item.deadline_at ? ` · Deadline ${new Date(item.deadline_at).toLocaleString("id-ID")}` : ""}
             {item.attempts !== undefined ? ` · Percobaan ${item.attempts}` : ""}
           </p>

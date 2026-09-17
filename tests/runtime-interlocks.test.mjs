@@ -147,6 +147,14 @@ extended = engine.add_manual_economic_event_override(
     blackout_start=now + timedelta(minutes=1), blackout_end=now + timedelta(minutes=10), reason="operator event")
 assert extended["blackout_start"] == now.isoformat()
 assert extended["blackout_end"] == (now + timedelta(minutes=10)).isoformat()
+try:
+    engine.add_manual_economic_event_override(
+        "account-b", override_id=override["id"], pair="EURUSD", currencies=("EUR",),
+        blackout_start=now, blackout_end=now + timedelta(minutes=5), reason="wrong account")
+except ExecutionError as error:
+    assert error.code == "WRONG_ACCOUNT"
+else:
+    raise AssertionError("calendar override crossed account scope")
 engine.set_calendar_interlock("account-a", scope_known=False)
 assert engine.runtime_interlock("account-a").status == "BLOCKED"
 try:
@@ -164,6 +172,15 @@ assert accept(
 ).order.account_id == "account-a"
 assert engine.runtime_interlock("account-a").status == "ELIGIBLE"
 assert engine.runtime_interlock("account-b").status == "ELIGIBLE"
+engine.set_calendar_interlock(
+    "account-a", scope_known=False,
+    blackout_start=datetime(2026, 1, 1, 0, 5),
+    blackout_end=datetime(2026, 1, 1, 0, 10),
+    now=now,
+)
+assert accept(
+    engine, "account-a", "before-future-blackout", "GBPJPY", now,
+).order.account_id == "account-a"
 print("ok")
 `);
   assert.match(output, /ok/);

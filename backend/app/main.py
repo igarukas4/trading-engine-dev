@@ -39,6 +39,7 @@ from .execution import (
     ExecutionError,
     GlobalEmergencyOperation,
     OperatorCommand,
+    RuntimeInterlockDecision,
     canonical_order_hash,
 )
 from .dashboard import audit_hub, dashboard_hub
@@ -440,6 +441,21 @@ def _execution_interlock_payload(account_id: str) -> dict[str, Any]:
         "protection": protections,
         "critical_alerts": execution.critical_alerts(account_id),
     }
+
+
+def _publish_runtime_interlock_update(
+    account_id: str, decision: RuntimeInterlockDecision
+) -> None:
+    dashboard_hub.publish(
+        "account",
+        account_id,
+        "runtime_interlock.updated",
+        {
+            "status": decision.status,
+            "reasons": list(decision.reasons),
+            "evidence": decision.evidence,
+        },
+    )
 
 
 def _require_expected_version(
@@ -860,10 +876,7 @@ def observe_runtime_health(
     except (ExecutionError, ValueError) as error:
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
-    dashboard_hub.publish(
-        "account", account_id, "runtime_interlock.updated",
-        {"status": decision.status, "reasons": list(decision.reasons), "evidence": decision.evidence},
-    )
+    _publish_runtime_interlock_update(account_id, decision)
     return {"account_id": account_id, "runtime_interlock": _execution_interlock_payload(account_id)}
 
 
@@ -889,10 +902,7 @@ def recover_runtime_interlock(
         {"evidence": evidence, "result": decision.status},
         actor="custodian",
     )
-    dashboard_hub.publish(
-        "account", account_id, "runtime_interlock.updated",
-        {"status": decision.status, "reasons": list(decision.reasons), "evidence": decision.evidence},
-    )
+    _publish_runtime_interlock_update(account_id, decision)
     return {"account_id": account_id, "runtime_interlock": _execution_interlock_payload(account_id)}
 
 
@@ -1248,6 +1258,8 @@ def create_calendar_override(
             reason=request.reason,
             override_id=request.override_id,
         )
+    except ExecutionError as error:
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
     except ValueError as error:
         raise HTTPException(status_code=409, detail={"code": str(error)}) from error
     _audit(
@@ -2023,7 +2035,6 @@ async def connector_stream(websocket: WebSocket) -> None:
         if not account or requested_identity != account.identity:
             await websocket.close(code=1008, reason="WRONG_ACCOUNT")
             return
-        bound_account = account
         try:
             accounts.authenticate(hello["account_id"], hello["key_id"], hello["secret"], hello["generation"])
             accounts.heartbeat(hello["account_id"], hello["generation"], hello["session_id"])
@@ -2031,6 +2042,7 @@ async def connector_stream(websocket: WebSocket) -> None:
         except AccountError as error:
             await websocket.close(code=1008, reason=error.code)
             return
+        bound_account = account
         await websocket.send_json({"type": "snapshot", "snapshot": accounts.read_only_snapshot(account.id)})
         recovery = [
             record for record in execution.recovery_records(account.id)

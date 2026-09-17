@@ -27,6 +27,34 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Treat naive timestamps as UTC and normalize aware timestamps."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+RUNTIME_HEALTH_REASONS = frozenset(
+    {
+        "CONNECTOR_UNAVAILABLE",
+        "CONNECTOR_GAP",
+        "BROKER_FACTS_STALE",
+        "RECONCILIATION_FAILED",
+        "RISK_STATE_UNCERTAIN",
+        "RESERVATION_INCONSISTENT",
+        "ORDERING_OVERLOAD",
+        "BACKUP_RECOVERY_POINT_STALE",
+        "CRITICAL_ALERT_DELIVERY_STALE",
+    }
+)
+CONNECTOR_HEALTH_REASONS = frozenset(
+    {"CONNECTOR_UNAVAILABLE", "CONNECTOR_GAP"}
+)
+PROTECTION_INTERLOCK_REASONS = frozenset(
+    {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"}
+)
+
+
 def canonical_order_hash(
     order_payload: dict[str, Any], signal_revision: int, risk_amount: str | Decimal
 ) -> str:
@@ -473,7 +501,7 @@ class ExecutionSubstrate:
         account.quarantine_requires_command = (
             account.quarantine_requires_command or persistent
         )
-        account.interlock_updated_at = now or _now()
+        account.interlock_updated_at = _as_utc(now or _now())
         account.exposure_gate = "QUARANTINED"
         return self.runtime_interlock(account_id)
 
@@ -576,7 +604,7 @@ class ExecutionSubstrate:
         escalation_deadline: timedelta = timedelta(minutes=15),
     ) -> RuntimeInterlockDecision:
         """Project account-local runtime facts into the exposure interlock."""
-        at = now or _now()
+        at = _as_utc(now or _now())
         reasons: list[str] = []
         evidence: dict[str, Any] = {"observed_at": at.isoformat()}
         if connector_healthy is False:
@@ -601,6 +629,7 @@ class ExecutionSubstrate:
         ):
             if observed_at is None:
                 continue
+            observed_at = _as_utc(observed_at)
             age = at - observed_at
             evidence[f"{name}_observed_at"] = observed_at.isoformat()
             evidence[f"{name}_age_seconds"] = age.total_seconds()
@@ -626,16 +655,11 @@ class ExecutionSubstrate:
         account = self.account(account_id)
         if account.runtime_interlock == "QUARANTINED":
             return self.runtime_interlock(account_id)
-        health_reasons = {
-            "CONNECTOR_UNAVAILABLE", "CONNECTOR_GAP", "BROKER_FACTS_STALE",
-            "RECONCILIATION_FAILED", "RISK_STATE_UNCERTAIN",
-            "RESERVATION_INCONSISTENT", "ORDERING_OVERLOAD",
-            "BACKUP_RECOVERY_POINT_STALE", "CRITICAL_ALERT_DELIVERY_STALE",
-        }
-        self._remove_runtime_interlock_reasons(account_id, health_reasons)
-        if self.runtime_interlock(account_id).status == "ELIGIBLE":
-            self.account(account_id).interlock_evidence = dict(evidence)
-        return self.runtime_interlock(account_id)
+        self._remove_runtime_interlock_reasons(account_id, RUNTIME_HEALTH_REASONS)
+        decision = self.runtime_interlock(account_id)
+        if decision.status == "ELIGIBLE":
+            account.interlock_evidence = dict(evidence)
+        return decision
 
     def observe_connector_health(
         self,
@@ -658,9 +682,7 @@ class ExecutionSubstrate:
                 evidence={"healthy": healthy, "gap": gap},
                 now=now,
             )
-        self._remove_runtime_interlock_reasons(
-            account_id, {"CONNECTOR_UNAVAILABLE", "CONNECTOR_GAP"}
-        )
+        self._remove_runtime_interlock_reasons(account_id, CONNECTOR_HEALTH_REASONS)
         return self.runtime_interlock(account_id)
 
     update_runtime_health = observe_runtime_health
@@ -682,24 +704,20 @@ class ExecutionSubstrate:
             raise ExecutionError("QUARANTINE_RECOVERY_COMMAND_REQUIRED")
         if not evidence.get("broker_reconciled") and not evidence.get("verified"):
             raise ExecutionError("QUARANTINE_RECOVERY_EVIDENCE_REQUIRED")
-        if any(
-            position.account_id == account_id
-            and position.stage != "CLOSED"
-            and position.protection_status != "CONFIRMED"
-            for position in self.positions.values()
-        ):
+        if self._has_unconfirmed_open_protection(account_id):
             raise ExecutionError("NATIVE_PROTECTION_UNVERIFIED")
         account.quarantine_requires_command = False
         account.runtime_interlock = "ELIGIBLE"
         account.interlock_reasons = ()
         account.interlock_evidence = dict(evidence)
-        account.interlock_updated_at = now or _now()
+        observed_at = _as_utc(now or _now())
+        account.interlock_updated_at = observed_at
         if account.exposure_gate == "QUARANTINED":
             account.exposure_gate = "OPEN"
         for alert in self._critical_alerts.values():
             if alert.account_id == account_id and alert.status == "OPEN":
                 alert.status = "RESOLVED"
-                alert.resolved_at = now or _now()
+                alert.resolved_at = observed_at
         audit = getattr(self, "_audit", None)
         if callable(audit):
             audit(account_id, "execution.interlock.recovered", evidence=evidence)
@@ -728,21 +746,8 @@ class ExecutionSubstrate:
     ) -> bool:
         pair = str(order_payload.get("symbol", order_payload.get("pair", ""))).upper()
         currencies = self._payload_currencies(order_payload)
-        at = now or _now()
-        for block in self.calendar_blocks.get(account_id, []):
-            if not block.get("active", True):
-                continue
-            expires_at = block.get("expires_at")
-            if expires_at is not None:
-                expires = _state_datetime(expires_at)
-                if at >= expires:
-                    continue
-            blackout_start = block.get("blackout_start")
-            if blackout_start is not None and at < _state_datetime(blackout_start):
-                continue
-            blackout_end = block.get("blackout_end")
-            if blackout_end is not None and at >= _state_datetime(blackout_end):
-                continue
+        at = _as_utc(now or _now())
+        for block in self._active_calendar_blocks(account_id, at):
             if not block.get("scope_known", False):
                 return True
             if block.get("pair") and str(block["pair"]).upper() == pair:
@@ -750,6 +755,30 @@ class ExecutionSubstrate:
             if currencies.intersection({str(item).upper() for item in block.get("currencies", ())}):
                 return True
         return False
+
+    @staticmethod
+    def _calendar_block_is_active(block: dict[str, Any], at: datetime) -> bool:
+        if not block.get("active", True):
+            return False
+        expires_at = block.get("expires_at")
+        if expires_at is not None and at >= _state_datetime(expires_at):
+            return False
+        blackout_start = block.get("blackout_start")
+        if blackout_start is not None and at < _state_datetime(blackout_start):
+            return False
+        blackout_end = block.get("blackout_end")
+        if blackout_end is not None and at >= _state_datetime(blackout_end):
+            return False
+        return True
+
+    def _active_calendar_blocks(
+        self, account_id: str, at: datetime
+    ) -> list[dict[str, Any]]:
+        return [
+            block
+            for block in self.calendar_blocks.get(account_id, [])
+            if self._calendar_block_is_active(block, at)
+        ]
 
     def set_calendar_interlock(
         self,
@@ -768,6 +797,9 @@ class ExecutionSubstrate:
         """Apply calendar impact to one account, preserving known scope."""
         normalized_pair = pair.upper() if pair else None
         normalized_currencies = tuple(sorted({str(item).upper() for item in currencies}))
+        normalized_expires_at = _as_utc(expires_at) if expires_at else None
+        normalized_blackout_start = _as_utc(blackout_start) if blackout_start else None
+        normalized_blackout_end = _as_utc(blackout_end) if blackout_end else None
         blocks = self.calendar_blocks.setdefault(account_id, [])
         matching = [
             block for block in blocks
@@ -786,10 +818,10 @@ class ExecutionSubstrate:
             block.update({
                 "active": True,
                 "reason_code": reason_code,
-                "expires_at": expires_at,
-                "blackout_start": blackout_start,
-                "blackout_end": blackout_end,
-                "updated_at": (now or _now()).isoformat(),
+                "expires_at": normalized_expires_at,
+                "blackout_start": normalized_blackout_start,
+                "blackout_end": normalized_blackout_end,
+                "updated_at": _as_utc(now or _now()).isoformat(),
             })
             if not matching:
                 blocks.append(block)
@@ -809,15 +841,14 @@ class ExecutionSubstrate:
         for block in matching:
             block["active"] = False
         if self.account(account_id).runtime_interlock != "QUARANTINED":
-            if not any(
-                block.get("active", True)
-                and not block.get("scope_known", False)
-                and (
-                    block.get("expires_at") is None
-                    or (now or _now()) < _state_datetime(block["expires_at"])
+            active_broad_blocks = [
+                block
+                for block in self._active_calendar_blocks(
+                    account_id, _as_utc(now or _now())
                 )
-                for block in blocks
-            ):
+                if not block.get("scope_known", False)
+            ]
+            if not active_broad_blocks:
                 self._remove_runtime_interlock_reasons(
                     account_id, {reason_code, "CALENDAR_BLACKOUT_ACTIVE"}
                 )
@@ -837,11 +868,16 @@ class ExecutionSubstrate:
         override_id: str | None = None,
     ) -> dict[str, Any]:
         """Create or extend a blackout; this method never shortens one."""
+        blackout_start = _as_utc(blackout_start)
+        blackout_end = _as_utc(blackout_end)
+        expires_at = _as_utc(expires_at) if expires_at else None
         if blackout_end <= blackout_start:
             raise ValueError("blackout_end must be after blackout_start")
         key = override_id or str(uuid4())
         prior = self.calendar_overrides.get(key)
         if prior is not None:
+            if prior.get("account_id") != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
             blackout_start = min(blackout_start, _state_datetime(prior["blackout_start"]))
             blackout_end = max(blackout_end, _state_datetime(prior["blackout_end"]))
         record = {
@@ -927,29 +963,18 @@ class ExecutionSubstrate:
         now: datetime | None = None,
     ) -> tuple[str, ...]:
         account = self.account(account_id)
-        at = now or _now()
+        at = _as_utc(now or _now())
+        calendar_blocks = self.calendar_blocks.get(account_id, [])
         broad_calendar_reasons = {
             str(block.get("reason_code", "CALENDAR_BLACKOUT_ACTIVE"))
-            for block in self.calendar_blocks.get(account_id, [])
+            for block in calendar_blocks
             if not block.get("scope_known", False)
         }
+        active_calendar_blocks = self._active_calendar_blocks(account_id, at)
         active_broad_calendar_reasons = {
             str(block.get("reason_code", "CALENDAR_BLACKOUT_ACTIVE"))
-            for block in self.calendar_blocks.get(account_id, [])
+            for block in active_calendar_blocks
             if not block.get("scope_known", False)
-            and block.get("active", True)
-            and (
-                block.get("expires_at") is None
-                or at < _state_datetime(block["expires_at"])
-            )
-            and (
-                block.get("blackout_start") is None
-                or at >= _state_datetime(block["blackout_start"])
-            )
-            and (
-                block.get("blackout_end") is None
-                or at < _state_datetime(block["blackout_end"])
-            )
         }
         expired_calendar_reasons = broad_calendar_reasons - active_broad_calendar_reasons
         if expired_calendar_reasons:
@@ -1865,8 +1890,7 @@ class ExecutionSubstrate:
                     "evidence": evidence,
                 }
                 self._remove_runtime_interlock_reasons(
-                    account_id,
-                    {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"},
+                    account_id, PROTECTION_INTERLOCK_REASONS
                 )
                 if self.runtime_interlock(account_id).status == "ELIGIBLE":
                     self.account(account_id).interlock_evidence = dict(evidence)
@@ -1903,18 +1927,21 @@ class ExecutionSubstrate:
 
     repair_protection = repair_native_protection
 
+    def _has_unconfirmed_open_protection(self, account_id: str) -> bool:
+        return any(
+            position.account_id == account_id
+            and position.stage != "CLOSED"
+            and position.protection_status != "CONFIRMED"
+            for position in self.positions.values()
+        )
+
     def _restore_runtime_interlock_if_safe(
         self, account_id: str, evidence: dict[str, Any] | None = None
     ) -> None:
         account = self.account(account_id)
         if account.quarantine_requires_command or account.interlock_reasons:
             return
-        if any(
-            position.account_id == account_id
-            and position.stage != "CLOSED"
-            and position.protection_status != "CONFIRMED"
-            for position in self.positions.values()
-        ):
+        if self._has_unconfirmed_open_protection(account_id):
             return
         prior_gates = {
             work.entry_gate_before
@@ -2089,8 +2116,7 @@ class ExecutionSubstrate:
             position = self.position(account_id, order_id)
             position.protection_status = "CONFIRMED"
             self._remove_runtime_interlock_reasons(
-                account_id,
-                {"NATIVE_PROTECTION_UNCONFIRMED", "NATIVE_PROTECTION_CHANGED"},
+                account_id, PROTECTION_INTERLOCK_REASONS
             )
             return position
 
@@ -2206,10 +2232,10 @@ def _deserialize_state_value(value: Any) -> Any:
 
 def _state_datetime(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value
+        return _as_utc(value)
     if isinstance(value, dict) and "__datetime__" in value:
-        return datetime.fromisoformat(value["__datetime__"])
-    return datetime.fromisoformat(value)
+        return _as_utc(datetime.fromisoformat(value["__datetime__"]))
+    return _as_utc(datetime.fromisoformat(value))
 
 
 class ExecutionCoordinator(ExecutionSubstrate):
