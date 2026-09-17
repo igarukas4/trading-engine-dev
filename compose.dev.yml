@@ -16,16 +16,13 @@ services:
       - dev_postgres_data:/var/lib/postgresql/data
 
   migrate:
-    image: postgres:16-alpine
+    build: ./backend
     depends_on:
       postgres:
         condition: service_healthy
     environment:
-      PGPASSWORD: local-development-only
-    volumes:
-      - ./backend/migrations:/migrations:ro
-    entrypoint: ["/bin/sh", "-ec"]
-    command: ["for migration in /migrations/*.sql; do psql -h postgres -U trading_engine -d trading_engine -v ON_ERROR_STOP=1 -f \"$migration\"; done"]
+      DATABASE_URL: postgresql://trading_engine:local-development-only@postgres:5432/trading_engine
+    command: ["python", "-m", "app.migrate"]
 
   backend:
     build: ./backend

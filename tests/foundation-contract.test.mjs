@@ -28,7 +28,10 @@ test("development composition and migration are present", () => {
   assert.match(compose, /postgres:/);
   assert.match(compose, /backend:/);
   assert.match(compose, /frontend:/);
-  assert.match(compose, /psql .*ON_ERROR_STOP=1/);
+  assert.match(compose, /migrate:/);
+  assert.match(compose, /build: \.\/backend/);
+  assert.match(compose, /command: \["python", "-m", "app\.migrate"\]/);
+  assert.doesNotMatch(compose, /psql .*ON_ERROR_STOP=1/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS schema_migrations/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS application_metadata/);
 });
