@@ -12,8 +12,8 @@ Treat this document as the operational authority before invoking it.
 - Obtain explicit user approval before starting `npm run sandcastle` or
   `npm run sandcastle:watch`.
 - Before asking for approval, show the default profiles from this runbook:
-  planner, implementer, and reviewer use `gpt-5.6-luna` with `high` effort;
-  merger uses `gpt-5.6-sol` with `low` effort. Ask the user to confirm those
+  planner, implementer, and reviewer use `gpt-5.6-luna` with `medium` effort;
+  merger uses `gpt-5.6-sol` with `medium` effort. Ask the user to confirm those
   profiles before starting the runner.
 - Work only on open issues labelled `ready-for-agent`. The label means the
   ticket is specified well enough for autonomous work; `## Blocked by` still
