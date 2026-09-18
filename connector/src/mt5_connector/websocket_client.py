@@ -97,6 +97,7 @@ class ConnectorClient:
     async def connect_once(self, secret, *, max_messages=1):
         if not secret:
             raise ProtocolError("secret is required")
+        self.protocol.begin_session()
         transport = await self._open()
         try:
             await transport.send(json.dumps(self.protocol.hello(secret), separators=(",", ":")))

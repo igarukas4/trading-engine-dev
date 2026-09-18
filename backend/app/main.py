@@ -2083,7 +2083,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 if sender in done:
                     sender.result()
                 message = received.result()
-                if message.get("type") not in {"command.result", "command_result"}:
+                if message.get("type") != "command.result":
                     try:
                         await connector_delivery.accept_inbound(
                             account.id, hello["session_id"], message,
@@ -2140,7 +2140,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                     })
                     await websocket.send_json({"type": "reconciliation_observed", "account_id": account.id,
                                                "status": result.status, "recovery": execution.recovery_records(account.id)})
-                elif message.get("type") in {"command.result", "command_result"}:
+                elif message.get("type") == "command.result":
                     try:
                         result = await connector_delivery.record_result(
                             message,

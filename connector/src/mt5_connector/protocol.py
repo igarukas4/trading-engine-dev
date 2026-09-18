@@ -43,6 +43,11 @@ class ConnectorProtocol:
         self._idempotency: dict[str, tuple[str, str, dict[str, Any]]] = {}
         self._context_results: dict[tuple[str, str, str, int, str], dict[str, Any]] = {}
 
+    def begin_session(self) -> str:
+        """Rotate the transport session identity while retaining sequence state."""
+        self.session_id = str(uuid.uuid4())
+        return self.session_id
+
     def validate_hello(self, message: Mapping[str, Any]) -> HelloFrame:
         try:
             return HelloFrame.from_mapping(message)
@@ -94,6 +99,8 @@ class ConnectorProtocol:
         if server_sequence is not None:
             if isinstance(server_sequence, bool) or not isinstance(server_sequence, int) or server_sequence < 0:
                 raise ProtocolError("MALFORMED_FRAME", "invalid server_sequence")
+            if server_sequence < self.last_server_sequence:
+                raise ProtocolError("OUT_OF_ORDER_SEQUENCE", "server sequence moved backwards")
             self.last_server_sequence = server_sequence
         return snapshot
 

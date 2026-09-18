@@ -35,12 +35,16 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         envelope = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         await self.registry.next_for_session("a", "s1")
         await self.registry.mark_sent("a", envelope.command_id, "s1")
-        result = {"type": "command_result", "account_id": "a", "connector_generation": 7,
-                  "dispatch_sequence": 1, "command_id": "c1", "idempotency_key": "i1", "request_hash": "h1", "result": "UNKNOWN"}
+        result = {
+            **envelope.as_message(),
+            "type": "command.result",
+            "message_id": "result-1",
+            "payload": {"state": "UNKNOWN"},
+        }
         self.assertEqual(await self.registry.record_result(result), "UNKNOWN")
         self.assertEqual(self.registry.pending_state("a", "c1"), "UNKNOWN")
         with self.assertRaisesRegex(DeliveryError, "STALE_COMMAND_RESULT"):
-            await self.registry.record_result(result)
+            await self.registry.record_result({**result, "message_id": "result-2", "sequence": 2})
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.registry.next_for_session("a", "s1"), 0.01)
 
@@ -94,11 +98,20 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
             await self.registry.record_result({k: v for k, v in result.items() if k != "schema_version"})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.record_result({**result, "type": "command_result"})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.record_result({**result, "dispatch_sequence": 1})
         self.assertEqual(await self.registry.record_result(result), "REJECTED")
         second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
         await self.registry.next_for_session("a", "s1")
         await self.registry.mark_sent("a", second.command_id, "s1")
-        duplicate = {**result, "command_id": "c2", "sequence": 2}
+        duplicate = {
+            **second.as_message(),
+            "type": "command.result",
+            "message_id": result["message_id"],
+            "payload": {"state": "REJECTED", "code": "EXECUTION_DISABLED"},
+        }
         with self.assertRaisesRegex(DeliveryError, "REPLAYED_SEQUENCE"):
             await self.registry.record_result(duplicate)
 
