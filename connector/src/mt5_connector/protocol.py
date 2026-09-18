@@ -153,8 +153,7 @@ class ConnectorProtocol:
         # The pre-contract backend used a small heartbeat acknowledgement. Keep
         # that compatibility form, but never use it to authorize a command.
         legacy_context = set(message) <= {"type", "account_id", "generation", "session_id"}
-        legacy_command = "schema_version" not in message and message.get("type") in SIDE_EFFECTING_TYPES
-        if legacy_context or legacy_command:
+        if legacy_context:
             self._validate_legacy_context(message)
             typ = message.get("type")
             if typ == "heartbeat_ack":

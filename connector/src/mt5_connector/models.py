@@ -149,8 +149,9 @@ class PostHandshakeEnvelope:
             "generation", "sequence", "execution_epoch", "command_id",
             "idempotency_key", "sent_at", "payload",
         }
-        if not isinstance(raw, Mapping) or not required.issubset(raw):
-            raise ContractError("MALFORMED_FRAME", "incomplete envelope")
+        allowed = required | {"request_hash"}
+        if not isinstance(raw, Mapping) or not required.issubset(raw) or not set(raw).issubset(allowed):
+            raise ContractError("MALFORMED_FRAME", "incomplete or unknown envelope fields")
         if isinstance(raw.get("schema_version"), bool) or raw.get("schema_version") != 1:
             raise ContractError("MALFORMED_FRAME", "unsupported schema version")
         typ = _nonempty_string(raw["type"], "type")

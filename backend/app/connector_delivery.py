@@ -202,6 +202,10 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("STALE_GENERATION")
             return message
 
+    async def current_sequence(self, account_id: str) -> int:
+        async with self._lock:
+            return self._last_sequence.get(account_id, 0)
+
     async def reserve_sequence(self, account_id: str, session_id: str) -> int:
         async with self._lock:
             session = self._sessions.get(account_id)
@@ -277,7 +281,13 @@ class ConnectorDeliveryRegistry:
             await session.queue.put(envelope)
             return envelope
 
-    async def record_result(self, message: dict[str, Any]) -> str:
+    async def record_result(
+        self,
+        message: dict[str, Any],
+        *,
+        authenticated_account_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
         if not isinstance(message, dict) or message.get("type") not in {"command.result", "command_result"}:
             raise DeliveryError("INVALID_COMMAND_RESULT")
         canonical_result = message.get("type") == "command.result"
@@ -319,15 +329,18 @@ class ConnectorDeliveryRegistry:
         if generation is None or sequence is None or result not in RESULT_STATES:
             raise DeliveryError("INVALID_COMMAND_RESULT")
         account_id = message["account_id"]
+        if authenticated_account_id is not None and account_id != authenticated_account_id:
+            raise DeliveryError("WRONG_ACCOUNT")
         async with self._lock:
+            session_account_id = authenticated_account_id or account_id
+            session = self._sessions.get(session_account_id)
+            if session is None or (session_id is not None and session.session_id != session_id):
+                raise DeliveryError("SESSION_NOT_ACTIVE")
             pending = self._pending.get(account_id, {})
             item = pending.get(message["command_id"])
             if item is None:
                 raise DeliveryError("UNKNOWN_COMMAND")
             envelope = item.envelope
-            session = self._sessions.get(account_id)
-            if session is None:
-                raise DeliveryError("SESSION_NOT_ACTIVE")
             if canonical_result:
                 if any(message.get(field) != envelope.identity[field] for field in IDENTITY_FIELDS):
                     raise DeliveryError("COMMAND_CONTEXT_MISMATCH")

@@ -2055,7 +2055,7 @@ async def connector_stream(websocket: WebSocket) -> None:
         await websocket.send_json({
             "type": "snapshot",
             "generation": account.connector_generation,
-            "server_sequence": 0,
+            "server_sequence": await connector_delivery.current_sequence(account.id),
             "execution_epoch": execution.account(account.id).execution_epoch,
             "snapshot": accounts.read_only_snapshot(account.id),
         })
@@ -2142,7 +2142,11 @@ async def connector_stream(websocket: WebSocket) -> None:
                                                "status": result.status, "recovery": execution.recovery_records(account.id)})
                 elif message.get("type") in {"command.result", "command_result"}:
                     try:
-                        result = await connector_delivery.record_result(message)
+                        result = await connector_delivery.record_result(
+                            message,
+                            authenticated_account_id=account.id,
+                            session_id=hello["session_id"],
+                        )
                     except DeliveryError as error:
                         await websocket.send_json({"type": "error", "code": error.code})
                         continue

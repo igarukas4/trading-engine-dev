@@ -46,6 +46,8 @@ class ContractIssue63Tests(unittest.TestCase):
             "idempotency_key": "manual-1", "request_hash": "hash-1",
             "sent_at": "2026-09-18T00:00:00+00:00", "payload": {},
         }
+        with self.assertRaisesRegex(ProtocolError, "MALFORMED_FRAME"):
+            protocol.handle({**command, "dispatch_sequence": 1})
         result = protocol.handle(command)
         self.assertEqual(result["payload"]["state"], "REJECTED")
         self.assertEqual(result["request_hash"], "hash-1")

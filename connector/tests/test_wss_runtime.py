@@ -63,10 +63,10 @@ class WssRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_side_effecting_commands_rejected(self):
         protocol = ConnectorProtocol(self.config(), Fake())
-        result = protocol.handle({"type": "order.submit_market", "account_id": "a1",
-                                  "generation": 0, "command_id": "c1",
-                                  "idempotency_key": "i1"})
-        self.assertEqual(result["payload"], {"state": "REJECTED", "code": "EXECUTION_DISABLED"})
+        with self.assertRaisesRegex(ProtocolError, "MALFORMED_FRAME"):
+            protocol.handle({"type": "order.submit_market", "account_id": "a1",
+                             "generation": 0, "command_id": "c1",
+                             "idempotency_key": "i1"})
 
     async def test_secret_not_in_runtime_errors(self):
         secret = "do-not-log-this"
