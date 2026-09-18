@@ -83,6 +83,8 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "a", "s2", {**message, "message_id": "hb-2", "sequence": 2, "idempotency_key": "msg:hb-2"},
         )
         self.assertEqual(accepted["sequence"], 2)
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "connector_generation": 7})
         with self.assertRaisesRegex(DeliveryError, "REPLAYED_SEQUENCE"):
             await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-1"})
 

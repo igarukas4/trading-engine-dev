@@ -164,14 +164,14 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("SESSION_NOT_ACTIVE")
             if not isinstance(message, dict):
                 raise DeliveryError("MALFORMED_FRAME")
+            if "dispatch_sequence" in message or "connector_generation" in message:
+                raise DeliveryError("MALFORMED_FRAME")
             if message.get("account_id") != account_id:
                 raise DeliveryError("WRONG_ACCOUNT")
-            generation = message.get("generation", message.get("connector_generation"))
+            generation = message.get("generation")
             if generation != session.generation:
                 raise DeliveryError("STALE_GENERATION")
             if message.get("schema_version") == 1:
-                if "dispatch_sequence" in message or "connector_generation" in message:
-                    raise DeliveryError("MALFORMED_FRAME")
                 required = {
                     "schema_version", "type", "message_id", "account_id", *IDENTITY_FIELDS,
                     "generation", "sequence", "execution_epoch", "command_id",
