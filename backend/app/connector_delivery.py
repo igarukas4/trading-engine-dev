@@ -168,10 +168,19 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("MALFORMED_FRAME")
             if message.get("account_id") != account_id:
                 raise DeliveryError("WRONG_ACCOUNT")
+            schema_version = message.get("schema_version")
             generation = message.get("generation")
+            if "schema_version" in message and (
+                isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1
+            ):
+                raise DeliveryError("MALFORMED_FRAME")
+            if (
+                isinstance(generation, bool) or not isinstance(generation, int) or generation < 0
+            ):
+                raise DeliveryError("MALFORMED_FRAME")
             if generation != session.generation:
                 raise DeliveryError("STALE_GENERATION")
-            if message.get("schema_version") == 1:
+            if schema_version == 1:
                 required = {
                     "schema_version", "type", "message_id", "account_id", *IDENTITY_FIELDS,
                     "generation", "sequence", "execution_epoch", "command_id",
@@ -184,6 +193,19 @@ class ConnectorDeliveryRegistry:
                     message.get(field) != session.identity[field] for field in IDENTITY_FIELDS
                 ):
                     raise DeliveryError("WRONG_ACCOUNT")
+                typ = message["type"]
+                message_id = message["message_id"]
+                command_id = message["command_id"]
+                request_hash = message.get("request_hash")
+                if not isinstance(typ, str) or not typ or not isinstance(message_id, str) or not message_id:
+                    raise DeliveryError("MALFORMED_FRAME")
+                if command_id is not None and (not isinstance(command_id, str) or not command_id):
+                    raise DeliveryError("MALFORMED_FRAME")
+                if typ in COMMAND_TYPES or typ == "command.result":
+                    if command_id is None or not isinstance(request_hash, str) or not request_hash:
+                        raise DeliveryError("MALFORMED_FRAME")
+                elif command_id is not None or request_hash is not None:
+                    raise DeliveryError("MALFORMED_FRAME")
                 sequence = message["sequence"]
                 if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
                     raise DeliveryError("MALFORMED_FRAME")
@@ -213,10 +235,18 @@ class ConnectorDeliveryRegistry:
             if message.get("type") == "heartbeat" and message.get("session_id") not in (None, session.session_id):
                 raise DeliveryError("STALE_GENERATION")
             if message.get("type") == "heartbeat":
+                if not set(message).issubset({"type", "account_id", "generation", "session_id"}):
+                    raise DeliveryError("MALFORMED_FRAME")
                 return message
-            if message.get("type") in {
-                "reconciliation_observation", "account_snapshot", "market_snapshot", "candle_batch",
-            }:
+            legacy_allowed = {
+                "reconciliation_observation": {"type", "account_id", "generation", "observation"},
+                "account_snapshot": {"type", "account_id", "generation", "payload", "snapshot"},
+                "market_snapshot": {"type", "account_id", "generation", "payload", "snapshot"},
+                "candle_batch": {"type", "account_id", "generation", "payload", "snapshot"},
+            }
+            if message.get("type") in legacy_allowed:
+                if not set(message).issubset(legacy_allowed[message["type"]]):
+                    raise DeliveryError("MALFORMED_FRAME")
                 return message
             raise DeliveryError("MALFORMED_FRAME")
 
@@ -315,7 +345,11 @@ class ConnectorDeliveryRegistry:
         }
         if not set(message).issubset(allowed):
             raise DeliveryError("MALFORMED_FRAME")
-        if message.get("schema_version") != 1:
+        if (
+            isinstance(message.get("schema_version"), bool)
+            or not isinstance(message.get("schema_version"), int)
+            or message.get("schema_version") != 1
+        ):
             raise DeliveryError("MALFORMED_FRAME")
         if any(field not in message for field in (
             "message_id", "sent_at", "sequence", "generation", *IDENTITY_FIELDS, "execution_epoch", "payload",

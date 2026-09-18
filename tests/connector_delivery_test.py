@@ -85,6 +85,16 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accepted["sequence"], 2)
         with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
             await self.registry.accept_inbound("a", "s2", {**message, "connector_generation": 7})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-3", "sequence": 3, "generation": True})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-3", "sequence": 3, "schema_version": 1.0})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-3", "sequence": 3, "schema_version": 2})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-3", "sequence": 3, "foo": "nope"})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-3", "sequence": 3, "command_id": "unexpected"})
         with self.assertRaisesRegex(DeliveryError, "REPLAYED_SEQUENCE"):
             await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-1"})
 
@@ -103,7 +113,9 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
             await self.registry.record_result({**result, "type": "command_result"})
         with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
-            await self.registry.record_result({**result, "dispatch_sequence": 1})
+            await self.registry.record_result({**result, "schema_version": True})
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.record_result({**result, "schema_version": 1.0})
         self.assertEqual(await self.registry.record_result(result), "REJECTED")
         second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
         await self.registry.next_for_session("a", "s1")
