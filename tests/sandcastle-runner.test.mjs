@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const main = readFileSync(".sandcastle/main.mts", "utf8");
+const settings = readFileSync(".claude/settings.json", "utf8");
 const envExample = readFileSync(".sandcastle/.env.example", "utf8");
 const planner = readFileSync(".sandcastle/plan-prompt.md", "utf8");
 const supervisor = readFileSync(".sandcastle/run-supervisor.ps1", "utf8");
@@ -74,24 +75,34 @@ test("Sandcastle passes GitHub and proxy auth to sandbox runs", () => {
 test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   assert.match(
     main,
-    /const plannerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const plannerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const implementerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const implementerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const reviewerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const reviewerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.claudeCode\("gpt-5\.6-sol", \{\s+effort: "low",/,
+    /const mergerAgent = sandcastle\.claudeCode\("sonnet", \{\s+effort: "low",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);
   assert.match(main, /agent: reviewerAgent/);
   assert.match(main, /agent: mergerAgent/);
+});
+
+test("Sandcastle uses configurable gateway model aliases", () => {
+  assert.match(main, /sandcastle\.claudeCode\("haiku"/);
+  assert.match(main, /sandcastle\.claudeCode\("sonnet"/);
+  assert.match(settings, /CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY/);
+  assert.match(settings, /ANTHROPIC_DEFAULT_HAIKU_MODEL.*gpt-5\.6-luna/);
+  assert.match(settings, /ANTHROPIC_DEFAULT_SONNET_MODEL.*gpt-5\.6-sol/);
+  assert.match(settings, /ANTHROPIC_DEFAULT_OPUS_MODEL.*gpt-6-astra/);
+  assert.match(settings, /ANTHROPIC_DEFAULT_FABLE_MODEL.*gpt-5\.6-terra/);
 });
 
 test("sandbox image installs Claude Code", () => {

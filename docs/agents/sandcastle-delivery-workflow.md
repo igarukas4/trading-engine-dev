@@ -47,20 +47,18 @@ changed.
 
 | Runner role | Effective profile | Responsibility |
 | --- | --- | --- |
-| Planner | `gpt-5.6-luna`, `high` | Read backlog context and emit a plan; issue selection remains deterministic. |
-| Implementer | `gpt-5.6-luna`, `high` | Complete one ticket, test it, and commit on its ticket branch. |
-| Reviewer | `gpt-5.6-luna`, `high` | Review only that branch, make justified corrections, and verify. |
-| Merger | `gpt-5.6-sol`, `low` | Merge reviewed committed work, verify, and close the issue. |
+| Planner | `haiku` → `gpt-5.6-luna`, `high` | Read backlog context and emit a plan; issue selection remains deterministic. |
+| Implementer | `haiku` → `gpt-5.6-luna`, `high` | Complete one ticket, test it, and commit on its ticket branch. |
+| Reviewer | `haiku` → `gpt-5.6-luna`, `high` | Review only that branch, make justified corrections, and verify. |
+| Merger | `sonnet` → `gpt-5.6-sol`, `low` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
 The four role profiles in `.sandcastle/main.mts` are the canonical
-configuration for a default run. Keep them explicit rather than sharing one
-agent object. Token usage may require changing these profiles at any time. If
-the user requests a different profile after seeing the defaults, change only
-`.sandcastle/main.mts` for that run and leave this runbook unchanged. Record
-the confirmed profiles and any override in the Sandcastle log or the relevant
-GitHub issue. A profile change does not affect an agent that is already
-running.
+configuration for a default run. The Claude Code family aliases resolve through
+`.claude/settings.json`, so changing the gateway model mapping there changes the
+underlying proxy model without changing the runner roles. Keep the role aliases
+explicit rather than sharing one agent object. A mapping change does not affect
+an agent that is already running.
 
 ## Admission: ticket and repository
 
