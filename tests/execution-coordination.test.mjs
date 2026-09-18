@@ -492,8 +492,8 @@ asyncio.run(connector_stream(socket))
 assert socket.sent and socket.sent[0]["type"] == "snapshot", socket.sent
 assert socket.sent[1]["type"] == "reconciliation.required" and socket.sent[1]["account_id"] == account.id
 assert socket.sent[2]["type"] == "reconciliation_observed"
-assert socket.sent[3]["code"] == "WRONG_ACCOUNT"
-assert socket.sent[4]["code"] == "INVALID_RECONCILIATION_OBSERVATION"
+assert socket.sent[3]["type"] == "error" and socket.sent[3]["payload"]["code"] == "WRONG_ACCOUNT"
+assert socket.sent[4]["type"] == "error" and socket.sent[4]["payload"]["code"] == "INVALID_RECONCILIATION_OBSERVATION"
 
 assert execution.orders[created.order.id].status == "SUBMITTED"
 assert execution.account(account.id).exposure_gate == "OPEN"

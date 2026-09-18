@@ -132,7 +132,23 @@ class ContractIssue63Tests(unittest.TestCase):
                 "payload": {"closed_only": True, "count": 0},
             })
 
-    def test_secret_is_not_in_protocol_error(self):
+    def test_telemetry_requires_null_command_id(self):
+        protocol = ConnectorProtocol(self.config(backend_generation=7), Fake())
+        protocol.accept_snapshot({
+            "type": "snapshot", "generation": 7,
+            "snapshot": {"account_id": "a1"},
+        })
+        with self.assertRaisesRegex(ProtocolError, "MALFORMED_FRAME"):
+            protocol.handle({
+                "schema_version": 1, "type": "heartbeat",
+                "message_id": "heartbeat-1", "account_id": "a1",
+                "provider": "MT5", "broker_server": "Demo",
+                "external_account_id": "42", "generation": 7, "sequence": 1,
+                "execution_epoch": 0, "command_id": "unexpected",
+                "idempotency_key": "msg:heartbeat-1",
+                "sent_at": "2026-09-18T00:00:00+00:00", "payload": {},
+            })
+
         protocol = ConnectorProtocol(self.config(), Fake())
         with self.assertRaises(ProtocolError) as error:
             protocol.validate_hello({"type": "hello", "secret": "super-secret"})

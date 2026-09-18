@@ -39,6 +39,7 @@ class OutboundEnvelope:
     identity: dict[str, str]
     connector_generation: int
     dispatch_sequence: int
+    sequence: int
     execution_epoch: int
     command_id: str
     idempotency_key: str
@@ -57,7 +58,7 @@ class OutboundEnvelope:
             "broker_server": self.identity["broker_server"],
             "external_account_id": self.identity["external_account_id"],
             "generation": self.connector_generation,
-            "sequence": self.dispatch_sequence,
+            "sequence": self.sequence,
             "execution_epoch": self.execution_epoch,
             "command_id": self.command_id,
             "idempotency_key": self.idempotency_key,
@@ -109,6 +110,7 @@ class ConnectorDeliveryRegistry:
         self._sessions: dict[str, _Session] = {}
         self._pending: dict[str, dict[str, _Pending]] = {}
         self._last_sequence: dict[str, int] = {}
+        self._last_dispatch_sequence: dict[str, int] = {}
         self._received_generation: dict[str, int] = {}
         self._received_sequence: dict[str, int] = {}
         self._received_message_ids: dict[str, set[str]] = {}
@@ -123,7 +125,7 @@ class ConnectorDeliveryRegistry:
         identity: dict[str, str] | None = None,
         execution_epoch: int | None = None,
     ) -> None:
-        if not account_id or not session_id or generation < 0:
+        if not account_id or not session_id or isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise DeliveryError("INVALID_SESSION")
         if identity is not None and set(identity) != IDENTITY_FIELDS:
             raise DeliveryError("INVALID_ACCOUNT_IDENTITY")
@@ -316,15 +318,17 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("COMMAND_ID_REUSED")
             if any(item.envelope.idempotency_key == idempotency_key for item in pending.values()):
                 raise DeliveryError("DUPLICATE_PENDING_COMMAND")
-            last = self._last_sequence.get(account_id, 0)
-            if dispatch_sequence <= last:
+            last_dispatch = self._last_dispatch_sequence.get(account_id, 0)
+            if dispatch_sequence <= last_dispatch:
                 raise DeliveryError("OUT_OF_ORDER_DISPATCH")
+            sequence = self._last_sequence.get(account_id, 0) + 1
             envelope = OutboundEnvelope(
-                account_id, dict(identity), connector_generation, dispatch_sequence,
+                account_id, dict(identity), connector_generation, dispatch_sequence, sequence,
                 execution_epoch, command_id, idempotency_key, request_hash, type, dict(payload),
                 datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             )
-            self._last_sequence[account_id] = dispatch_sequence
+            self._last_dispatch_sequence[account_id] = dispatch_sequence
+            self._last_sequence[account_id] = sequence
             pending[command_id] = _Pending(envelope)
             await session.queue.put(envelope)
             return envelope
@@ -375,9 +379,13 @@ class ConnectorDeliveryRegistry:
             raise DeliveryError("INVALID_COMMAND_RESULT") from error
         payload = message["payload"]
         result = payload.get("state")
-        required = ("account_id", "command_id", "idempotency_key", "request_hash")
-        if result not in RESULT_STATES or any(not message.get(field) for field in required):
+        if result not in RESULT_STATES:
             raise DeliveryError("INVALID_COMMAND_RESULT")
+        for field in ("account_id", "command_id", "idempotency_key", "request_hash"):
+            if field not in message:
+                raise DeliveryError("INVALID_COMMAND_RESULT")
+            if not isinstance(message[field], str) or not message[field]:
+                raise DeliveryError("MALFORMED_FRAME")
         generation = message["generation"]
         sequence = message["sequence"]
         account_id = message["account_id"]

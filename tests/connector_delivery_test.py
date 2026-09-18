@@ -25,7 +25,15 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DeliveryError, "OUT_OF_ORDER_DISPATCH"):
             await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c3", idempotency_key="i3", request_hash="h3")
 
-    async def test_one_session_and_generation_validation(self):
+    async def test_wire_sequence_is_independent_from_dispatch_ordering(self):
+        first = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
+        ack_sequence = await self.registry.reserve_sequence("a", "s1")
+        second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
+        self.assertEqual(first.as_message()["sequence"], 1)
+        self.assertEqual(ack_sequence, 2)
+        self.assertEqual(second.as_message()["sequence"], 3)
+        self.assertEqual(await self.registry.current_sequence("a"), 3)
+
         with self.assertRaisesRegex(DeliveryError, "SESSION_ALREADY_ACTIVE"):
             await self.registry.open_session("a", 7, "s2")
         with self.assertRaisesRegex(DeliveryError, "STALE_GENERATION"):
@@ -117,6 +125,8 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
             await self.registry.record_result({**result, "schema_version": 1.0})
         self.assertEqual(await self.registry.record_result(result), "REJECTED")
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.record_result({**result, "message_id": "result-malformed", "command_id": {"not": "hashable"}})
         second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
         await self.registry.next_for_session("a", "s1")
         await self.registry.mark_sent("a", second.command_id, "s1")

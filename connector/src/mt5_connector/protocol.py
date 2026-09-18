@@ -17,6 +17,10 @@ from .models import (
 )
 
 READ_ONLY = frozenset(COMMAND_TYPES - SIDE_EFFECTING_TYPES)
+CONTROL_TYPES = frozenset({
+    "heartbeat_ack", "reconciliation.required", "reconciliation_observed",
+    "command_result_ack", "error",
+})
 
 
 class ProtocolError(ContractError):
@@ -170,7 +174,7 @@ class ConnectorProtocol:
             raise ProtocolError("MALFORMED_FRAME", "post-handshake envelope is required")
 
         envelope = self._validate_inbound(message)
-        if envelope.type == "heartbeat_ack":
+        if envelope.type in CONTROL_TYPES:
             return message
         if envelope.type not in COMMAND_TYPES:
             raise ProtocolError("UNSUPPORTED_COMMAND", "unsupported command")
@@ -184,7 +188,10 @@ class ConnectorProtocol:
         if message.get("account_id") not in (None, self.cfg.account_id):
             raise ProtocolError("WRONG_ACCOUNT", "wrong account")
         expected_generation = self.generation if self.generation is not None else self.cfg.backend_generation
-        if message.get("generation", expected_generation) != expected_generation:
+        generation = message.get("generation", expected_generation)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ProtocolError("MALFORMED_FRAME", "invalid generation")
+        if generation != expected_generation:
             raise ProtocolError("STALE_GENERATION", "generation mismatch")
 
     def _legacy_result(self, message: Mapping[str, Any]) -> dict[str, Any]:
