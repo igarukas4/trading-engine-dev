@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const main = readFileSync(".sandcastle/main.mts", "utf8");
+const envExample = readFileSync(".sandcastle/.env.example", "utf8");
 const planner = readFileSync(".sandcastle/plan-prompt.md", "utf8");
 const supervisor = readFileSync(".sandcastle/run-supervisor.ps1", "utf8");
 
@@ -61,35 +62,42 @@ test("open blockers outside the ready batch prevent dispatch", () => {
   execFileSync("node", ["--import", "tsx", "--input-type=module", "--eval", program]);
 });
 
-test("Sandcastle passes GitHub auth to trusted sandbox runs", () => {
-  assert.match(main, /process\.loadEnvFile\("\.sandcastle\/\.env"\)/);
-  assert.match(main, /const sandboxEnv = \{ GH_TOKEN: ghToken, CODEX_HOME: "\/tmp\/codex" \}/);
-  assert.match(main, /sandboxPath: "\/home\/agent\/\.codex-source"/);
-  assert.match(main, /readonly: true/);
+test("Sandcastle passes GitHub and proxy auth to sandbox runs", () => {
+  assert.match(main, /process\.loadEnvFile\("\.sandcastle\/.env"\)/);
+  assert.match(main, /GH_TOKEN: ghToken/);
+  assert.match(main, /ANTHROPIC_BASE_URL: anthropicBaseUrl/);
+  assert.match(main, /ANTHROPIC_AUTH_TOKEN: process\.env\.ANTHROPIC_AUTH_TOKEN \|\| "unused"/);
+  assert.match(envExample, /host\.docker\.internal/);
+  assert.doesNotMatch(main, /CODEX_HOME|codex-source|\.codex/);
 });
 
-test("Sandcastle uses the canonical role-specific Codex profiles", () => {
+test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   assert.match(
     main,
-    /const plannerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const plannerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const implementerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const implementerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const reviewerAgent = sandcastle\.codex\("gpt-5\.6-luna", \{\s+effort: "high",/,
+    /const reviewerAgent = sandcastle\.claudeCode\("gpt-5\.6-luna", \{\s+effort: "high",/,
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.codex\("gpt-5\.6-sol", \{\s+effort: "low",/,
+    /const mergerAgent = sandcastle\.claudeCode\("gpt-5\.6-sol", \{\s+effort: "low",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);
   assert.match(main, /agent: reviewerAgent/);
   assert.match(main, /agent: mergerAgent/);
-  assert.doesNotMatch(main, /const codeAgent/);
+});
+
+test("sandbox image installs Claude Code", () => {
+  const dockerfile = readFileSync(".sandcastle/Dockerfile", "utf8");
+  assert.match(dockerfile, /npm install -g @anthropic-ai\/claude-code/);
+  assert.doesNotMatch(dockerfile, /@openai\/codex/);
 });
 
 test("sandbox installs the committed Node dependency graph", () => {
