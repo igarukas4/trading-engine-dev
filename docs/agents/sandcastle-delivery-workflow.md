@@ -99,26 +99,33 @@ Use two independent credentials:
 | Credential | Purpose | Where it belongs |
 | --- | --- | --- |
 | `GH_TOKEN` | GitHub issue read/comment/close operations in the sandbox | `.sandcastle/.env` or process environment; never commit it. |
-| Codex ChatGPT login | Agent model authentication | Host `~/.codex`; mounted only into the trusted local sandbox. |
+| Proxy-managed Codex OAuth | ChatGPT Plus/Pro model access for Claude Code | Host `claude-code-proxy` state; never mount native CLI credentials into the sandbox. |
 
-Before starting, verify without printing sensitive values:
+The local `claude-code-proxy` is an Anthropic-compatible gateway. It owns its
+separate ChatGPT OAuth login and forwards the configured `gpt-*` models. Verify
+it without printing sensitive values:
 
 ```powershell
-gh auth status
-codex login status
+claude-code-proxy codex auth status
 docker info
+curl.exe --connect-timeout 5 -sS -o NUL -w "HTTP %{http_code}\n" http://127.0.0.1:18765/v1/models
 ```
 
 Create `.sandcastle/.env` from `.sandcastle/.env.example`; it must contain a
-non-empty `GH_TOKEN` with repository metadata and GitHub Issues read/write
-permission. The runner loads it, passes the token as sandbox environment, and
-keeps the source file ignored.
+non-empty `GH_TOKEN` and the proxy settings. Docker Desktop reaches a host
+loopback service through `host.docker.internal`, not `localhost`:
 
-The host Codex cache is mounted read-only at `/home/agent/.codex-source` and
-copied into container-native `/tmp/codex` for a run. This protects the host
-cache from container writes while allowing session refresh in the container.
-Use this mount only with the repository's trusted local Docker image. Never
-paste tokens into prompts, shell output, issue comments, or test fixtures.
+```text
+ANTHROPIC_BASE_URL=http://host.docker.internal:18765
+ANTHROPIC_AUTH_TOKEN=unused
+ANTHROPIC_MODEL=gpt-5.6-sol[1m]
+ANTHROPIC_SMALL_FAST_MODEL=gpt-5.6-luna[1m]
+```
+
+The proxy has no incoming client authentication. Keep it loopback-only or
+otherwise restrict it with a firewall; never expose it through port forwarding,
+public tunnels, permissive IPv6, or an untrusted network. Never paste tokens
+into prompts, shell output, issue comments, or test fixtures.
 
 ## Reproducible environment preflight
 
@@ -130,18 +137,21 @@ npm ci
 npm run typecheck
 npm test
 docker build --tag sandcastle:trading-engine-v0 --file .sandcastle/Dockerfile .
+docker run --rm --entrypoint claude sandcastle:trading-engine-v0 --version
+docker run --rm --entrypoint sh sandcastle:trading-engine-v0 -lc 'curl --connect-timeout 5 -sS -o /dev/null -w "HTTP %{http_code}\n" http://host.docker.internal:18765/v1/models'
 ```
 
-The Docker image supplies Node, Git, GitHub CLI, Codex CLI, Python `pip`, and
-Python `venv`; the project lockfile supplies Node dependencies. Sandcastle's
-hook uses `npm ci`, never an unconstrained install. `.dockerignore` excludes
-the credential file, worktrees, logs, and local dependency artifacts from the
-build context.
+The Docker image supplies Node, Git, GitHub CLI, Claude Code CLI, Python
+`pip`, and Python `venv`; the project lockfile supplies Node dependencies.
+Sandcastle's hook uses `npm ci`, never an unconstrained install.
+`.dockerignore` excludes the credential file, worktrees, logs, and local
+dependency artifacts from the build context.
 
 Before a long unattended run, do a non-agent sandbox smoke test: in a temporary
 container filesystem, run `npm ci`, `npm run typecheck`, and `npm test`; also
-confirm `python3 -m pip --version` and a temporary `python3 -m venv` succeed.
-This proves the image and lockfile, not broker integration.
+confirm `python3 -m pip --version`, a temporary `python3 -m venv`, and
+container-to-proxy connectivity succeed. This proves the image and gateway,
+not broker integration.
 
 ## Windows worktree health
 
@@ -260,7 +270,8 @@ shared API/schema decision or model quota becomes constrained.
 | Symptom | Evidence-first response |
 | --- | --- |
 | Rate limit or quota | Use `sandcastle:watch` or wait for its bounded retry; retain the ticket branch and inspect the log before changing model/profile. |
-| Codex authentication failure | Check host `codex login status`, then the trusted mount/copy setup. Treat this separately from GitHub authentication. |
+| Proxy unavailable | Check `claude-code-proxy serve`, `curl` on `127.0.0.1:18765/v1/models`, and Docker access through `host.docker.internal`; do not expose the unauthenticated proxy publicly. |
+| Proxy OAuth/model failure | Check `claude-code-proxy codex auth status` and `claude-code-proxy models`; treat upstream quota/provider errors separately from GitHub authentication. |
 | GitHub CLI failure | Check `gh auth status`, `.sandcastle/.env` presence, and token permission without printing its value. |
 | No runnable issue | Inspect `ready-for-agent` labels, issue links in `## Blocked by`, and the selector/log. Do not force a blocked ticket. |
 | No commit produced | Read the implementer log and issue state. Resolve the actual scope, test, or environment problem before a retry. |

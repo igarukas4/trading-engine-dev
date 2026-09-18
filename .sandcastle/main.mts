@@ -42,7 +42,24 @@ if (!ghToken) {
   throw new Error("GH_TOKEN must be set in .sandcastle/.env or the environment.");
 }
 
-const sandboxEnv = { GH_TOKEN: ghToken, CODEX_HOME: "/tmp/codex" };
+const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+if (!anthropicBaseUrl) {
+  throw new Error(
+    "ANTHROPIC_BASE_URL must be set to the local Claude Code proxy URL.",
+  );
+}
+
+const sandboxEnv = {
+  GH_TOKEN: ghToken,
+  ANTHROPIC_BASE_URL: anthropicBaseUrl,
+  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || "unused",
+  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "gpt-5.6-sol[1m]",
+  ANTHROPIC_SMALL_FAST_MODEL:
+    process.env.ANTHROPIC_SMALL_FAST_MODEL || "gpt-5.6-luna[1m]",
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: "272000",
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+  CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1",
+};
 
 const planSchema = z.object({
   issues: z.array(
@@ -150,59 +167,36 @@ const MAX_CONCURRENT_ISSUES = 3;
 
 // These checked-in role profiles are the canonical Sandcastle configuration.
 // Change a profile only as a reviewed runner configuration change.
-const plannerAgent = sandcastle.codex("gpt-5.6-luna", {
+const plannerAgent = sandcastle.claudeCode("gpt-5.6-luna", {
   effort: "high",
   captureSessions: false,
 });
 
-const implementerAgent = sandcastle.codex("gpt-5.6-luna", {
+const implementerAgent = sandcastle.claudeCode("gpt-5.6-luna", {
   effort: "high",
   captureSessions: false,
 });
 
-const reviewerAgent = sandcastle.codex("gpt-5.6-luna", {
+const reviewerAgent = sandcastle.claudeCode("gpt-5.6-luna", {
   effort: "high",
   captureSessions: false,
 });
 
-const mergerAgent = sandcastle.codex("gpt-5.6-sol", {
+const mergerAgent = sandcastle.claudeCode("gpt-5.6-sol", {
   effort: "low",
   captureSessions: false,
 });
 
-// Hooks run inside the sandbox before the agent starts each iteration.
 // npm ci installs the exact versions recorded in the committed lockfile.
 const hooks = {
   sandbox: {
-    onSandboxReady: [
-      {
-        command:
-          'mkdir -p "$CODEX_HOME" && cp /home/agent/.codex-source/auth.json "$CODEX_HOME"/ && if [ -f /home/agent/.codex-source/config.toml ]; then cp /home/agent/.codex-source/config.toml "$CODEX_HOME"/; fi',
-      },
-      { command: "npm ci" },
-    ],
+    onSandboxReady: [{ command: "npm ci" }],
   },
 };
 
-const authHooks = {
-  sandbox: { onSandboxReady: [hooks.sandbox.onSandboxReady[0]] },
-};
-
-// Reuse the host's Codex CLI login inside this trusted local sandbox. This
-// lets Codex authenticate through the active ChatGPT subscription instead of
-// requiring an OpenAI API key. Runtime state is copied to native container
-// storage, so the credential source mount stays read-only. Do not use this
-// setup with an untrusted container.
 const sandboxProvider = docker({
   imageName: "sandcastle:trading-engine-v0",
   env: sandboxEnv,
-  mounts: [
-    {
-      hostPath: "~/.codex",
-      sandboxPath: "/home/agent/.codex-source",
-      readonly: true,
-    },
-  ],
 });
 
 // ---------------------------------------------------------------------------
@@ -222,7 +216,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // It outputs a <plan> JSON block — Output.object parses and validates it.
   // -------------------------------------------------------------------------
   const plan = await sandcastle.run({
-    hooks: authHooks,
+    hooks: hooks,
     sandbox: sandboxProvider,
     name: "planner",
     // One iteration is enough: the planner just needs to read and reason,
@@ -373,7 +367,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   // uses to know which branches to merge and which issues to close.
   // -------------------------------------------------------------------------
   await sandcastle.run({
-    hooks: authHooks,
+    hooks: hooks,
     sandbox: sandboxProvider,
     name: "merger",
     maxIterations: 1,
