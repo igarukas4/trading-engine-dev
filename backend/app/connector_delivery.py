@@ -109,6 +109,9 @@ class ConnectorDeliveryRegistry:
         self._sessions: dict[str, _Session] = {}
         self._pending: dict[str, dict[str, _Pending]] = {}
         self._last_sequence: dict[str, int] = {}
+        self._received_generation: dict[str, int] = {}
+        self._received_sequence: dict[str, int] = {}
+        self._received_message_ids: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
     async def open_session(
@@ -129,9 +132,15 @@ class ConnectorDeliveryRegistry:
         async with self._lock:
             if account_id in self._sessions:
                 raise DeliveryError("SESSION_ALREADY_ACTIVE")
+            if self._received_generation.get(account_id) != generation:
+                self._received_generation[account_id] = generation
+                self._received_sequence[account_id] = 0
+                self._received_message_ids[account_id] = set()
             self._sessions[account_id] = _Session(
                 account_id, generation, session_id, asyncio.Queue(),
                 dict(identity) if identity else None, execution_epoch,
+                self._received_sequence.get(account_id, 0),
+                set(self._received_message_ids.get(account_id, set())),
             )
             self._pending.setdefault(account_id, {})
 
@@ -164,11 +173,12 @@ class ConnectorDeliveryRegistry:
                 if "dispatch_sequence" in message or "connector_generation" in message:
                     raise DeliveryError("MALFORMED_FRAME")
                 required = {
-                    "type", "message_id", "account_id", *IDENTITY_FIELDS,
+                    "schema_version", "type", "message_id", "account_id", *IDENTITY_FIELDS,
                     "generation", "sequence", "execution_epoch", "command_id",
                     "idempotency_key", "sent_at", "payload",
                 }
-                if not required.issubset(message) or not isinstance(message.get("payload"), dict):
+                allowed = required | {"request_hash"}
+                if not required.issubset(message) or not set(message).issubset(allowed) or not isinstance(message.get("payload"), dict):
                     raise DeliveryError("MALFORMED_FRAME")
                 if session.identity is not None and any(
                     message.get(field) != session.identity[field] for field in IDENTITY_FIELDS
@@ -197,6 +207,8 @@ class ConnectorDeliveryRegistry:
                     raise DeliveryError("MALFORMED_FRAME") from error
                 session.last_received_sequence = sequence
                 session.seen_message_ids.add(message["message_id"])
+                self._received_sequence[account_id] = sequence
+                self._received_message_ids[account_id] = set(session.seen_message_ids)
                 return message
             if message.get("type") == "heartbeat" and message.get("session_id") not in (None, session.session_id):
                 raise DeliveryError("STALE_GENERATION")
@@ -292,6 +304,13 @@ class ConnectorDeliveryRegistry:
             raise DeliveryError("INVALID_COMMAND_RESULT")
         canonical_result = message.get("type") == "command.result"
         if canonical_result:
+            allowed = {
+                "schema_version", "type", "message_id", "account_id", *IDENTITY_FIELDS,
+                "generation", "sequence", "execution_epoch", "command_id",
+                "idempotency_key", "request_hash", "sent_at", "payload",
+            }
+            if not set(message).issubset(allowed):
+                raise DeliveryError("MALFORMED_FRAME")
             if message.get("schema_version") != 1:
                 raise DeliveryError("MALFORMED_FRAME")
             if any(field not in message for field in (
@@ -350,6 +369,8 @@ class ConnectorDeliveryRegistry:
                     raise DeliveryError("OUT_OF_ORDER_SEQUENCE")
                 session.last_received_sequence = message["sequence"]
                 session.seen_message_ids.add(message["message_id"])
+                self._received_sequence[session.account_id] = message["sequence"]
+                self._received_message_ids[session.account_id] = set(session.seen_message_ids)
             if generation != envelope.connector_generation:
                 raise DeliveryError("STALE_GENERATION")
             if message.get("execution_epoch") is not None and message["execution_epoch"] != envelope.execution_epoch:

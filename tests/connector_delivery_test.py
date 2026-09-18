@@ -60,6 +60,28 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "payload": {"state": "REJECTED", "code": "EXECUTION_DISABLED"},
         }), "REJECTED")
 
+    async def test_inbound_sequence_watermark_survives_reconnect(self):
+        message = {
+            "schema_version": 1, "type": "heartbeat", "message_id": "hb-1",
+            "account_id": "a", "provider": "mt5", "broker_server": "demo",
+            "external_account_id": "42", "generation": 7, "sequence": 1,
+            "execution_epoch": 3, "command_id": None, "idempotency_key": "msg:hb-1",
+            "sent_at": "2026-09-18T00:00:00+00:00", "payload": {},
+        }
+        await self.registry.accept_inbound("a", "s1", message)
+        await self.registry.close_session("a", "s1")
+        await self.registry.open_session(
+            "a", 7, "s2",
+            identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
+            execution_epoch=3,
+        )
+        accepted = await self.registry.accept_inbound(
+            "a", "s2", {**message, "message_id": "hb-2", "sequence": 2, "idempotency_key": "msg:hb-2"},
+        )
+        self.assertEqual(accepted["sequence"], 2)
+        with self.assertRaisesRegex(DeliveryError, "REPLAYED_SEQUENCE"):
+            await self.registry.accept_inbound("a", "s2", {**message, "message_id": "hb-1"})
+
     async def test_result_requires_canonical_schema_and_rejects_message_replay(self):
         envelope = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         await self.registry.next_for_session("a", "s1")
