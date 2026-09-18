@@ -1951,6 +1951,67 @@ async def quote_stream(websocket: WebSocket) -> None:
         return
 
 
+def _reconciliation_gate_complete(
+    observation: dict[str, Any],
+    recovery: list[dict[str, Any]],
+    from_server_time: str | None,
+) -> bool:
+    """Require complete reads and durable evidence before opening the stream gate."""
+    if observation.get("complete") is not True:
+        return False
+    if not {"orders", "fills", "positions", "history_orders", "deals"}.issubset(observation):
+        return False
+    recovery_ids = {
+        str(record.get("subject_id"))
+        for record in recovery
+        if record.get("subject_id")
+    }
+    if len(recovery_ids) != len(recovery) or (recovery and from_server_time is None):
+        return False
+    recovery_matches = observation.get("recovery_matches")
+    matched_ids = {
+        str(match.get("subject_id"))
+        for match in recovery_matches or []
+        if isinstance(match, dict) and match.get("subject_id")
+    }
+    if recovery_ids and not (
+        isinstance(recovery_matches, list)
+        and matched_ids == recovery_ids
+        and len(recovery_matches) == len(recovery_ids)
+        and all(match.get("status") == "MATCHED" for match in recovery_matches)
+        and observation.get("from_server_time") == from_server_time
+    ):
+        return False
+    evidence_by_id = {
+        str(match["subject_id"]): match
+        for match in recovery_matches or []
+        if isinstance(match, dict) and match.get("subject_id")
+    }
+    order_ids = {
+        str(item.get("order_id")) for item in observation.get("orders", [])
+        if isinstance(item, dict) and item.get("order_id")
+    }
+    command_ids = {
+        str(item.get("command_id")) for item in observation.get("commands", [])
+        if isinstance(item, dict) and item.get("command_id")
+    }
+    position_command_ids = {
+        str(item.get("command_id")) for item in observation.get("position_commands", [])
+        if isinstance(item, dict) and item.get("command_id")
+    }
+    for subject_id, match in evidence_by_id.items():
+        kind = match.get("kind")
+        if kind == "ORDER" and subject_id not in order_ids:
+            return False
+        if kind == "COMMAND" and subject_id not in command_ids:
+            return False
+        if kind == "POSITION_COMMAND" and subject_id not in position_command_ids:
+            return False
+        if kind not in {"ORDER", "COMMAND", "POSITION_COMMAND"}:
+            return False
+    return True
+
+
 @app.websocket("/ws/v1/connector")
 async def connector_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -2108,7 +2169,19 @@ async def connector_stream(websocket: WebSocket) -> None:
             record for record in execution.recovery_records(account.id)
             if record["status"] in {"PENDING", "ESCALATED"}
         ]
-        await queue_control("reconciliation.required", {"recovery": recovery})
+        recovery_times = [
+            datetime.fromisoformat(record["first_seen_at"].replace("Z", "+00:00"))
+            for record in recovery
+            if isinstance(record.get("first_seen_at"), str)
+        ]
+        from_server_time = (
+            min(recovery_times).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if recovery_times else None
+        )
+        await queue_control(
+            "reconciliation.required",
+            {"recovery": recovery, "from_server_time": from_server_time},
+        )
         try:
             while True:
                 received = asyncio.create_task(websocket.receive_json())
@@ -2157,7 +2230,9 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "duplicate_fill_ids": result.duplicate_fill_ids,
                         "recovery": execution.recovery_records(account.id),
                     })
-                    if observation.get("complete") is True and {"orders", "fills", "positions"}.issubset(observation):
+                    if _reconciliation_gate_complete(
+                        observation, recovery, from_server_time,
+                    ):
                         await connector_delivery.mark_reconciled(account.id, hello["session_id"])
                     await queue_control("reconciliation_observed", {
                         "status": result.status,

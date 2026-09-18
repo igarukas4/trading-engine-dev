@@ -203,15 +203,88 @@ class ConnectorProtocol:
         request_hash = message.get("request_hash", "legacy:" + command_id)
         return self._legacy_result_for(command_id, key, request_hash)
 
+    @staticmethod
+    def _recovery_match(record: Any, rows: list[Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Match only an explicit durable correlation, never broker heuristics."""
+        if not isinstance(record, dict):
+            return ({"status": "UNRESOLVED", "reason": "INVALID_RECOVERY_RECORD"}, None)
+        subject_id = record.get("subject_id", record.get("order_id"))
+        kind = record.get("kind")
+        if (
+            not isinstance(subject_id, str)
+            or not subject_id
+            or not isinstance(kind, str)
+            or kind not in {"ORDER", "POSITION_COMMAND", "COMMAND"}
+        ):
+            return ({"status": "UNRESOLVED", "reason": "INVALID_RECOVERY_RECORD"}, None)
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for source, row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field in ("command_id", "correlation_id", "position_id", "order_id", "comment", "magic"):
+                if str(row.get(field, "")) == subject_id:
+                    matches.append((source, row))
+                    break
+        evidence = {"subject_id": subject_id, "kind": kind}
+        if len(matches) != 1:
+            evidence.update({
+                "status": "UNRESOLVED",
+                "reason": "CORRELATION_ABSENT" if not matches else "MULTIPLE_CORRELATIONS",
+            })
+            return evidence, None
+        source, row = matches[0]
+        evidence.update({
+            "status": "MATCHED",
+            "source": source,
+            "matched_by": next(
+                field for field in ("command_id", "correlation_id", "position_id", "order_id", "comment", "magic")
+                if str(row.get(field, "")) == subject_id
+            ),
+        })
+        return evidence, row
+
     def _reconciliation_responses(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        from_server_time = payload.get("from_server_time")
         try:
             account = self.adapter.account_snapshot().to_dict()
             orders = self.adapter.open_orders().to_dict()
             positions = self.adapter.open_positions().to_dict()
-            history_orders = self.adapter.history_orders(payload.get("from_server_time")).to_dict()
-            history_deals = self.adapter.history_deals(payload.get("from_server_time")).to_dict()
+            history_orders = self.adapter.history_orders(from_server_time).to_dict()
+            history_deals = self.adapter.history_deals(from_server_time).to_dict()
         except Exception as error:
             raise ProtocolError("ADAPTER_ERROR", "reconciliation read failed") from error
+        order_rows = [
+            ("open_orders", row) for row in orders.get("items", [])
+        ] + [
+            ("history_orders", row) for row in history_orders.get("items", [])
+        ] + [
+            ("history_deals", row) for row in history_deals.get("items", [])
+        ]
+        recovery_matches: list[dict[str, Any]] = []
+        commands: list[dict[str, Any]] = []
+        position_commands: list[dict[str, Any]] = []
+        broker_order_ids: dict[str, str] = {}
+        recovered_orders = list(orders.get("items", []))
+        for record in payload.get("recovery", []):
+            match, row = self._recovery_match(record, order_rows)
+            recovery_matches.append(match)
+            if row is None:
+                continue
+            subject_id = match["subject_id"]
+            status = str(row.get("status", row.get("state", "UNKNOWN"))).upper()
+            kind = match["kind"]
+            if kind == "ORDER":
+                mapped = dict(row)
+                mapped["order_id"] = subject_id
+                mapped.setdefault("external_id", row.get("ticket", row.get("order")))
+                recovered_orders.append(mapped)
+                for field in ("ticket", "order", "order_id"):
+                    if row.get(field) is not None:
+                        broker_order_ids[str(row[field])] = subject_id
+            elif kind == "POSITION_COMMAND":
+                position_commands.append({"command_id": subject_id, "status": status, "evidence": match})
+            elif kind == "COMMAND":
+                commands.append({"command_id": subject_id, "status": status, "evidence": match})
         deals = history_deals.get("items", [])
         fills = []
         for deal in deals:
@@ -220,21 +293,25 @@ class ConnectorProtocol:
             fill = dict(deal)
             fill.setdefault("deal_id", fill.get("ticket"))
             fill.setdefault("order_id", fill.get("order"))
+            if str(fill.get("order_id", "")) in broker_order_ids:
+                fill["order_id"] = broker_order_ids[str(fill["order_id"])]
             fill.setdefault("volume", fill.get("volume", "0"))
             if fill.get("deal_id") and fill.get("order_id"):
                 fills.append(fill)
         observation = {
             "account_id": self.cfg.account_id,
             "complete": True,
+            "from_server_time": from_server_time,
             "account": account,
-            "orders": orders.get("items", []),
+            "orders": recovered_orders,
             "positions": positions.get("items", []),
             "history_orders": history_orders.get("items", []),
             "deals": deals,
             "fills": fills,
-            "commands": [],
-            "position_commands": [],
+            "commands": commands,
+            "position_commands": position_commands,
             "recovery": payload.get("recovery", []),
+            "recovery_matches": recovery_matches,
             "sequence_watermark": self.sequence,
         }
         return [

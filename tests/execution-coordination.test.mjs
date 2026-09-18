@@ -503,6 +503,43 @@ print("ok")
   assert.match(output, /ok/);
 });
 
+test("reconciliation gate rejects sparse or unmatched recovery evidence", () => {
+  const output = run(`
+from backend.app.main import _reconciliation_gate_complete
+
+recovery = [{"subject_id": "command-1", "kind": "COMMAND"}]
+base = {
+    "complete": True,
+    "orders": [], "fills": [], "positions": [],
+    "commands": [{"command_id": "command-1"}],
+    "history_orders": [], "deals": [],
+    "from_server_time": "2026-09-17T23:55:00Z",
+}
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "status": "UNRESOLVED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "kind": "COMMAND", "status": "MATCHED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "status": "MATCHED"}], "from_server_time": None},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "kind": "UNKNOWN", "status": "MATCHED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+print("ok")
+  `);
+  assert.match(output, /ok/);
+});
+
 test("ambiguous close-all and position commands stay UNKNOWN until broker observations resolve them", () => {
   const output = run(`
 from backend.app.execution import ExecutionCoordinator

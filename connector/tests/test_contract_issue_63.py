@@ -6,7 +6,7 @@ sys.path.insert(0, "connector/src")
 sys.path.insert(0, "connector/tests")
 
 from mt5_connector.config import ConnectorConfig
-from mt5_connector.models import Identity, AccountSnapshot
+from mt5_connector.models import Identity, AccountSnapshot, ReadSnapshot
 from mt5_connector.protocol import ConnectorProtocol, ProtocolError
 
 from test_runtime import Fake, RAW
@@ -184,7 +184,49 @@ class ContractIssue63Tests(unittest.TestCase):
         self.assertEqual([frame["sequence"] for frame in response], [1, 2])
         self.assertEqual(response[1]["payload"]["observation"]["account_id"], "a1")
 
-    def test_secret_is_not_in_protocol_error(self):
+    def test_reconciliation_uses_recovery_window_and_emits_match_evidence(self):
+        class TrackingFake(Fake):
+            def __init__(self):
+                super().__init__()
+                self.history_windows = []
+
+            def history_orders(self, from_server_time=None):
+                self.history_windows.append(("orders", from_server_time))
+                return ReadSnapshot("history_orders", {
+                    "items": [{"comment": "command-1", "status": "EXECUTED"}],
+                })
+
+            def history_deals(self, from_server_time=None):
+                self.history_windows.append(("deals", from_server_time))
+                return ReadSnapshot("history_deals", {"items": []})
+
+        adapter = TrackingFake()
+        protocol = ConnectorProtocol(self.config(backend_generation=7), adapter)
+        protocol.accept_snapshot({
+            "type": "snapshot", "generation": 7,
+            "snapshot": {"account_id": "a1"},
+        })
+        response = protocol.handle({
+            "schema_version": 1, "type": "reconciliation.required",
+            "message_id": "reconcile-2", "account_id": "a1",
+            "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 1,
+            "execution_epoch": 0, "command_id": None,
+            "idempotency_key": "msg:reconcile-2",
+            "sent_at": "2026-09-18T00:00:00+00:00",
+            "payload": {
+                "from_server_time": "2026-09-17T23:55:00Z",
+                "recovery": [{"kind": "COMMAND", "subject_id": "command-1"}],
+            },
+        })
+        observation = response[1]["payload"]["observation"]
+        self.assertEqual(adapter.history_windows, [
+            ("orders", "2026-09-17T23:55:00Z"),
+            ("deals", "2026-09-17T23:55:00Z"),
+        ])
+        self.assertEqual(observation["recovery_matches"][0]["status"], "MATCHED")
+        self.assertEqual(observation["commands"][0]["command_id"], "command-1")
+
         protocol = ConnectorProtocol(self.config(), Fake())
         with self.assertRaises(ProtocolError) as error:
             protocol.validate_hello({"type": "hello", "secret": "super-secret"})
