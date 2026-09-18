@@ -11,6 +11,10 @@ Treat this document as the operational authority before invoking it.
 
 - Obtain explicit user approval before starting `npm run sandcastle` or
   `npm run sandcastle:watch`.
+- Before asking for approval, show the default profiles from this runbook:
+  planner, implementer, and reviewer use `gpt-5.6-luna` with `high` effort;
+  merger uses `gpt-5.6-sol` with `low` effort. Ask the user to confirm those
+  profiles before starting the runner.
 - Work only on open issues labelled `ready-for-agent`. The label means the
   ticket is specified well enough for autonomous work; `## Blocked by` still
   decides whether it is runnable.
@@ -46,15 +50,17 @@ changed.
 | Planner | `gpt-5.6-luna`, `high` | Read backlog context and emit a plan; issue selection remains deterministic. |
 | Implementer | `gpt-5.6-luna`, `high` | Complete one ticket, test it, and commit on its ticket branch. |
 | Reviewer | `gpt-5.6-luna`, `high` | Review only that branch, make justified corrections, and verify. |
-| Merger | `gpt-5.6-terra`, `high` | Merge reviewed committed work, verify, and close the issue. |
+| Merger | `gpt-5.6-sol`, `low` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
 The four role profiles in `.sandcastle/main.mts` are the canonical
-configuration. Keep them explicit rather than sharing one agent object. Change
-a model or effort only through a reviewed runner configuration change. Cover it
-in `tests/sandcastle-runner.test.mjs`, run `npm run typecheck` and `npm test`,
-then commit it before starting. A profile change does not affect an agent that
-is already running.
+configuration for a default run. Keep them explicit rather than sharing one
+agent object. Token usage may require changing these profiles at any time. If
+the user requests a different profile after seeing the defaults, change only
+`.sandcastle/main.mts` for that run and leave this runbook unchanged. Record
+the confirmed profiles and any override in the Sandcastle log or the relevant
+GitHub issue. A profile change does not affect an agent that is already
+running.
 
 ## Admission: ticket and repository
 
@@ -261,10 +267,10 @@ shared API/schema decision or model quota becomes constrained.
 | Worktree cleanup/ACL failure | Inspect ACL and `git worktree list`; preserve the affected branch/log; repair only the scoped worktree lifecycle. |
 | Dirty host tree before merge | Treat it as user-owned work, isolate it from the merge decision, and request direction if scopes overlap. |
 
-## Completion and handoff
+## Completion and resumption
 
 After every stopped run, record the selected issue, branch, commits, test
-results, log path, and unresolved state in the issue or `HANDOFF.md`. Before
-swapping coordinator/model/session, update `HANDOFF.md` with those durable
-facts. A replacement agent begins by reading `AGENTS.md`, this runbook,
-`HANDOFF.md`, the current Git status, and the active GitHub issue.
+results, log path, and unresolved state in the GitHub issue and Sandcastle log.
+A replacement coordinator begins by reading `AGENTS.md`, this runbook, the
+current Git status, the active GitHub issue, the ticket branch, and the
+relevant Sandcastle log.
