@@ -2157,7 +2157,8 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "duplicate_fill_ids": result.duplicate_fill_ids,
                         "recovery": execution.recovery_records(account.id),
                     })
-                    await connector_delivery.mark_reconciled(account.id, hello["session_id"])
+                    if observation.get("complete") is True and {"orders", "fills", "positions"}.issubset(observation):
+                        await connector_delivery.mark_reconciled(account.id, hello["session_id"])
                     await queue_control("reconciliation_observed", {
                         "status": result.status,
                         "recovery": execution.recovery_records(account.id),

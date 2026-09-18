@@ -15,6 +15,8 @@ class Fake:
  def closed_m1(self,s,c): return ReadSnapshot("candles",{"items":[{"open":"1"}],"closed_only":True})
  def open_orders(self): return ReadSnapshot("orders",{"items":[]})
  def open_positions(self): return ReadSnapshot("positions",{"items":[]})
+ def history_orders(self,from_server_time=None): return ReadSnapshot("history_orders",{"items":[]})
+ def history_deals(self,from_server_time=None): return ReadSnapshot("history_deals",{"items":[]})
 class Tests(unittest.TestCase):
  def test_config_and_wss(self):
   cfg=ConnectorConfig.from_dict(RAW); self.assertEqual(cfg.wss_url[:3],"wss"); self.assertEqual(set(ConnectorProtocol(cfg,Fake()).hello("SECRET")),{"type","account_id","provider","broker_server","external_account_id","key_id","secret","generation","session_id"})

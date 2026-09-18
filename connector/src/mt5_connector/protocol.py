@@ -174,7 +174,7 @@ class ConnectorProtocol:
 
         envelope = self._validate_inbound(message)
         if envelope.type == "reconciliation.required":
-            return self._reconciliation_responses()
+            return self._reconciliation_responses(envelope.payload)
         if envelope.type in CONTROL_TYPES:
             return message
         if envelope.type not in COMMAND_TYPES:
@@ -203,23 +203,38 @@ class ConnectorProtocol:
         request_hash = message.get("request_hash", "legacy:" + command_id)
         return self._legacy_result_for(command_id, key, request_hash)
 
-    def _reconciliation_responses(self) -> list[dict[str, Any]]:
+    def _reconciliation_responses(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         try:
             account = self.adapter.account_snapshot().to_dict()
             orders = self.adapter.open_orders().to_dict()
             positions = self.adapter.open_positions().to_dict()
+            history_orders = self.adapter.history_orders(payload.get("from_server_time")).to_dict()
+            history_deals = self.adapter.history_deals(payload.get("from_server_time")).to_dict()
         except Exception as error:
             raise ProtocolError("ADAPTER_ERROR", "reconciliation read failed") from error
+        deals = history_deals.get("items", [])
+        fills = []
+        for deal in deals:
+            if not isinstance(deal, dict):
+                continue
+            fill = dict(deal)
+            fill.setdefault("deal_id", fill.get("ticket"))
+            fill.setdefault("order_id", fill.get("order"))
+            fill.setdefault("volume", fill.get("volume", "0"))
+            if fill.get("deal_id") and fill.get("order_id"):
+                fills.append(fill)
         observation = {
             "account_id": self.cfg.account_id,
             "complete": True,
             "account": account,
             "orders": orders.get("items", []),
             "positions": positions.get("items", []),
-            "deals": [],
-            "fills": [],
+            "history_orders": history_orders.get("items", []),
+            "deals": deals,
+            "fills": fills,
             "commands": [],
             "position_commands": [],
+            "recovery": payload.get("recovery", []),
             "sequence_watermark": self.sequence,
         }
         return [

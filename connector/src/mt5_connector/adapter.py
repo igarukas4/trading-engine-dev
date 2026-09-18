@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Protocol, Any
 from .models import Identity, AccountSnapshot, ReadSnapshot
 
@@ -11,6 +12,8 @@ class MT5ReadAdapter(Protocol):
     def closed_m1(self, symbol: str, count: int) -> ReadSnapshot: ...
     def open_orders(self) -> ReadSnapshot: ...
     def open_positions(self) -> ReadSnapshot: ...
+    def history_orders(self, from_server_time: str | None = None) -> ReadSnapshot: ...
+    def history_deals(self, from_server_time: str | None = None) -> ReadSnapshot: ...
 
 class OfficialMT5Adapter:
     def __init__(self, expected: Identity, account_id: str): self.expected=expected; self.account_id=account_id; self._mt5=None
@@ -39,6 +42,24 @@ class OfficialMT5Adapter:
         return ReadSnapshot("candles", {"symbol":symbol,"timeframe":"M1","closed_only":True,"items":[self._plain(x) for x in rows or []]})
     def open_orders(self): return ReadSnapshot("orders", {"items":[self._plain(x) for x in self._module().orders_get() or []]})
     def open_positions(self): return ReadSnapshot("positions", {"items":[self._plain(x) for x in self._module().positions_get() or []]})
+    def history_orders(self, from_server_time=None):
+        start, end = self._history_window(from_server_time)
+        rows = self._module().history_orders_get(start, end) or []
+        return ReadSnapshot("history_orders", {"items": [self._plain(x) for x in rows]})
+    def history_deals(self, from_server_time=None):
+        start, end = self._history_window(from_server_time)
+        rows = self._module().history_deals_get(start, end) or []
+        return ReadSnapshot("history_deals", {"items": [self._plain(x) for x in rows]})
+    @staticmethod
+    def _history_window(from_server_time):
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=1)
+        if from_server_time:
+            parsed = datetime.fromisoformat(str(from_server_time).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise AdapterError("history window requires timezone")
+            start = parsed.astimezone(timezone.utc)
+        return start, end
     @staticmethod
     def _plain(value):
         if value is None: return None
