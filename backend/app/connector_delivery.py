@@ -84,6 +84,7 @@ class _Session:
     execution_epoch: int | None = None
     last_received_sequence: int = 0
     seen_message_ids: set[str] = field(default_factory=set)
+    reconciliation_required: bool = False
 
 
 def validate_hello(message: dict[str, Any]) -> dict[str, Any]:
@@ -124,6 +125,7 @@ class ConnectorDeliveryRegistry:
         *,
         identity: dict[str, str] | None = None,
         execution_epoch: int | None = None,
+        reconciliation_required: bool = False,
     ) -> None:
         if not account_id or not session_id or isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise DeliveryError("INVALID_SESSION")
@@ -143,6 +145,7 @@ class ConnectorDeliveryRegistry:
                 dict(identity) if identity else None, execution_epoch,
                 self._received_sequence.get(account_id, 0),
                 set(self._received_message_ids.get(account_id, set())),
+                reconciliation_required,
             )
             self._pending.setdefault(account_id, {})
 
@@ -157,6 +160,13 @@ class ConnectorDeliveryRegistry:
         if not session or session.session_id != session_id:
             raise DeliveryError("SESSION_NOT_ACTIVE")
         return await session.queue.get()
+
+    async def mark_reconciled(self, account_id: str, session_id: str) -> None:
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if not session or session.session_id != session_id:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            session.reconciliation_required = False
 
     async def accept_inbound(self, account_id: str, session_id: str, message: dict[str, Any]) -> dict[str, Any]:
         """Validate a connector frame against the already-authenticated session."""
@@ -304,6 +314,8 @@ class ConnectorDeliveryRegistry:
                 identity[field] != session.identity[field] for field in IDENTITY_FIELDS
             ):
                 raise DeliveryError("WRONG_ACCOUNT")
+            if type in SIDE_EFFECTING_COMMANDS and session.reconciliation_required:
+                raise DeliveryError("RECONCILIATION_REQUIRED")
             if (
                 type in SIDE_EFFECTING_COMMANDS
                 and session.execution_epoch is not None
@@ -420,6 +432,8 @@ class ConnectorDeliveryRegistry:
             self._received_sequence[session.account_id] = message["sequence"]
             self._received_message_ids[session.account_id] = set(session.seen_message_ids)
             if item.state != "SENT":
+                if item.state == result:
+                    return result
                 raise DeliveryError("STALE_COMMAND_RESULT")
             item.state = result
             return result

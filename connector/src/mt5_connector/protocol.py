@@ -18,8 +18,7 @@ from .models import (
 
 READ_ONLY = frozenset(COMMAND_TYPES - SIDE_EFFECTING_TYPES)
 CONTROL_TYPES = frozenset({
-    "heartbeat_ack", "reconciliation.required", "reconciliation_observed",
-    "command_result_ack", "error",
+    "heartbeat_ack", "reconciliation_observed", "command_result_ack", "error",
 })
 
 
@@ -174,6 +173,8 @@ class ConnectorProtocol:
             raise ProtocolError("MALFORMED_FRAME", "post-handshake envelope is required")
 
         envelope = self._validate_inbound(message)
+        if envelope.type == "reconciliation.required":
+            return self._reconciliation_responses()
         if envelope.type in CONTROL_TYPES:
             return message
         if envelope.type not in COMMAND_TYPES:
@@ -202,12 +203,44 @@ class ConnectorProtocol:
         request_hash = message.get("request_hash", "legacy:" + command_id)
         return self._legacy_result_for(command_id, key, request_hash)
 
+    def _reconciliation_responses(self) -> list[dict[str, Any]]:
+        try:
+            account = self.adapter.account_snapshot().to_dict()
+            orders = self.adapter.open_orders().to_dict()
+            positions = self.adapter.open_positions().to_dict()
+        except Exception as error:
+            raise ProtocolError("ADAPTER_ERROR", "reconciliation read failed") from error
+        observation = {
+            "account_id": self.cfg.account_id,
+            "complete": True,
+            "account": account,
+            "orders": orders.get("items", []),
+            "positions": positions.get("items", []),
+            "deals": [],
+            "fills": [],
+            "commands": [],
+            "position_commands": [],
+            "sequence_watermark": self.sequence,
+        }
+        return [
+            self._envelope("account_snapshot", account),
+            self._envelope("reconciliation_observation", {"observation": observation}),
+        ]
+
+    def _replay_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        replay = dict(result)
+        replay["message_id"] = str(uuid.uuid4())
+        self.sequence += 1
+        replay["sequence"] = self.sequence
+        replay["sent_at"] = self._sent_at()
+        return replay
+
     def _legacy_result_for(self, command_id: str, key: str, request_hash: str) -> dict[str, Any]:
         prior = self._results.get(command_id)
         if prior is not None:
             prior_key, prior_hash, result = prior
             if prior_key == key and prior_hash == request_hash:
-                return result
+                return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
         result = self._envelope(
             "command.result",
@@ -230,7 +263,7 @@ class ConnectorProtocol:
         )
         prior = self._context_results.get(key)
         if prior is not None:
-            return prior
+            return self._replay_result(prior)
         result = self._envelope(
             "command.result",
             {"state": "REJECTED", "code": code},
@@ -247,13 +280,13 @@ class ConnectorProtocol:
         if prior is not None:
             prior_key, prior_hash, result = prior
             if prior_key == envelope.idempotency_key and prior_hash == envelope.request_hash:
-                return result
+                return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
         prior_key = self._idempotency.get(envelope.idempotency_key)
         if prior_key is not None:
             command_id, prior_hash, result = prior_key
             if command_id == envelope.command_id and prior_hash == envelope.request_hash:
-                return result
+                return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
         result = self._envelope(
             "command.result",
@@ -273,13 +306,13 @@ class ConnectorProtocol:
         if prior is not None:
             prior_key, prior_hash, result = prior
             if prior_key == envelope.idempotency_key and prior_hash == envelope.request_hash:
-                return result
+                return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
         prior_key = self._idempotency.get(envelope.idempotency_key)
         if prior_key is not None:
             command_id, prior_hash, result = prior_key
             if command_id == envelope.command_id and prior_hash == envelope.request_hash:
-                return result
+                return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
         if envelope.type == "account_snapshot.request":
             data = self.adapter.account_snapshot().to_dict()

@@ -165,10 +165,8 @@ class PostHandshakeEnvelope:
                 raise ContractError("MISSING_REQUEST_HASH", "command request_hash is required")
             if command_id is None:
                 raise ContractError("MALFORMED_FRAME", "command_id is required")
-        elif command_id is not None:
-            raise ContractError("MALFORMED_FRAME", "telemetry command_id must be null")
-        elif request_hash is not None and (not isinstance(request_hash, str) or not request_hash):
-            raise ContractError("MALFORMED_FRAME", "invalid request_hash")
+        elif command_id is not None or request_hash is not None:
+            raise ContractError("MALFORMED_FRAME", "telemetry command context must be null")
         if not isinstance(raw["payload"], dict):
             raise ContractError("MALFORMED_FRAME", "payload must be an object")
         epoch = raw["execution_epoch"]

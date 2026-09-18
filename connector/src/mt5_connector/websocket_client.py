@@ -111,7 +111,9 @@ class ConnectorClient:
                     processed += 1
                     continue
                 if response is not None:
-                    await transport.send(json.dumps(response, separators=(",", ":")))
+                    responses = response if isinstance(response, list) else [response]
+                    for frame in responses:
+                        await transport.send(json.dumps(frame, separators=(",", ":")))
                 processed += 1
             return self.protocol
         finally:

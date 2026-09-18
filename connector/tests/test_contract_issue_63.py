@@ -78,7 +78,10 @@ class ContractIssue63Tests(unittest.TestCase):
         }
         first = protocol.handle(command)
         replay = protocol.handle({**command, "message_id": "command-message-2", "sequence": 2})
-        self.assertEqual(replay, first)
+        self.assertNotEqual(replay["message_id"], first["message_id"])
+        self.assertEqual(replay["sequence"], 2)
+        self.assertEqual(replay["payload"], first["payload"])
+        self.assertEqual(replay["idempotency_key"], first["idempotency_key"])
         with self.assertRaisesRegex(ProtocolError, "IDEMPOTENCY_KEY_REUSED"):
             protocol.handle({**command, "message_id": "command-message-3", "sequence": 3,
                              "request_hash": "different"})
@@ -104,7 +107,10 @@ class ContractIssue63Tests(unittest.TestCase):
         self.assertEqual(result["idempotency_key"], "snapshot-key")
         self.assertEqual(result["request_hash"], "snapshot-hash")
         replay = protocol.handle({**command, "message_id": "snapshot-command-2", "sequence": 2})
-        self.assertEqual(replay, result)
+        self.assertNotEqual(replay["message_id"], result["message_id"])
+        self.assertEqual(replay["sequence"], 2)
+        self.assertEqual(replay["payload"], result["payload"])
+        self.assertEqual(replay["idempotency_key"], result["idempotency_key"])
 
     def test_candle_request_requires_closed_only_and_valid_payload(self):
         protocol = ConnectorProtocol(self.config(backend_generation=7), Fake())
@@ -148,7 +154,37 @@ class ContractIssue63Tests(unittest.TestCase):
                 "idempotency_key": "msg:heartbeat-1",
                 "sent_at": "2026-09-18T00:00:00+00:00", "payload": {},
             })
+        with self.assertRaisesRegex(ProtocolError, "MALFORMED_FRAME"):
+            protocol.handle({
+                "schema_version": 1, "type": "heartbeat",
+                "message_id": "heartbeat-2", "account_id": "a1",
+                "provider": "MT5", "broker_server": "Demo",
+                "external_account_id": "42", "generation": 7, "sequence": 1,
+                "execution_epoch": 0, "command_id": None,
+                "idempotency_key": "msg:heartbeat-2", "request_hash": "unexpected",
+                "sent_at": "2026-09-18T00:00:00+00:00", "payload": {},
+            })
 
+    def test_reconciliation_required_collects_read_only_state(self):
+        protocol = ConnectorProtocol(self.config(backend_generation=7), Fake())
+        protocol.accept_snapshot({
+            "type": "snapshot", "generation": 7,
+            "snapshot": {"account_id": "a1"},
+        })
+        response = protocol.handle({
+            "schema_version": 1, "type": "reconciliation.required",
+            "message_id": "reconcile-1", "account_id": "a1",
+            "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 1,
+            "execution_epoch": 0, "command_id": None,
+            "idempotency_key": "msg:reconcile-1",
+            "sent_at": "2026-09-18T00:00:00+00:00", "payload": {"recovery": []},
+        })
+        self.assertEqual([frame["type"] for frame in response], ["account_snapshot", "reconciliation_observation"])
+        self.assertEqual([frame["sequence"] for frame in response], [1, 2])
+        self.assertEqual(response[1]["payload"]["observation"]["account_id"], "a1")
+
+    def test_secret_is_not_in_protocol_error(self):
         protocol = ConnectorProtocol(self.config(), Fake())
         with self.assertRaises(ProtocolError) as error:
             protocol.validate_hello({"type": "hello", "secret": "super-secret"})

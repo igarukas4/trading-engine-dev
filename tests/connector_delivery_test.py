@@ -39,7 +39,20 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DeliveryError, "STALE_GENERATION"):
             await self.registry.enqueue(**{**self.kw, "connector_generation": 8}, dispatch_sequence=1, command_id="c", idempotency_key="i", request_hash="h")
 
-    async def test_result_states_and_unknown_is_terminal_without_resend(self):
+    async def test_reconciliation_gate_blocks_side_effects_until_observed(self):
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session(
+            "a", 7, "s1",
+            identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
+            execution_epoch=3,
+            reconciliation_required=True,
+        )
+        with self.assertRaisesRegex(DeliveryError, "RECONCILIATION_REQUIRED"):
+            await registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
+        await registry.mark_reconciled("a", "s1")
+        envelope = await registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
+        self.assertEqual(envelope.command_id, "c1")
+
         envelope = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         await self.registry.next_for_session("a", "s1")
         await self.registry.mark_sent("a", envelope.command_id, "s1")
@@ -51,8 +64,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(await self.registry.record_result(result), "UNKNOWN")
         self.assertEqual(self.registry.pending_state("a", "c1"), "UNKNOWN")
-        with self.assertRaisesRegex(DeliveryError, "STALE_COMMAND_RESULT"):
-            await self.registry.record_result({**result, "message_id": "result-2", "sequence": 2})
+        self.assertEqual(await self.registry.record_result({**result, "message_id": "result-2", "sequence": 2}), "UNKNOWN")
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.registry.next_for_session("a", "s1"), 0.01)
 

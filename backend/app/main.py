@@ -2048,6 +2048,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                     "external_account_id": account.external_account_id,
                 },
                 execution_epoch=execution.account(account.id).execution_epoch,
+                reconciliation_required=True,
             )
         except DeliveryError as error:
             await websocket.close(code=1013, reason=error.code)
@@ -2107,8 +2108,7 @@ async def connector_stream(websocket: WebSocket) -> None:
             record for record in execution.recovery_records(account.id)
             if record["status"] in {"PENDING", "ESCALATED"}
         ]
-        if recovery:
-            await queue_control("reconciliation.required", {"recovery": recovery})
+        await queue_control("reconciliation.required", {"recovery": recovery})
         try:
             while True:
                 received = asyncio.create_task(websocket.receive_json())
@@ -2118,6 +2118,9 @@ async def connector_stream(websocket: WebSocket) -> None:
                 if writer in done:
                     writer.result()
                 message = received.result()
+                if not isinstance(message, dict):
+                    await queue_control("error", {"code": "MALFORMED_FRAME"})
+                    continue
                 if message.get("type") != "command.result":
                     try:
                         await connector_delivery.accept_inbound(
@@ -2154,6 +2157,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "duplicate_fill_ids": result.duplicate_fill_ids,
                         "recovery": execution.recovery_records(account.id),
                     })
+                    await connector_delivery.mark_reconciled(account.id, hello["session_id"])
                     await queue_control("reconciliation_observed", {
                         "status": result.status,
                         "recovery": execution.recovery_records(account.id),
