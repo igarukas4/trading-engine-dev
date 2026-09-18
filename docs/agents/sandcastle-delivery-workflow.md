@@ -47,10 +47,10 @@ changed.
 
 | Runner role | Effective profile | Responsibility |
 | --- | --- | --- |
-| Planner | `haiku` → `gpt-5.6-luna`, `high` | Read backlog context and emit a plan; issue selection remains deterministic. |
-| Implementer | `haiku` → `gpt-5.6-luna`, `high` | Complete one ticket, test it, and commit on its ticket branch. |
-| Reviewer | `haiku` → `gpt-5.6-luna`, `high` | Review only that branch, make justified corrections, and verify. |
-| Merger | `sonnet` → `gpt-5.6-sol`, `low` | Merge reviewed committed work, verify, and close the issue. |
+| Planner | `haiku` → `gpt-5.6-luna`, `medium` | Read backlog context and emit a plan; issue selection remains deterministic. |
+| Implementer | `haiku` → `gpt-5.6-luna`, `medium` | Complete one ticket, test it, and commit on its ticket branch. |
+| Reviewer | `haiku` → `gpt-5.6-luna`, `medium` | Review only that branch, make justified corrections, and verify. |
+| Merger | `sonnet` → `gpt-5.6-sol`, `medium` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
 The four role profiles in `.sandcastle/main.mts` are the canonical

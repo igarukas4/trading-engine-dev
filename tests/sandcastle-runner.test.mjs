@@ -75,19 +75,19 @@ test("Sandcastle passes GitHub and proxy auth to sandbox runs", () => {
 test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   assert.match(
     main,
-    /const plannerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
+    /const plannerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
   );
   assert.match(
     main,
-    /const implementerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
+    /const implementerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
   );
   assert.match(
     main,
-    /const reviewerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
+    /const reviewerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.claudeCode\("sonnet", \{\s+effort: "low",/,
+    /const mergerAgent = sandcastle\.claudeCode\("sonnet", \{\s+effort: "medium",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);

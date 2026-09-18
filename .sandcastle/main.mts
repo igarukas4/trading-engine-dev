@@ -168,22 +168,22 @@ const MAX_CONCURRENT_ISSUES = 3;
 // These checked-in role profiles are the canonical Sandcastle configuration.
 // Change a profile only as a reviewed runner configuration change.
 const plannerAgent = sandcastle.claudeCode("haiku", {
-  effort: "high",
+  effort: "medium",
   captureSessions: false,
 });
 
 const implementerAgent = sandcastle.claudeCode("haiku", {
-  effort: "high",
+  effort: "medium",
   captureSessions: false,
 });
 
 const reviewerAgent = sandcastle.claudeCode("haiku", {
-  effort: "high",
+  effort: "medium",
   captureSessions: false,
 });
 
 const mergerAgent = sandcastle.claudeCode("sonnet", {
-  effort: "low",
+  effort: "medium",
   captureSessions: false,
 });
 
