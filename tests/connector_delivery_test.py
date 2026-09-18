@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from backend.app.connector_delivery import ConnectorDeliveryRegistry, DeliveryError
+from backend.app.connector_delivery import ConnectorDeliveryRegistry, DeliveryError, validate_hello
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -44,13 +44,73 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.registry.next_for_session("a", "s1"), 0.01)
 
-    async def test_receive_and_delivery_can_progress_concurrently(self):
+    async def test_wire_contract_uses_sequence_and_round_trips_request_hash(self):
         envelope = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
-        receive = asyncio.create_task(asyncio.sleep(0.01, result={"type": "heartbeat"}))
-        outbound = asyncio.create_task(self.registry.next_for_session("a", "s1"))
-        received, sent = await asyncio.gather(receive, outbound)
-        self.assertEqual(received["type"], "heartbeat")
-        self.assertEqual(sent.command_id, envelope.command_id)
+        message = envelope.as_message()
+        self.assertEqual(message["sequence"], 1)
+        self.assertNotIn("dispatch_sequence", message)
+        self.assertNotIn("connector_generation", message)
+        await self.registry.next_for_session("a", "s1")
+        await self.registry.mark_sent("a", "c1", "s1")
+        self.assertEqual(await self.registry.record_result({
+            **message,
+            "type": "command.result",
+            "message_id": "result-1",
+            "sequence": 1,
+            "payload": {"state": "REJECTED", "code": "EXECUTION_DISABLED"},
+        }), "REJECTED")
+
+    async def test_result_requires_canonical_schema_and_rejects_message_replay(self):
+        envelope = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
+        await self.registry.next_for_session("a", "s1")
+        await self.registry.mark_sent("a", envelope.command_id, "s1")
+        result = {
+            **envelope.as_message(),
+            "type": "command.result",
+            "message_id": "result-1",
+            "payload": {"state": "REJECTED", "code": "EXECUTION_DISABLED"},
+        }
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME"):
+            await self.registry.record_result({k: v for k, v in result.items() if k != "schema_version"})
+        self.assertEqual(await self.registry.record_result(result), "REJECTED")
+        second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
+        await self.registry.next_for_session("a", "s1")
+        await self.registry.mark_sent("a", second.command_id, "s1")
+        duplicate = {**result, "command_id": "c2", "sequence": 2}
+        with self.assertRaisesRegex(DeliveryError, "REPLAYED_SEQUENCE"):
+            await self.registry.record_result(duplicate)
+
+        hello = {
+            "type": "hello", "account_id": "a", "provider": "MT5",
+            "broker_server": "demo", "external_account_id": "42", "key_id": "k",
+            "secret": "super-secret", "generation": 7, "session_id": "s1",
+        }
+        self.assertEqual(validate_hello(hello), hello)
+        with self.assertRaisesRegex(DeliveryError, "MALFORMED_FRAME") as error:
+            validate_hello({**hello, "extra": "nope"})
+        self.assertNotIn("super-secret", str(error.exception))
+
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session(
+            "a", 7, "s1",
+            identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
+            execution_epoch=3,
+        )
+        with self.assertRaisesRegex(DeliveryError, "WRONG_ACCOUNT"):
+            await registry.enqueue(
+                **{**self.kw, "identity": {"provider": "mt5", "broker_server": "other", "external_account_id": "42"}},
+                dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1",
+            )
+        self.assertIsNone(registry.pending_state("a", "c1"))
+
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session("a", 7, "s1", execution_epoch=4)
+        with self.assertRaisesRegex(DeliveryError, "STALE_EPOCH"):
+            await registry.enqueue(
+                **{**self.kw, "execution_epoch": 3},
+                dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1",
+            )
+        self.assertIsNone(registry.pending_state("a", "c1"))
 
 
 if __name__ == "__main__":

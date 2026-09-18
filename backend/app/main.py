@@ -43,7 +43,7 @@ from .execution import (
     canonical_order_hash,
 )
 from .dashboard import audit_hub, dashboard_hub
-from .connector_delivery import DeliveryError, connector_delivery
+from .connector_delivery import DeliveryError, connector_delivery, validate_hello
 
 
 @dataclass(frozen=True)
@@ -2015,19 +2015,10 @@ async def connector_stream(websocket: WebSocket) -> None:
                 })
                 await websocket.close(code=1000, reason="pairing complete")
                 return
-        required = {
-            "type",
-            "account_id",
-            "provider",
-            "broker_server",
-            "external_account_id",
-            "key_id",
-            "secret",
-            "generation",
-            "session_id",
-        }
-        if set(hello) != required or hello["type"] != "hello":
-            await websocket.close(code=1008, reason="invalid authenticated handshake")
+        try:
+            hello = validate_hello(hello)
+        except DeliveryError as error:
+            await websocket.close(code=1008, reason=error.code)
             return
         account = accounts.accounts.get(hello["account_id"])
         requested_identity = (
@@ -2047,11 +2038,27 @@ async def connector_stream(websocket: WebSocket) -> None:
             return
         bound_account = account
         try:
-            await connector_delivery.open_session(account.id, account.connector_generation, hello["session_id"])
+            await connector_delivery.open_session(
+                account.id,
+                account.connector_generation,
+                hello["session_id"],
+                identity={
+                    "provider": account.provider,
+                    "broker_server": account.broker_server,
+                    "external_account_id": account.external_account_id,
+                },
+                execution_epoch=execution.account(account.id).execution_epoch,
+            )
         except DeliveryError as error:
             await websocket.close(code=1013, reason=error.code)
             return
-        await websocket.send_json({"type": "snapshot", "snapshot": accounts.read_only_snapshot(account.id)})
+        await websocket.send_json({
+            "type": "snapshot",
+            "generation": account.connector_generation,
+            "server_sequence": 0,
+            "execution_epoch": execution.account(account.id).execution_epoch,
+            "snapshot": accounts.read_only_snapshot(account.id),
+        })
         recovery = [
             record for record in execution.recovery_records(account.id)
             if record["status"] in {"PENDING", "ESCALATED"}
@@ -2076,15 +2083,48 @@ async def connector_stream(websocket: WebSocket) -> None:
                 if sender in done:
                     sender.result()
                 message = received.result()
-                if message.get("account_id") != account.id or message.get("generation", message.get("connector_generation")) != account.connector_generation:
-                    await websocket.send_json({"type": "error", "code": "STALE_GENERATION" if message.get("account_id") == account.id else "WRONG_ACCOUNT"})
-                    continue
+                if message.get("type") not in {"command.result", "command_result"}:
+                    try:
+                        await connector_delivery.accept_inbound(
+                            account.id, hello["session_id"], message,
+                        )
+                    except DeliveryError as error:
+                        await websocket.send_json({"type": "error", "code": error.code})
+                        continue
                 if message.get("type") == "heartbeat":
-                    accounts.heartbeat(account.id, account.connector_generation, message.get("session_id", ""))
+                    accounts.heartbeat(account.id, account.connector_generation, hello["session_id"])
                     execution.observe_connector_health(account.id, healthy=True)
-                    await websocket.send_json({"type": "heartbeat_ack", "account_id": account.id, "generation": account.connector_generation})
+                    if message.get("schema_version") == 1:
+                        ack_id = f"heartbeat-ack:{message.get('message_id', 'unknown')}"
+                        ack_sequence = await connector_delivery.reserve_sequence(
+                            account.id, hello["session_id"],
+                        )
+                        await websocket.send_json({
+                            "schema_version": 1,
+                            "type": "heartbeat_ack",
+                            "message_id": ack_id,
+                            "account_id": account.id,
+                            "provider": account.provider,
+                            "broker_server": account.broker_server,
+                            "external_account_id": account.external_account_id,
+                            "generation": account.connector_generation,
+                            "sequence": ack_sequence,
+                            "execution_epoch": execution.account(account.id).execution_epoch,
+                            "command_id": None,
+                            "idempotency_key": "msg:" + ack_id,
+                            "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "payload": {},
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "heartbeat_ack",
+                            "account_id": account.id,
+                            "generation": account.connector_generation,
+                        })
                 elif message.get("type") == "reconciliation_observation":
                     observation = message.get("observation")
+                    if observation is None and isinstance(message.get("payload"), dict):
+                        observation = message["payload"].get("observation", message["payload"])
                     if not isinstance(observation, dict):
                         await websocket.send_json({"type": "error", "code": "INVALID_RECONCILIATION_OBSERVATION"})
                         continue
@@ -2108,8 +2148,15 @@ async def connector_stream(websocket: WebSocket) -> None:
                         continue
                     await websocket.send_json({"type": "command_result_ack", "account_id": account.id,
                                                "command_id": message["command_id"], "result": result})
+                elif message.get("type") in {"account_snapshot", "market_snapshot", "candle_batch"}:
+                    _audit(
+                        account.id,
+                        "connector.snapshot.received",
+                        "connector read-only snapshot",
+                        {"type": message["type"], "payload": message.get("payload", {})},
+                    )
                 else:
-                    await websocket.send_json({"type": "error", "code": "READ_ONLY_FOUNDATION"})
+                    await websocket.send_json({"type": "error", "code": "UNSUPPORTED_COMMAND"})
         finally:
             sender.cancel()
             with suppress(asyncio.CancelledError):

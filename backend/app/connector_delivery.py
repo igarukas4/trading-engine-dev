@@ -6,7 +6,8 @@ must not be confused with the connector SQLite journal or a backend outbox.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 
@@ -19,6 +20,10 @@ COMMAND_TYPES = frozenset({
     "position.close",
     "reconcile.request",
 })
+SIDE_EFFECTING_COMMANDS = frozenset({
+    "order.submit_market", "position.modify_protection", "position.close",
+})
+IDENTITY_FIELDS = frozenset({"provider", "broker_server", "external_account_id"})
 RESULT_STATES = frozenset({"ACCEPTED", "REJECTED", "UNKNOWN"})
 
 
@@ -40,6 +45,7 @@ class OutboundEnvelope:
     request_hash: str
     type: str
     payload: dict[str, Any]
+    sent_at: str
 
     def as_message(self) -> dict[str, Any]:
         return {
@@ -47,17 +53,16 @@ class OutboundEnvelope:
             "type": self.type,
             "message_id": f"dispatch:{self.command_id}",
             "account_id": self.account_id,
-            "provider": self.identity.get("provider", ""),
-            "broker_server": self.identity.get("broker_server", ""),
-            "external_account_id": self.identity.get("external_account_id", ""),
+            "provider": self.identity["provider"],
+            "broker_server": self.identity["broker_server"],
+            "external_account_id": self.identity["external_account_id"],
             "generation": self.connector_generation,
-            "connector_generation": self.connector_generation,
-            "dispatch_sequence": self.dispatch_sequence,
             "sequence": self.dispatch_sequence,
             "execution_epoch": self.execution_epoch,
             "command_id": self.command_id,
             "idempotency_key": self.idempotency_key,
             "request_hash": self.request_hash,
+            "sent_at": self.sent_at,
             "payload": self.payload,
         }
 
@@ -74,6 +79,27 @@ class _Session:
     generation: int
     session_id: str
     queue: asyncio.Queue[OutboundEnvelope]
+    identity: dict[str, str] | None = None
+    execution_epoch: int | None = None
+    last_received_sequence: int = 0
+    seen_message_ids: set[str] = field(default_factory=set)
+
+
+def validate_hello(message: dict[str, Any]) -> dict[str, Any]:
+    """Validate the exact nine-field opening frame without echoing its secret."""
+    fields = {
+        "type", "account_id", "provider", "broker_server", "external_account_id",
+        "key_id", "secret", "generation", "session_id",
+    }
+    if not isinstance(message, dict) or set(message) != fields or message.get("type") != "hello":
+        raise DeliveryError("MALFORMED_FRAME")
+    for field in fields - {"generation", "type"}:
+        if not isinstance(message.get(field), str) or not message[field]:
+            raise DeliveryError("MALFORMED_FRAME")
+    generation = message["generation"]
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise DeliveryError("MALFORMED_FRAME")
+    return dict(message)
 
 
 class ConnectorDeliveryRegistry:
@@ -85,14 +111,27 @@ class ConnectorDeliveryRegistry:
         self._last_sequence: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
-    async def open_session(self, account_id: str, generation: int, session_id: str) -> None:
+    async def open_session(
+        self,
+        account_id: str,
+        generation: int,
+        session_id: str,
+        *,
+        identity: dict[str, str] | None = None,
+        execution_epoch: int | None = None,
+    ) -> None:
         if not account_id or not session_id or generation < 0:
             raise DeliveryError("INVALID_SESSION")
+        if identity is not None and set(identity) != IDENTITY_FIELDS:
+            raise DeliveryError("INVALID_ACCOUNT_IDENTITY")
+        if execution_epoch is not None and (isinstance(execution_epoch, bool) or execution_epoch < 0):
+            raise DeliveryError("INVALID_COMMAND_CONTEXT")
         async with self._lock:
             if account_id in self._sessions:
                 raise DeliveryError("SESSION_ALREADY_ACTIVE")
             self._sessions[account_id] = _Session(
-                account_id, generation, session_id, asyncio.Queue()
+                account_id, generation, session_id, asyncio.Queue(),
+                dict(identity) if identity else None, execution_epoch,
             )
             self._pending.setdefault(account_id, {})
 
@@ -107,6 +146,70 @@ class ConnectorDeliveryRegistry:
         if not session or session.session_id != session_id:
             raise DeliveryError("SESSION_NOT_ACTIVE")
         return await session.queue.get()
+
+    async def accept_inbound(self, account_id: str, session_id: str, message: dict[str, Any]) -> dict[str, Any]:
+        """Validate a connector frame against the already-authenticated session."""
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if not session or session.session_id != session_id:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            if not isinstance(message, dict):
+                raise DeliveryError("MALFORMED_FRAME")
+            if message.get("account_id") != account_id:
+                raise DeliveryError("WRONG_ACCOUNT")
+            generation = message.get("generation", message.get("connector_generation"))
+            if generation != session.generation:
+                raise DeliveryError("STALE_GENERATION")
+            if message.get("schema_version") == 1:
+                if "dispatch_sequence" in message or "connector_generation" in message:
+                    raise DeliveryError("MALFORMED_FRAME")
+                required = {
+                    "type", "message_id", "account_id", *IDENTITY_FIELDS,
+                    "generation", "sequence", "execution_epoch", "command_id",
+                    "idempotency_key", "sent_at", "payload",
+                }
+                if not required.issubset(message) or not isinstance(message.get("payload"), dict):
+                    raise DeliveryError("MALFORMED_FRAME")
+                if session.identity is not None and any(
+                    message.get(field) != session.identity[field] for field in IDENTITY_FIELDS
+                ):
+                    raise DeliveryError("WRONG_ACCOUNT")
+                sequence = message["sequence"]
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                    raise DeliveryError("MALFORMED_FRAME")
+                if message["message_id"] in session.seen_message_ids:
+                    raise DeliveryError("REPLAYED_SEQUENCE")
+                if sequence != session.last_received_sequence + 1:
+                    raise DeliveryError("OUT_OF_ORDER_SEQUENCE")
+                epoch = message["execution_epoch"]
+                if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+                    raise DeliveryError("MALFORMED_FRAME")
+                if message["type"] in SIDE_EFFECTING_COMMANDS and session.execution_epoch is not None and epoch != session.execution_epoch:
+                    raise DeliveryError("STALE_EPOCH")
+                if not isinstance(message["idempotency_key"], str) or not message["idempotency_key"]:
+                    raise DeliveryError("MALFORMED_FRAME")
+                if not isinstance(message["sent_at"], str):
+                    raise DeliveryError("MALFORMED_FRAME")
+                try:
+                    if datetime.fromisoformat(message["sent_at"].replace("Z", "+00:00")).tzinfo is None:
+                        raise ValueError
+                except ValueError as error:
+                    raise DeliveryError("MALFORMED_FRAME") from error
+                session.last_received_sequence = sequence
+                session.seen_message_ids.add(message["message_id"])
+                return message
+            if message.get("type") == "heartbeat" and message.get("session_id") not in (None, session.session_id):
+                raise DeliveryError("STALE_GENERATION")
+            return message
+
+    async def reserve_sequence(self, account_id: str, session_id: str) -> int:
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if not session or session.session_id != session_id:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            sequence = self._last_sequence.get(account_id, 0) + 1
+            self._last_sequence[account_id] = sequence
+            return sequence
 
     async def enqueue(
         self,
@@ -126,9 +229,16 @@ class ConnectorDeliveryRegistry:
             raise DeliveryError("UNSUPPORTED_COMMAND_TYPE")
         if not account_id or not command_id or not idempotency_key or not request_hash:
             raise DeliveryError("MISSING_COMMAND_CONTEXT")
-        if not isinstance(identity, dict) or not identity or any(not k or not v for k, v in identity.items()):
+        if not isinstance(identity, dict) or set(identity) != IDENTITY_FIELDS or any(not isinstance(v, str) or not v for v in identity.values()):
             raise DeliveryError("INVALID_ACCOUNT_IDENTITY")
-        if dispatch_sequence < 1 or connector_generation < 0 or execution_epoch < 0:
+        if not isinstance(payload, dict):
+            raise DeliveryError("INVALID_COMMAND_PAYLOAD")
+        if (
+            isinstance(dispatch_sequence, bool) or not isinstance(dispatch_sequence, int)
+            or isinstance(connector_generation, bool) or not isinstance(connector_generation, int)
+            or isinstance(execution_epoch, bool) or not isinstance(execution_epoch, int)
+            or dispatch_sequence < 1 or connector_generation < 0 or execution_epoch < 0
+        ):
             raise DeliveryError("INVALID_COMMAND_CONTEXT")
         async with self._lock:
             session = self._sessions.get(account_id)
@@ -136,6 +246,16 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("SESSION_NOT_ACTIVE")
             if connector_generation != session.generation:
                 raise DeliveryError("STALE_GENERATION")
+            if session.identity is not None and any(
+                identity[field] != session.identity[field] for field in IDENTITY_FIELDS
+            ):
+                raise DeliveryError("WRONG_ACCOUNT")
+            if (
+                type in SIDE_EFFECTING_COMMANDS
+                and session.execution_epoch is not None
+                and execution_epoch != session.execution_epoch
+            ):
+                raise DeliveryError("STALE_EPOCH")
             pending = self._pending.setdefault(account_id, {})
             existing = pending.get(command_id)
             if existing is not None:
@@ -150,6 +270,7 @@ class ConnectorDeliveryRegistry:
             envelope = OutboundEnvelope(
                 account_id, dict(identity), connector_generation, dispatch_sequence,
                 execution_epoch, command_id, idempotency_key, request_hash, type, dict(payload),
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             )
             self._last_sequence[account_id] = dispatch_sequence
             pending[command_id] = _Pending(envelope)
@@ -157,15 +278,44 @@ class ConnectorDeliveryRegistry:
             return envelope
 
     async def record_result(self, message: dict[str, Any]) -> str:
-        if message.get("type") not in {"command.result", "command_result"}:
+        if not isinstance(message, dict) or message.get("type") not in {"command.result", "command_result"}:
             raise DeliveryError("INVALID_COMMAND_RESULT")
+        canonical_result = message.get("type") == "command.result"
+        if canonical_result:
+            if message.get("schema_version") != 1:
+                raise DeliveryError("MALFORMED_FRAME")
+            if any(field not in message for field in (
+                "message_id", "sent_at", "sequence", "generation", *IDENTITY_FIELDS, "execution_epoch", "payload",
+            )):
+                raise DeliveryError("INVALID_COMMAND_RESULT")
+            if (
+                not isinstance(message["message_id"], str) or not message["message_id"]
+                or not isinstance(message["sequence"], int) or isinstance(message["sequence"], bool)
+                or message["sequence"] < 1
+                or not isinstance(message["generation"], int) or isinstance(message["generation"], bool)
+                or message["generation"] < 0
+                or not isinstance(message["execution_epoch"], int) or isinstance(message["execution_epoch"], bool)
+                or message["execution_epoch"] < 0
+                or not isinstance(message["sent_at"], str)
+            ):
+                raise DeliveryError("INVALID_COMMAND_RESULT")
+            if not isinstance(message.get("payload"), dict):
+                raise DeliveryError("INVALID_COMMAND_RESULT")
+            try:
+                if datetime.fromisoformat(message["sent_at"].replace("Z", "+00:00")).tzinfo is None:
+                    raise ValueError
+            except ValueError as error:
+                raise DeliveryError("INVALID_COMMAND_RESULT") from error
+        elif "schema_version" in message:
+            raise DeliveryError("MALFORMED_FRAME")
         payload = message.get("payload")
         result = payload.get("state") if isinstance(payload, dict) else message.get("result")
         required = ("account_id", "command_id", "idempotency_key", "request_hash")
         if any(not message.get(field) for field in required):
             raise DeliveryError("INVALID_COMMAND_RESULT")
         generation = message.get("connector_generation", message.get("generation"))
-        sequence = message.get("dispatch_sequence", message.get("sequence"))
+        legacy_result = message.get("type") == "command_result" and "dispatch_sequence" in message
+        sequence = message.get("dispatch_sequence") if legacy_result else message.get("sequence")
         if generation is None or sequence is None or result not in RESULT_STATES:
             raise DeliveryError("INVALID_COMMAND_RESULT")
         account_id = message["account_id"]
@@ -175,9 +325,29 @@ class ConnectorDeliveryRegistry:
             if item is None:
                 raise DeliveryError("UNKNOWN_COMMAND")
             envelope = item.envelope
-            if (generation != envelope.connector_generation or sequence != envelope.dispatch_sequence
-                    or message["idempotency_key"] != envelope.idempotency_key
-                    or message["request_hash"] != envelope.request_hash):
+            session = self._sessions.get(account_id)
+            if session is None:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            if canonical_result:
+                if any(message.get(field) != envelope.identity[field] for field in IDENTITY_FIELDS):
+                    raise DeliveryError("COMMAND_CONTEXT_MISMATCH")
+                if message["message_id"] in session.seen_message_ids:
+                    raise DeliveryError("REPLAYED_SEQUENCE")
+                if message["sequence"] != session.last_received_sequence + 1:
+                    raise DeliveryError("OUT_OF_ORDER_SEQUENCE")
+                session.last_received_sequence = message["sequence"]
+                session.seen_message_ids.add(message["message_id"])
+            if generation != envelope.connector_generation:
+                raise DeliveryError("STALE_GENERATION")
+            if message.get("execution_epoch") is not None and message["execution_epoch"] != envelope.execution_epoch:
+                raise DeliveryError("STALE_EPOCH")
+            if legacy_result:
+                sequence_matches = sequence == envelope.dispatch_sequence
+            else:
+                sequence_matches = True
+            if not sequence_matches or message["idempotency_key"] != envelope.idempotency_key:
+                raise DeliveryError("COMMAND_CONTEXT_MISMATCH")
+            if message["request_hash"] != envelope.request_hash:
                 raise DeliveryError("COMMAND_CONTEXT_MISMATCH")
             if item.state != "SENT":
                 raise DeliveryError("STALE_COMMAND_RESULT")
