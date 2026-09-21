@@ -75,19 +75,23 @@ test("Sandcastle passes GitHub and proxy auth to sandbox runs", () => {
 test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   assert.match(
     main,
-    /const plannerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
+    /const runnerModel = "gpt-5\.6-luna";/,
   );
   assert.match(
     main,
-    /const implementerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
+    /const plannerAgent = sandcastle\.claudeCode\(runnerModel, \{\s+effort: "medium",/,
   );
   assert.match(
     main,
-    /const reviewerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "medium",/,
+    /const implementerAgent = sandcastle\.claudeCode\(runnerModel, \{\s+effort: "medium",/,
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
+    /const reviewerAgent = sandcastle\.claudeCode\(runnerModel, \{\s+effort: "xhigh",/,
+  );
+  assert.match(
+    main,
+    /const mergerAgent = sandcastle\.claudeCode\(runnerModel, \{\s+effort: "high",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);
@@ -95,10 +99,10 @@ test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   assert.match(main, /agent: mergerAgent/);
 });
 
-test("Sandcastle uses configurable gateway model aliases", () => {
-  assert.match(main, /sandcastle\.claudeCode\("haiku"/);
+test("Sandcastle uses the configured gateway model directly", () => {
+  assert.match(main, /const runnerModel = "gpt-5\.6-luna"/);
   assert.match(settings, /CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY/);
-  assert.match(settings, /ANTHROPIC_DEFAULT_HAIKU_MODEL.*claude-haiku-4-5/);
+  assert.match(settings, /ANTHROPIC_DEFAULT_HAIKU_MODEL.*gpt-5\.6-luna/);
   assert.match(settings, /ANTHROPIC_DEFAULT_SONNET_MODEL.*gpt-5\.6-sol/);
   assert.match(settings, /ANTHROPIC_DEFAULT_OPUS_MODEL.*gpt-6-astra/);
   assert.match(settings, /ANTHROPIC_DEFAULT_FABLE_MODEL.*gpt-5\.6-terra/);

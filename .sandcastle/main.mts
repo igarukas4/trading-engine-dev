@@ -53,10 +53,10 @@ const sandboxEnv = {
   GH_TOKEN: ghToken,
   ANTHROPIC_BASE_URL: anthropicBaseUrl,
   ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || "unused",
-  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "gpt-5.6-sol[1m]",
+  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "gpt-5.6-luna[1m]",
   ANTHROPIC_SMALL_FAST_MODEL:
     process.env.ANTHROPIC_SMALL_FAST_MODEL || "gpt-5.6-luna[1m]",
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-4-5",
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: "gpt-5.6-luna",
   CLAUDE_CODE_AUTO_COMPACT_WINDOW: "272000",
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
   CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1",
@@ -168,24 +168,26 @@ async function nextUnblockedIssues(
 const MAX_ITERATIONS = 100;
 const MAX_CONCURRENT_ISSUES = 3;
 
-// These checked-in role profiles are the canonical Sandcastle configuration.
-// Change a profile only as a reviewed runner configuration change.
-const plannerAgent = sandcastle.claudeCode("haiku", {
+// All Sandcastle roles use the same raw gateway model ID. This avoids a
+// Claude Code family alias resolving to a different model in settings.json.
+const runnerModel = "gpt-5.6-luna";
+
+const plannerAgent = sandcastle.claudeCode(runnerModel, {
   effort: "medium",
   captureSessions: false,
 });
 
-const implementerAgent = sandcastle.claudeCode("haiku", {
+const implementerAgent = sandcastle.claudeCode(runnerModel, {
   effort: "medium",
   captureSessions: false,
 });
 
-const reviewerAgent = sandcastle.claudeCode("haiku", {
-  effort: "medium",
+const reviewerAgent = sandcastle.claudeCode(runnerModel, {
+  effort: "xhigh",
   captureSessions: false,
 });
 
-const mergerAgent = sandcastle.claudeCode("haiku", {
+const mergerAgent = sandcastle.claudeCode(runnerModel, {
   effort: "high",
   captureSessions: false,
 });

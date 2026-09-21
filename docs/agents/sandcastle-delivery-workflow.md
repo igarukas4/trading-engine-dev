@@ -12,9 +12,10 @@ Treat this document as the operational authority before invoking it.
 - Obtain explicit user approval before starting `npm run sandcastle` or
   `npm run sandcastle:watch`.
 - Before asking for approval, show the default profiles from this runbook:
-  planner, implementer, and reviewer use `gpt-5.6-luna` with `medium` effort;
-  merger uses `gpt-5.6-luna` with `high` effort. Ask the user to confirm those
-  profiles before starting the runner.
+  planner and implementer use `gpt-5.6-luna` with `medium` effort, reviewer
+  uses `gpt-5.6-luna` with `xhigh` effort, and merger uses `gpt-5.6-luna` with
+  `high` effort. Ask the user to confirm those profiles before starting the
+  runner.
 - Work only on open issues labelled `ready-for-agent`. The label means the
   ticket is specified well enough for autonomous work; `## Blocked by` still
   decides whether it is runnable.
@@ -47,18 +48,16 @@ changed.
 
 | Runner role | Effective profile | Responsibility |
 | --- | --- | --- |
-| Planner | `haiku` → `gpt-5.6-luna`, `medium` | Read backlog context and emit a plan; issue selection remains deterministic. |
-| Implementer | `haiku` → `gpt-5.6-luna`, `medium` | Complete one ticket, test it, and commit on its ticket branch. |
-| Reviewer | `haiku` → `gpt-5.6-luna`, `medium` | Review only that branch, make justified corrections, and verify. |
-| Merger | `haiku` → `gpt-5.6-luna`, `high` | Merge reviewed committed work, verify, and close the issue. |
+| Planner | `gpt-5.6-luna`, `medium` | Read backlog context and emit a plan; issue selection remains deterministic. |
+| Implementer | `gpt-5.6-luna`, `medium` | Complete one ticket, test it, and commit on its ticket branch. |
+| Reviewer | `gpt-5.6-luna`, `xhigh` | Review only that branch, make justified corrections, and verify. |
+| Merger | `gpt-5.6-luna`, `high` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
-The four role profiles in `.sandcastle/main.mts` are the canonical
-configuration for a default run. The Claude Code family aliases resolve through
-`.claude/settings.json`, so changing the gateway model mapping there changes the
-underlying proxy model without changing the runner roles. Keep the role aliases
-explicit rather than sharing one agent object. A mapping change does not affect
-an agent that is already running.
+The four role profiles in `.sandcastle/main.mts` use the explicit gateway model
+ID `gpt-5.6-luna`. The runner does not depend on Claude Code family aliases in
+`.claude/settings.json`, so a picker mapping cannot silently change the model.
+The settings file still exposes the same model for interactive Claude Code use.
 
 ## Admission: ticket and repository
 
