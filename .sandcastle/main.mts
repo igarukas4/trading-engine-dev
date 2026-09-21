@@ -391,6 +391,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     hooks: hooks,
     sandbox: sandboxProvider,
     name: "merger",
+    // Verification creates Linux dependencies and a Python virtualenv. Keep
+    // them in a temporary worktree, then merge the verified commits to main.
+    branchStrategy: { type: "merge-to-head" },
     maxIterations: 1,
     agent: mergerAgent,
     promptFile: "./.sandcastle/merge-prompt.md",

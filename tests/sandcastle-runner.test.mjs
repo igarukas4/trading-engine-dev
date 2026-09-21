@@ -24,6 +24,13 @@ test("Sandcastle isolates planner dependencies from the Windows host", () => {
   );
 });
 
+test("Sandcastle isolates merger verification from the Windows host", () => {
+  assert.match(
+    main,
+    /name: "merger",[\s\S]*?branchStrategy: \{ type: "merge-to-head" \},[\s\S]*?agent: mergerAgent/,
+  );
+});
+
 test("Sandcastle sends agent prompts through a temporary container file", () => {
   const program = `
     import assert from "node:assert/strict";
