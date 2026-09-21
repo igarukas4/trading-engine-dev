@@ -26,8 +26,10 @@ ARG AGENT_GID=1000
 # Rename the base image's "node" user to "agent" and align UID/GID.
 RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
 
-# Install Claude Code CLI (run as root before USER agent)
-RUN npm install -g @anthropic-ai/claude-code
+# Pin the CLI to the host-tested version so the sandbox does not silently
+# change its gateway behavior on a later image rebuild.
+ARG CLAUDE_CODE_VERSION=2.1.232
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 USER ${AGENT_UID}:${AGENT_GID}
 

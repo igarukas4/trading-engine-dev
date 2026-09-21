@@ -106,7 +106,8 @@ test("Sandcastle uses configurable gateway model aliases", () => {
 
 test("sandbox image installs Claude Code", () => {
   const dockerfile = readFileSync(".sandcastle/Dockerfile", "utf8");
-  assert.match(dockerfile, /npm install -g @anthropic-ai\/claude-code/);
+  assert.match(dockerfile, /ARG CLAUDE_CODE_VERSION=2\.1\.232/);
+  assert.match(dockerfile, /npm install -g @anthropic-ai\/claude-code@\$\{CLAUDE_CODE_VERSION\}/);
   assert.doesNotMatch(dockerfile, /@openai\/codex/);
 });
 
