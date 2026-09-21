@@ -54,6 +54,32 @@ class WssRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.sent[0]["generation"], 0)
         self.assertTrue(transport.closed)
 
+    async def test_reconnect_rotates_session_id(self):
+        client = ConnectorClient(
+            self.config(), Fake(),
+            transport=FakeTransport([
+                {"type": "snapshot", "generation": 0, "snapshot": {"account_id": "a1"}},
+                {"type": "heartbeat_ack", "account_id": "a1", "generation": 0},
+            ]),
+        )
+        await client.connect_once("injected-secret", max_messages=1)
+        first_session = client.transport.sent[0]["session_id"]
+        client.transport = FakeTransport([
+            {"type": "snapshot", "generation": 0, "server_sequence": 0, "snapshot": {"account_id": "a1"}},
+            {"type": "heartbeat_ack", "account_id": "a1", "generation": 0},
+        ])
+        await client.connect_once("injected-secret", max_messages=1)
+        second_session = client.transport.sent[0]["session_id"]
+        self.assertNotEqual(first_session, second_session)
+
+    def test_snapshot_rejects_server_sequence_rollback(self):
+        protocol = ConnectorProtocol(self.config(), Fake())
+        protocol.accept_snapshot({"type": "snapshot", "generation": 0,
+                                  "server_sequence": 4, "snapshot": {"account_id": "a1"}})
+        with self.assertRaisesRegex(ProtocolError, "OUT_OF_ORDER_SEQUENCE"):
+            protocol.accept_snapshot({"type": "snapshot", "generation": 0,
+                                      "server_sequence": 3, "snapshot": {"account_id": "a1"}})
+
     def test_generation_mismatch(self):
         protocol = ConnectorProtocol(self.config(backend_generation=4), Fake())
         protocol.accept_snapshot({"type": "snapshot", "generation": 4,
@@ -63,10 +89,10 @@ class WssRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def test_side_effecting_commands_rejected(self):
         protocol = ConnectorProtocol(self.config(), Fake())
-        result = protocol.handle({"type": "order.submit_market", "account_id": "a1",
-                                  "generation": 0, "command_id": "c1",
-                                  "idempotency_key": "i1"})
-        self.assertEqual(result["payload"], {"state": "REJECTED", "code": "EXECUTION_DISABLED"})
+        with self.assertRaisesRegex(ProtocolError, "MALFORMED_FRAME"):
+            protocol.handle({"type": "order.submit_market", "account_id": "a1",
+                             "generation": 0, "command_id": "c1",
+                             "idempotency_key": "i1"})
 
     async def test_secret_not_in_runtime_errors(self):
         secret = "do-not-log-this"

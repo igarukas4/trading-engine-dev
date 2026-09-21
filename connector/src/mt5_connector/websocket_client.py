@@ -97,6 +97,7 @@ class ConnectorClient:
     async def connect_once(self, secret, *, max_messages=1):
         if not secret:
             raise ProtocolError("secret is required")
+        self.protocol.begin_session()
         transport = await self._open()
         try:
             await transport.send(json.dumps(self.protocol.hello(secret), separators=(",", ":")))
@@ -110,7 +111,9 @@ class ConnectorClient:
                     processed += 1
                     continue
                 if response is not None:
-                    await transport.send(json.dumps(response, separators=(",", ":")))
+                    responses = response if isinstance(response, list) else [response]
+                    for frame in responses:
+                        await transport.send(json.dumps(frame, separators=(",", ":")))
                 processed += 1
             return self.protocol
         finally:

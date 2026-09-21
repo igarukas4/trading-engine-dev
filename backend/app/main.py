@@ -43,7 +43,7 @@ from .execution import (
     canonical_order_hash,
 )
 from .dashboard import audit_hub, dashboard_hub
-from .connector_delivery import DeliveryError, connector_delivery
+from .connector_delivery import DeliveryError, connector_delivery, validate_hello
 
 
 @dataclass(frozen=True)
@@ -1951,6 +1951,67 @@ async def quote_stream(websocket: WebSocket) -> None:
         return
 
 
+def _reconciliation_gate_complete(
+    observation: dict[str, Any],
+    recovery: list[dict[str, Any]],
+    from_server_time: str | None,
+) -> bool:
+    """Require complete reads and durable evidence before opening the stream gate."""
+    if observation.get("complete") is not True:
+        return False
+    if not {"orders", "fills", "positions", "history_orders", "deals"}.issubset(observation):
+        return False
+    recovery_ids = {
+        str(record.get("subject_id"))
+        for record in recovery
+        if record.get("subject_id")
+    }
+    if len(recovery_ids) != len(recovery) or (recovery and from_server_time is None):
+        return False
+    recovery_matches = observation.get("recovery_matches")
+    matched_ids = {
+        str(match.get("subject_id"))
+        for match in recovery_matches or []
+        if isinstance(match, dict) and match.get("subject_id")
+    }
+    if recovery_ids and not (
+        isinstance(recovery_matches, list)
+        and matched_ids == recovery_ids
+        and len(recovery_matches) == len(recovery_ids)
+        and all(match.get("status") == "MATCHED" for match in recovery_matches)
+        and observation.get("from_server_time") == from_server_time
+    ):
+        return False
+    evidence_by_id = {
+        str(match["subject_id"]): match
+        for match in recovery_matches or []
+        if isinstance(match, dict) and match.get("subject_id")
+    }
+    order_ids = {
+        str(item.get("order_id")) for item in observation.get("orders", [])
+        if isinstance(item, dict) and item.get("order_id")
+    }
+    command_ids = {
+        str(item.get("command_id")) for item in observation.get("commands", [])
+        if isinstance(item, dict) and item.get("command_id")
+    }
+    position_command_ids = {
+        str(item.get("command_id")) for item in observation.get("position_commands", [])
+        if isinstance(item, dict) and item.get("command_id")
+    }
+    for subject_id, match in evidence_by_id.items():
+        kind = match.get("kind")
+        if kind == "ORDER" and subject_id not in order_ids:
+            return False
+        if kind == "COMMAND" and subject_id not in command_ids:
+            return False
+        if kind == "POSITION_COMMAND" and subject_id not in position_command_ids:
+            return False
+        if kind not in {"ORDER", "COMMAND", "POSITION_COMMAND"}:
+            return False
+    return True
+
+
 @app.websocket("/ws/v1/connector")
 async def connector_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -2015,19 +2076,10 @@ async def connector_stream(websocket: WebSocket) -> None:
                 })
                 await websocket.close(code=1000, reason="pairing complete")
                 return
-        required = {
-            "type",
-            "account_id",
-            "provider",
-            "broker_server",
-            "external_account_id",
-            "key_id",
-            "secret",
-            "generation",
-            "session_id",
-        }
-        if set(hello) != required or hello["type"] != "hello":
-            await websocket.close(code=1008, reason="invalid authenticated handshake")
+        try:
+            hello = validate_hello(hello)
+        except DeliveryError as error:
+            await websocket.close(code=1008, reason=error.code)
             return
         account = accounts.accounts.get(hello["account_id"])
         requested_identity = (
@@ -2047,73 +2099,177 @@ async def connector_stream(websocket: WebSocket) -> None:
             return
         bound_account = account
         try:
-            await connector_delivery.open_session(account.id, account.connector_generation, hello["session_id"])
+            await connector_delivery.open_session(
+                account.id,
+                account.connector_generation,
+                hello["session_id"],
+                identity={
+                    "provider": account.provider,
+                    "broker_server": account.broker_server,
+                    "external_account_id": account.external_account_id,
+                },
+                execution_epoch=execution.account(account.id).execution_epoch,
+                reconciliation_required=True,
+            )
         except DeliveryError as error:
             await websocket.close(code=1013, reason=error.code)
             return
-        await websocket.send_json({"type": "snapshot", "snapshot": accounts.read_only_snapshot(account.id)})
-        recovery = [
-            record for record in execution.recovery_records(account.id)
-            if record["status"] in {"PENDING", "ESCALATED"}
-        ]
-        if recovery:
-            await websocket.send_json({
-                "type": "reconciliation.required",
+        server_sequence = await connector_delivery.current_sequence(account.id)
+        await websocket.send_json({
+            "type": "snapshot",
+            "generation": account.connector_generation,
+            "server_sequence": server_sequence,
+            "execution_epoch": execution.account(account.id).execution_epoch,
+            "snapshot": accounts.read_only_snapshot(account.id),
+        })
+        outbound: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
+
+        async def send_ordered() -> None:
+            expected = server_sequence + 1
+            pending: dict[int, dict[str, Any]] = {}
+            while True:
+                sequence, message = await outbound.get()
+                pending[sequence] = message
+                while expected in pending:
+                    await websocket.send_json(pending.pop(expected))
+                    outbound.task_done()
+                    expected += 1
+
+        async def queue_control(typ: str, payload: dict[str, Any]) -> None:
+            message_id = str(uuid4())
+            sequence = await connector_delivery.reserve_sequence(
+                account.id, hello["session_id"],
+            )
+            await outbound.put((sequence, {
+                "schema_version": 1,
+                "type": typ,
+                "message_id": message_id,
                 "account_id": account.id,
-                "recovery": recovery,
-            })
+                "provider": account.provider,
+                "broker_server": account.broker_server,
+                "external_account_id": account.external_account_id,
+                "generation": account.connector_generation,
+                "sequence": sequence,
+                "execution_epoch": execution.account(account.id).execution_epoch,
+                "command_id": None,
+                "idempotency_key": "msg:" + message_id,
+                "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "payload": payload,
+            }))
+
         async def deliver() -> None:
             while True:
                 envelope = await connector_delivery.next_for_session(account.id, hello["session_id"])
                 await connector_delivery.mark_sent(account.id, envelope.command_id, hello["session_id"])
-                await websocket.send_json(envelope.as_message())
+                await outbound.put((envelope.sequence, envelope.as_message()))
 
+        writer = asyncio.create_task(send_ordered())
         sender = asyncio.create_task(deliver())
+        recovery = [
+            record for record in execution.recovery_records(account.id)
+            if record["status"] in {"PENDING", "ESCALATED"}
+        ]
+        recovery_times = [
+            datetime.fromisoformat(record["first_seen_at"].replace("Z", "+00:00"))
+            for record in recovery
+            if isinstance(record.get("first_seen_at"), str)
+        ]
+        from_server_time = (
+            min(recovery_times).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if recovery_times else None
+        )
+        await queue_control(
+            "reconciliation.required",
+            {"recovery": recovery, "from_server_time": from_server_time},
+        )
         try:
             while True:
                 received = asyncio.create_task(websocket.receive_json())
-                done, _ = await asyncio.wait({received, sender}, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait({received, sender, writer}, return_when=asyncio.FIRST_COMPLETED)
                 if sender in done:
                     sender.result()
+                if writer in done:
+                    writer.result()
                 message = received.result()
-                if message.get("account_id") != account.id or message.get("generation", message.get("connector_generation")) != account.connector_generation:
-                    await websocket.send_json({"type": "error", "code": "STALE_GENERATION" if message.get("account_id") == account.id else "WRONG_ACCOUNT"})
+                if not isinstance(message, dict):
+                    await queue_control("error", {"code": "MALFORMED_FRAME"})
                     continue
+                if message.get("type") != "command.result":
+                    try:
+                        await connector_delivery.accept_inbound(
+                            account.id, hello["session_id"], message,
+                        )
+                    except DeliveryError as error:
+                        await queue_control("error", {"code": error.code})
+                        continue
                 if message.get("type") == "heartbeat":
-                    accounts.heartbeat(account.id, account.connector_generation, message.get("session_id", ""))
+                    accounts.heartbeat(account.id, account.connector_generation, hello["session_id"])
                     execution.observe_connector_health(account.id, healthy=True)
-                    await websocket.send_json({"type": "heartbeat_ack", "account_id": account.id, "generation": account.connector_generation})
+                    if message.get("schema_version") == 1:
+                        await queue_control("heartbeat_ack", {})
+                    else:
+                        await websocket.send_json({
+                            "type": "heartbeat_ack",
+                            "account_id": account.id,
+                            "generation": account.connector_generation,
+                        })
                 elif message.get("type") == "reconciliation_observation":
                     observation = message.get("observation")
+                    if observation is None and isinstance(message.get("payload"), dict):
+                        observation = message["payload"].get("observation", message["payload"])
                     if not isinstance(observation, dict):
-                        await websocket.send_json({"type": "error", "code": "INVALID_RECONCILIATION_OBSERVATION"})
+                        await queue_control("error", {"code": "INVALID_RECONCILIATION_OBSERVATION"})
                         continue
                     try:
                         result = execution.reconcile_observation(account.id, observation)
                     except ExecutionError as error:
-                        await websocket.send_json({"type": "error", "code": error.code})
+                        await queue_control("error", {"code": error.code})
                         continue
                     _audit(account.id, "execution.reconciliation.observed", "connector broker observation", {
                         "status": result.status, "applied_fill_ids": result.applied_fill_ids,
                         "duplicate_fill_ids": result.duplicate_fill_ids,
                         "recovery": execution.recovery_records(account.id),
                     })
-                    await websocket.send_json({"type": "reconciliation_observed", "account_id": account.id,
-                                               "status": result.status, "recovery": execution.recovery_records(account.id)})
-                elif message.get("type") in {"command.result", "command_result"}:
+                    if _reconciliation_gate_complete(
+                        observation, recovery, from_server_time,
+                    ):
+                        await connector_delivery.mark_reconciled(account.id, hello["session_id"])
+                    await queue_control("reconciliation_observed", {
+                        "status": result.status,
+                        "recovery": execution.recovery_records(account.id),
+                    })
+                elif message.get("type") == "command.result":
                     try:
-                        result = await connector_delivery.record_result(message)
+                        result = await connector_delivery.record_result(
+                            message,
+                            authenticated_account_id=account.id,
+                            session_id=hello["session_id"],
+                        )
                     except DeliveryError as error:
-                        await websocket.send_json({"type": "error", "code": error.code})
+                        await queue_control("error", {"code": error.code})
                         continue
-                    await websocket.send_json({"type": "command_result_ack", "account_id": account.id,
-                                               "command_id": message["command_id"], "result": result})
+                    await queue_control("command_result_ack", {
+                        "command_id": message["command_id"],
+                        "result": result,
+                    })
+                elif message.get("type") in {"account_snapshot", "market_snapshot", "candle_batch"}:
+                    _audit(
+                        account.id,
+                        "connector.snapshot.received",
+                        "connector read-only snapshot",
+                        {"type": message["type"], "payload": message.get("payload", {})},
+                    )
                 else:
-                    await websocket.send_json({"type": "error", "code": "READ_ONLY_FOUNDATION"})
+                    await queue_control("error", {"code": "UNSUPPORTED_COMMAND"})
         finally:
+            with suppress(asyncio.TimeoutError, WebSocketDisconnect):
+                await asyncio.wait_for(outbound.join(), timeout=0.1)
             sender.cancel()
+            writer.cancel()
             with suppress(asyncio.CancelledError):
                 await sender
+            with suppress(asyncio.CancelledError):
+                await writer
             await connector_delivery.close_session(account.id, hello["session_id"])
     except WebSocketDisconnect as error:
         if bound_account is not None and error.code not in {1000, 1001}:

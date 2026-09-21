@@ -226,12 +226,14 @@ Every post-handshake frame has these fields:
 Rules:
 
 - `sequence` is strictly increasing per sender direction and generation. Client and server maintain separate sequences.
+- `dispatch_sequence` is backend journal terminology only; it is serialized as the server sender's canonical `sequence` field. The wire contract never emits `dispatch_sequence` or `connector_generation` aliases.
 - `message_id` is unique within the account/generation and is retained for replay detection.
 - `account_id`, the three identity fields, and `generation` must match the authenticated session.
 - `execution_epoch` is the backend epoch observed by the connector. Exposure-increasing commands must match the current backend epoch immediately before invocation.
 - `command_id` is non-null for command requests and command results. It is null for telemetry/control frames.
 - `idempotency_key` is required on every frame. For telemetry it is `msg:<message_id>`; for a command it is the backend-provided command key and must be echoed unchanged in all results.
 - A connector must reject out-of-order, replayed, wrong-account, wrong-generation, and wrong-epoch side-effect frames. The backend must enforce the same checks rather than relying on the connector alone.
+- Command request and `command.result` frames add required `request_hash`; results echo the original `idempotency_key` and `request_hash` unchanged. Telemetry/control frames do not require `request_hash`.
 
 ### 4.4 Heartbeat
 
@@ -414,6 +416,7 @@ The connector returns one `command.result` for every accepted command frame, inc
   "execution_epoch": 4,
   "command_id": "command-uuid",
   "idempotency_key": "manual-order-001",
+  "request_hash": "canonical-request-hash",
   "sent_at": "2026-09-18T00:00:01Z",
   "payload": {
     "state": "ACCEPTED",
