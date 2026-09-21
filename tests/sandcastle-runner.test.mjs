@@ -17,6 +17,13 @@ test("Sandcastle selects a bounded batch of ready agent tickets", () => {
   assert.match(main, /plan\.output\.issues/);
 });
 
+test("Sandcastle isolates planner dependencies from the Windows host", () => {
+  assert.match(
+    main,
+    /name: "planner",[\s\S]*?branchStrategy: \{ type: "merge-to-head" \},[\s\S]*?agent: plannerAgent/,
+  );
+});
+
 test("Sandcastle can constrain a delivery phase without weakening blockers", () => {
   assert.match(main, /process\.env\.SANDCASTLE_ISSUES/);
   assert.match(main, /phaseReadyIssues/);

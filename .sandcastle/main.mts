@@ -224,6 +224,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     hooks: hooks,
     sandbox: sandboxProvider,
     name: "planner",
+    // The host runs the TypeScript launcher from Windows node_modules. Keep the
+    // Linux npm ci hook in a clean temporary worktree so it never replaces or
+    // tries to delete those locked host binaries through Docker Desktop.
+    branchStrategy: { type: "merge-to-head" },
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
