@@ -193,7 +193,7 @@ class ContractIssue63Tests(unittest.TestCase):
             def history_orders(self, from_server_time=None):
                 self.history_windows.append(("orders", from_server_time))
                 return ReadSnapshot("history_orders", {
-                    "items": [{"comment": "command-1", "status": "EXECUTED"}],
+                    "items": [{"correlation_id": "command-1", "status": "EXECUTED"}],
                 })
 
             def history_deals(self, from_server_time=None):
@@ -226,6 +226,12 @@ class ContractIssue63Tests(unittest.TestCase):
         ])
         self.assertEqual(observation["recovery_matches"][0]["status"], "MATCHED")
         self.assertEqual(observation["commands"][0]["command_id"], "command-1")
+        evidence, row = ConnectorProtocol._recovery_match(
+            {"kind": "COMMAND", "subject_id": "command-1"},
+            [("history_orders", {"magic": "command-1", "status": "EXECUTED"})],
+        )
+        self.assertEqual(evidence["status"], "UNRESOLVED")
+        self.assertIsNone(row)
 
         protocol = ConnectorProtocol(self.config(), Fake())
         with self.assertRaises(ProtocolError) as error:

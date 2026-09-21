@@ -221,7 +221,7 @@ class ConnectorProtocol:
         for source, row in rows:
             if not isinstance(row, dict):
                 continue
-            for field in ("command_id", "correlation_id", "position_id", "order_id", "comment", "magic"):
+            for field in ("command_id", "correlation_id", "position_id", "order_id"):
                 if str(row.get(field, "")) == subject_id:
                     matches.append((source, row))
                     break
@@ -237,7 +237,7 @@ class ConnectorProtocol:
             "status": "MATCHED",
             "source": source,
             "matched_by": next(
-                field for field in ("command_id", "correlation_id", "position_id", "order_id", "comment", "magic")
+                field for field in ("command_id", "correlation_id", "position_id", "order_id")
                 if str(row.get(field, "")) == subject_id
             ),
         })
