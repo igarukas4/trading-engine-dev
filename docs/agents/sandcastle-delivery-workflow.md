@@ -109,6 +109,11 @@ docker info
 curl.exe --connect-timeout 5 -sS -o NUL -w "HTTP %{http_code}\n" http://127.0.0.1:18765/v1/models
 ```
 
+On this Windows host, the scheduled proxy process sets
+`CCP_CODEX_AUTH_FILE=C:\Users\Portal\.codex\auth.json`. The proxy reads and
+refreshes that native Codex file. `claude-code-proxy codex auth status` must
+report that path. Sandcastle must not mount or copy the file into its image.
+
 Create `.sandcastle/.env` from `.sandcastle/.env.example`; it must contain a
 non-empty `GH_TOKEN` and the proxy settings. Docker Desktop reaches a host
 loopback service through `host.docker.internal`, not `localhost`:
