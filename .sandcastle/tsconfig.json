@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["main.mts", "issue-selection.mts"]
+  "include": ["main.mts", "issue-selection.mts", "file-backed-stdin.mts"]
 }

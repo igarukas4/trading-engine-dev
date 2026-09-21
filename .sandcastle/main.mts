@@ -24,25 +24,27 @@
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import { promisify } from "node:util";
+import { existsSync, readFileSync } from "node:fs";
+import { parseEnv, promisify } from "node:util";
 import type { SandboxRunResult } from "@ai-hero/sandcastle";
 import { z } from "zod";
 import {
   selectDispatchableIssues,
   type ReadyIssue,
 } from "./issue-selection.mts";
+import { withFileBackedStdin } from "./file-backed-stdin.mts";
 
-if (existsSync(".sandcastle/.env")) {
-  process.loadEnvFile(".sandcastle/.env");
-}
+const sandcastleFileEnv = existsSync(".sandcastle/.env")
+  ? parseEnv(readFileSync(".sandcastle/.env", "utf8"))
+  : {};
 
-const ghToken = process.env.GH_TOKEN;
+const ghToken = sandcastleFileEnv.GH_TOKEN ?? process.env.GH_TOKEN;
 if (!ghToken) {
   throw new Error("GH_TOKEN must be set in .sandcastle/.env or the environment.");
 }
 
-const anthropicBaseUrl = process.env.ANTHROPIC_BASE_URL;
+const anthropicBaseUrl =
+  sandcastleFileEnv.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL;
 if (!anthropicBaseUrl) {
   throw new Error(
     "ANTHROPIC_BASE_URL must be set to the local Claude Code proxy URL.",
@@ -52,10 +54,18 @@ if (!anthropicBaseUrl) {
 const sandboxEnv = {
   GH_TOKEN: ghToken,
   ANTHROPIC_BASE_URL: anthropicBaseUrl,
-  ANTHROPIC_AUTH_TOKEN: process.env.ANTHROPIC_AUTH_TOKEN || "unused",
-  ANTHROPIC_MODEL: process.env.ANTHROPIC_MODEL || "gpt-5.6-luna[1m]",
+  ANTHROPIC_AUTH_TOKEN:
+    sandcastleFileEnv.ANTHROPIC_AUTH_TOKEN ||
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    "unused",
+  ANTHROPIC_MODEL:
+    sandcastleFileEnv.ANTHROPIC_MODEL ||
+    process.env.ANTHROPIC_MODEL ||
+    "gpt-5.6-luna[1m]",
   ANTHROPIC_SMALL_FAST_MODEL:
-    process.env.ANTHROPIC_SMALL_FAST_MODEL || "gpt-5.6-luna[1m]",
+    sandcastleFileEnv.ANTHROPIC_SMALL_FAST_MODEL ||
+    process.env.ANTHROPIC_SMALL_FAST_MODEL ||
+    "gpt-5.6-luna[1m]",
   ANTHROPIC_DEFAULT_HAIKU_MODEL: "gpt-5.6-luna",
   CLAUDE_CODE_AUTO_COMPACT_WINDOW: "272000",
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
@@ -199,10 +209,12 @@ const hooks = {
   },
 };
 
-const sandboxProvider = docker({
-  imageName: "sandcastle:trading-engine-v0",
-  env: sandboxEnv,
-});
+const sandboxProvider = withFileBackedStdin(
+  docker({
+    imageName: "sandcastle:trading-engine-v0",
+    env: sandboxEnv,
+  }),
+);
 
 // ---------------------------------------------------------------------------
 // Main loop

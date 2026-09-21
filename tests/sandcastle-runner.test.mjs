@@ -24,6 +24,58 @@ test("Sandcastle isolates planner dependencies from the Windows host", () => {
   );
 });
 
+test("Sandcastle sends agent prompts through a temporary container file", () => {
+  const program = `
+    import assert from "node:assert/strict";
+    import { readFile, stat } from "node:fs/promises";
+    import { withFileBackedStdin } from "./.sandcastle/file-backed-stdin.mts";
+
+    let copiedHostPath;
+    let copiedSandboxPath;
+    let copiedPrompt;
+    const calls = [];
+    const baseProvider = {
+      tag: "bind-mount",
+      name: "fake",
+      env: {},
+      sandboxHomedir: "/home/agent",
+      async create() {
+        return {
+          worktreePath: "/home/agent/workspace",
+          async exec(command, options) {
+            calls.push({ command, options });
+            return { stdout: "", stderr: "", exitCode: 0 };
+          },
+          async copyFileIn(hostPath, sandboxPath) {
+            copiedHostPath = hostPath;
+            copiedSandboxPath = sandboxPath;
+            copiedPrompt = await readFile(hostPath, "utf8");
+          },
+          async copyFileOut() {},
+          async close() {},
+        };
+      },
+    };
+
+    const provider = withFileBackedStdin(baseProvider);
+    const handle = await provider.create({
+      worktreePath: "C:/repo",
+      hostRepoPath: "C:/repo",
+      mounts: [],
+      env: {},
+    });
+    await handle.exec("agent --print", { stdin: "test prompt", cwd: "/tmp" });
+
+    assert.equal(copiedPrompt, "test prompt");
+    assert.match(copiedSandboxPath, /^\\/home\\/agent\\/\\.sandcastle-stdin-[0-9a-f-]+$/);
+    assert.equal(calls[0].command, "agent --print < '" + copiedSandboxPath + "'");
+    assert.deepEqual(calls[0].options, { cwd: "/tmp" });
+    assert.equal(calls[1].command, "rm -f -- '" + copiedSandboxPath + "'");
+    await assert.rejects(stat(copiedHostPath), { code: "ENOENT" });
+  `;
+  execFileSync("node", ["--import", "tsx", "--input-type=module", "--eval", program]);
+});
+
 test("Sandcastle can constrain a delivery phase without weakening blockers", () => {
   assert.match(main, /process\.env\.SANDCASTLE_ISSUES/);
   assert.match(main, /phaseReadyIssues/);
@@ -71,10 +123,14 @@ test("open blockers outside the ready batch prevent dispatch", () => {
 });
 
 test("Sandcastle passes GitHub and proxy auth to sandbox runs", () => {
-  assert.match(main, /process\.loadEnvFile\("\.sandcastle\/.env"\)/);
+  assert.match(main, /parseEnv\(readFileSync\("\.sandcastle\/.env", "utf8"\)\)/);
+  assert.match(main, /sandcastleFileEnv\.ANTHROPIC_BASE_URL \?\? process\.env\.ANTHROPIC_BASE_URL/);
   assert.match(main, /GH_TOKEN: ghToken/);
   assert.match(main, /ANTHROPIC_BASE_URL: anthropicBaseUrl/);
-  assert.match(main, /ANTHROPIC_AUTH_TOKEN: process\.env\.ANTHROPIC_AUTH_TOKEN \|\| "unused"/);
+  assert.match(
+    main,
+    /ANTHROPIC_AUTH_TOKEN:[\s\S]*?sandcastleFileEnv\.ANTHROPIC_AUTH_TOKEN \|\|[\s\S]*?process\.env\.ANTHROPIC_AUTH_TOKEN \|\|[\s\S]*?"unused"/,
+  );
   assert.match(envExample, /host\.docker\.internal/);
   assert.doesNotMatch(main, /CODEX_HOME|codex-source|\.codex/);
 });
