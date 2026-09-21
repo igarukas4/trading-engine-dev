@@ -13,7 +13,7 @@ Treat this document as the operational authority before invoking it.
   `npm run sandcastle:watch`.
 - Before asking for approval, show the default profiles from this runbook:
   planner, implementer, and reviewer use `gpt-5.6-luna` with `medium` effort;
-  merger uses `gpt-5.6-sol` with `medium` effort. Ask the user to confirm those
+  merger uses `gpt-5.6-luna` with `high` effort. Ask the user to confirm those
   profiles before starting the runner.
 - Work only on open issues labelled `ready-for-agent`. The label means the
   ticket is specified well enough for autonomous work; `## Blocked by` still
@@ -50,7 +50,7 @@ changed.
 | Planner | `haiku` → `gpt-5.6-luna`, `medium` | Read backlog context and emit a plan; issue selection remains deterministic. |
 | Implementer | `haiku` → `gpt-5.6-luna`, `medium` | Complete one ticket, test it, and commit on its ticket branch. |
 | Reviewer | `haiku` → `gpt-5.6-luna`, `medium` | Review only that branch, make justified corrections, and verify. |
-| Merger | `sonnet` → `gpt-5.6-sol`, `medium` | Merge reviewed committed work, verify, and close the issue. |
+| Merger | `haiku` → `gpt-5.6-luna`, `high` | Merge reviewed committed work, verify, and close the issue. |
 | Human-facing coordinator | Active-session choice | Obtains approval, interprets evidence, and handles human gates. |
 
 The four role profiles in `.sandcastle/main.mts` are the canonical

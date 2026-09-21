@@ -87,7 +87,7 @@ test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
   );
   assert.match(
     main,
-    /const mergerAgent = sandcastle\.claudeCode\("sonnet", \{\s+effort: "medium",/,
+    /const mergerAgent = sandcastle\.claudeCode\("haiku", \{\s+effort: "high",/,
   );
   assert.match(main, /agent: plannerAgent/);
   assert.match(main, /agent: implementerAgent/);
@@ -97,7 +97,6 @@ test("Sandcastle uses the canonical role-specific Claude Code profiles", () => {
 
 test("Sandcastle uses configurable gateway model aliases", () => {
   assert.match(main, /sandcastle\.claudeCode\("haiku"/);
-  assert.match(main, /sandcastle\.claudeCode\("sonnet"/);
   assert.match(settings, /CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY/);
   assert.match(settings, /ANTHROPIC_DEFAULT_HAIKU_MODEL.*gpt-5\.6-luna/);
   assert.match(settings, /ANTHROPIC_DEFAULT_SONNET_MODEL.*gpt-5\.6-sol/);

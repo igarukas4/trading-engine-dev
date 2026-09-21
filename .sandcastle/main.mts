@@ -182,8 +182,8 @@ const reviewerAgent = sandcastle.claudeCode("haiku", {
   captureSessions: false,
 });
 
-const mergerAgent = sandcastle.claudeCode("sonnet", {
-  effort: "medium",
+const mergerAgent = sandcastle.claudeCode("haiku", {
+  effort: "high",
   captureSessions: false,
 });
 
