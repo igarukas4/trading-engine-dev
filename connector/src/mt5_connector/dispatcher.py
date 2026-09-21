@@ -23,19 +23,17 @@ class Dispatcher:
         self._lock = threading.RLock()
         # Recovery is part of construction: no caller can accidentally dispatch
         # while an old ambiguity boundary is still unresolved.
-        self.journal.recover()
-        self.blocked = bool(journal.unknown())
-        row = journal.connection.execute(
-            "SELECT MAX(dispatch_sequence) FROM connector_commands WHERE account_id=?",
-            (self.account_id,),
-        ).fetchone()
-        self._last_sequence = int(row[0] or 0)
+        self.recover()
+        self._last_sequence = self.journal.last_dispatch_sequence()
+
+    @property
+    def blocked(self) -> bool:
+        """Whether unresolved post-invocation work fences this account."""
+        return self.journal.has_unknown()
 
     def recover(self) -> list[Any]:
         with self._lock:
-            rows = self.journal.recover()
-            self.blocked = bool(self.journal.unknown())
-            return rows
+            return self.journal.recover()
 
     def dispatch(self, command: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch one command, returning its durable result.
@@ -53,12 +51,8 @@ class Dispatcher:
             if not command_id or not key or not isinstance(payload, Mapping):
                 return self._local_result(command_id, key, "MALFORMED_COMMAND")
             try:
-                generation = command.get("generation", 0)
-                epoch = command.get("execution_epoch", 0)
-                if isinstance(generation, bool) or not isinstance(generation, int):
-                    raise ValueError
-                if isinstance(epoch, bool) or not isinstance(epoch, int):
-                    raise ValueError
+                generation = self._int_field(command, "generation", 0)
+                epoch = self._int_field(command, "execution_epoch", 0)
                 sequence = command.get("dispatch_sequence", command.get("sequence", 0))
                 if isinstance(sequence, bool) or not isinstance(sequence, int):
                     raise ValueError
@@ -91,12 +85,10 @@ class Dispatcher:
             if record.state in {"ACCEPTED", "REJECTED"}:
                 return record.result or {"state": record.state, "code": record.error_code}
             if record.state == "UNKNOWN":
-                self.blocked = True
                 return {"state": "UNKNOWN", "code": record.error_code or "RECONCILIATION_REQUIRED"}
             if typ not in SIDE_EFFECTING_TYPES:
                 return self._finish(command_id, "REJECTED", "UNSUPPORTED_DISPATCH_TYPE")
-            if self.blocked or self.journal.unknown():
-                self.blocked = True
+            if self.blocked:
                 return self._finish(command_id, "REJECTED", "ACCOUNT_FENCED_UNKNOWN")
             error = self._validate(typ, payload)
             if error:
@@ -119,7 +111,6 @@ class Dispatcher:
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS")
             state = self._result_state(result)
             if state == "UNKNOWN":
-                self.blocked = True
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS", result)
             return self._finish(command_id, state, None if state == "ACCEPTED" else "BROKER_REJECTED", result)
 
@@ -137,7 +128,6 @@ class Dispatcher:
                 match_status=match_status, state=state,
                 result=result, error_code=error_code,
             )
-            self.blocked = bool(self.journal.unknown())
             return row.result or {"state": row.state, "code": row.error_code}
 
     def _check(self, typ, payload):
@@ -154,22 +144,40 @@ class Dispatcher:
         raise DispatchError("adapter does not implement side effect")
 
     @staticmethod
-    def _check_passed(result) -> bool:
+    def _int_field(command: Mapping[str, Any], name: str, default: int) -> int:
+        value = command.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"invalid {name}")
+        return value
+
+    @staticmethod
+    def _result_fields(result) -> Mapping[str, Any]:
+        if isinstance(result, Mapping):
+            return result
+        return {
+            "state": getattr(result, "state", None),
+            "retcode": getattr(result, "retcode", None),
+        }
+
+    @staticmethod
+    def _result_mapping(result) -> Mapping[str, Any]:
+        return result if isinstance(result, Mapping) else {}
+
+    @classmethod
+    def _check_passed(cls, result) -> bool:
         if result is True or result is None:
             return result is True
+        fields = cls._result_fields(result)
         if isinstance(result, Mapping):
             if "retcode" in result:
                 return result.get("retcode") in (0, "0")
             return result.get("ok") is True
-        return getattr(result, "retcode", None) in (0, "0")
+        return fields.get("retcode") in (0, "0")
 
-    @staticmethod
-    def _result_state(result) -> str:
-        if not isinstance(result, Mapping):
-            state = getattr(result, "state", None)
-            retcode = getattr(result, "retcode", None)
-        else:
-            state, retcode = result.get("state"), result.get("retcode")
+    @classmethod
+    def _result_state(cls, result) -> str:
+        fields = cls._result_fields(result)
+        state, retcode = fields.get("state"), fields.get("retcode")
         if str(state).upper() in {"UNKNOWN", "AMBIGUOUS"}:
             return "UNKNOWN"
         if str(state).upper() in {"ACCEPTED", "REJECTED"}:
@@ -183,26 +191,31 @@ class Dispatcher:
         return "UNKNOWN"
 
     def _finish(self, command_id, state, code, result=None):
-        result_payload = dict(result) if isinstance(result, Mapping) else ({"value": result} if result is not None else {})
+        result_mapping = self._result_mapping(result)
+        result_payload = dict(result_mapping) if isinstance(result, Mapping) else ({"value": result} if result is not None else {})
         result_payload.update({"state": state, "code": code})
-        self.journal.transition(command_id, state=state, phase="RESOLVED" if state != "UNKNOWN" else "RECONCILING",
-                                result=result_payload, error_code=code,
-                                retcode=result.get("retcode") if isinstance(result, Mapping) else None,
-                                external_order_id=str(result["external_order_id"]) if isinstance(result, Mapping) and result.get("external_order_id") is not None else None,
-                                external_deal_id=str(result["external_deal_id"]) if isinstance(result, Mapping) and result.get("external_deal_id") is not None else None,
-                                external_position_ids=[str(x) for x in result.get("position_tickets", [])] if isinstance(result, Mapping) else None)
-        if state == "UNKNOWN":
-            self.blocked = True
+        self.journal.transition(
+            command_id, state=state, phase="RESOLVED" if state != "UNKNOWN" else "RECONCILING",
+            result=result_payload, error_code=code,
+            retcode=result_mapping.get("retcode"),
+            external_order_id=(str(result_mapping["external_order_id"])
+                               if result_mapping.get("external_order_id") is not None else None),
+            external_deal_id=(str(result_mapping["external_deal_id"])
+                              if result_mapping.get("external_deal_id") is not None else None),
+            external_position_ids=([str(x) for x in result_mapping.get("position_tickets", [])]
+                                   if isinstance(result, Mapping) else None),
+        )
         return result_payload
 
     def _local_result(self, command_id, key, code):
         return {"state": "REJECTED", "code": code, "command_id": command_id, "idempotency_key": key}
 
     def _validate(self, typ, payload):
-        if typ == "order.submit_market" and (not payload.get("sl") or not payload.get("tp")):
-            return "NATIVE_PROTECTION_REQUIRED"
-        if typ == "position.close" and (not payload.get("position_ticket") or not payload.get("volume")):
-            return "POSITION_DETAILS_REQUIRED"
-        if typ == "position.modify_protection" and not payload.get("position_ticket"):
-            return "POSITION_DETAILS_REQUIRED"
+        required = {
+            "order.submit_market": (("sl", "tp"), "NATIVE_PROTECTION_REQUIRED"),
+            "position.close": (("position_ticket", "volume"), "POSITION_DETAILS_REQUIRED"),
+            "position.modify_protection": (("position_ticket",), "POSITION_DETAILS_REQUIRED"),
+        }.get(typ)
+        if required and any(not payload.get(name) for name in required[0]):
+            return required[1]
         return None

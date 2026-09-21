@@ -67,7 +67,9 @@ class JournalDispatcherTests(unittest.TestCase):
                          request_hash="h2", execution_epoch=1, command_type="order.submit_market", request={})
         journal.transition("after", state="INVOKING", phase="DISPATCHING", mt5_invoked=True)
         journal.close()
-        recovered = SQLiteJournal(self.path, "a1").recover()
+        restarted = SQLiteJournal(self.path, "a1")
+        self.addCleanup(restarted.close)
+        recovered = restarted.recover()
         self.assertEqual({row.command_id: row.state for row in recovered}, {"before": "REJECTED", "after": "UNKNOWN"})
 
     def test_reconciliation_persists_evidence_before_resolution(self):

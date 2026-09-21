@@ -13,6 +13,10 @@ from typing import Any, Mapping
 STATES = frozenset({"RECEIVED", "INVOKING", "ACCEPTED", "REJECTED", "UNKNOWN"})
 
 
+def _compact_json(value: Any, *, ensure_ascii: bool = True) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=ensure_ascii)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -20,7 +24,7 @@ def utc_now() -> str:
 def canonical_request_hash(command_type: str, payload: Mapping[str, Any]) -> str:
     """Hash the command type and JSON payload deterministically."""
     document = {"command_type": command_type, "payload": payload}
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    encoded = _compact_json(document, ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -106,6 +110,8 @@ class SQLiteJournal:
             account_id TEXT PRIMARY KEY, generation INTEGER NOT NULL, next_client_sequence INTEGER NOT NULL,
             last_server_sequence INTEGER NOT NULL, last_reconciliation_watermark TEXT, updated_at TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS connector_commands_account_sequence
+            ON connector_commands(account_id, dispatch_sequence);
         """)
         self.connection.commit()
 
@@ -117,22 +123,33 @@ class SQLiteJournal:
     def _row(self, row) -> JournalCommand | None:
         return JournalCommand(**dict(row)) if row else None
 
+    def _lookup(self, column: str, value: str) -> JournalCommand | None:
+        if column not in {"command_id", "idempotency_key"}:
+            raise ValueError("unsupported journal lookup")
+        return self._row(self.connection.execute(
+            f"SELECT * FROM connector_commands WHERE account_id=? AND {column}=?",
+            (self.account_id, value),
+        ).fetchone())
+
     def get(self, command_id: str) -> JournalCommand | None:
         with self._lock:
-            return self._row(self.connection.execute(
-                "SELECT * FROM connector_commands WHERE account_id=? AND command_id=?", (self.account_id, command_id)
-            ).fetchone())
+            return self._lookup("command_id", command_id)
 
     def get_by_idempotency(self, key: str) -> JournalCommand | None:
         with self._lock:
-            return self._row(self.connection.execute(
-                "SELECT * FROM connector_commands WHERE account_id=? AND idempotency_key=?", (self.account_id, key)
-            ).fetchone())
+            return self._lookup("idempotency_key", key)
+
+    def last_dispatch_sequence(self) -> int:
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT MAX(dispatch_sequence) FROM connector_commands WHERE account_id=?",
+                (self.account_id,),
+            ).fetchone()
+            return int(row[0] or 0)
 
     def receive(self, *, command_id: str, generation: int, dispatch_sequence: int,
                 idempotency_key: str, request_hash: str, execution_epoch: int,
                 command_type: str, request: Mapping[str, Any]) -> JournalCommand:
-        request_json = json.dumps(dict(request), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         with self._lock:
             existing = self.get(command_id)
             by_key = self.get_by_idempotency(idempotency_key)
@@ -141,6 +158,7 @@ class SQLiteJournal:
                 if prior.request_hash != request_hash or prior.command_id != command_id or prior.idempotency_key != idempotency_key:
                     raise IdempotencyConflict("IDEMPOTENCY_KEY_REUSED")
                 return prior
+            request_json = _compact_json(dict(request), ensure_ascii=False)
             now = self.clock()
             try:
                 self.connection.execute("""INSERT INTO connector_commands
@@ -176,35 +194,42 @@ class SQLiteJournal:
             values = {
                 "state": next_state, "phase": phase or current.phase,
                 "mt5_invoked": int(current.mt5_invoked if mt5_invoked is None else mt5_invoked),
-                "result_json": current.result_json if result is None else json.dumps(dict(result), sort_keys=True, separators=(",", ":")),
+                "result_json": current.result_json if result is None else _compact_json(dict(result)),
                 "error_code": error_code if error_code is not None else current.error_code,
                 "retcode": retcode if retcode is not None else current.retcode,
                 "external_order_id": external_order_id if external_order_id is not None else current.external_order_id,
                 "external_deal_id": external_deal_id if external_deal_id is not None else current.external_deal_id,
-                "external_position_ids_json": json.dumps(external_position_ids if external_position_ids is not None else json.loads(current.external_position_ids_json)),
+                "external_position_ids_json": current.external_position_ids_json if external_position_ids is None else json.dumps(external_position_ids),
                 "updated_at": now,
                 "resolved_at": now if next_state in {"ACCEPTED", "REJECTED"} else current.resolved_at,
+                "account_id": self.account_id,
+                "command_id": command_id,
             }
-            self.connection.execute("""UPDATE connector_commands SET state=?,phase=?,mt5_invoked=?,result_json=?,
-                error_code=?,retcode=?,external_order_id=?,external_deal_id=?,external_position_ids_json=?,updated_at=?,resolved_at=?
-                WHERE account_id=? AND command_id=?""", tuple(values[k] for k in (
-                    "state","phase","mt5_invoked","result_json","error_code","retcode","external_order_id",
-                    "external_deal_id","external_position_ids_json","updated_at","resolved_at")) + (self.account_id, command_id))
+            self.connection.execute("""UPDATE connector_commands SET state=:state,phase=:phase,mt5_invoked=:mt5_invoked,result_json=:result_json,
+                error_code=:error_code,retcode=:retcode,external_order_id=:external_order_id,external_deal_id=:external_deal_id,
+                external_position_ids_json=:external_position_ids_json,updated_at=:updated_at,resolved_at=:resolved_at
+                WHERE account_id=:account_id AND command_id=:command_id""", values)
             self.connection.commit()
             return self.get(command_id)  # type: ignore[return-value]
 
     def recover(self) -> list[JournalCommand]:
         """Resolve in-flight pre-side-effect work and fence post-side-effect work."""
         with self._lock:
-            rows = self.connection.execute("SELECT command_id,mt5_invoked,state,phase FROM connector_commands WHERE account_id=? AND state IN ('RECEIVED','INVOKING')", (self.account_id,)).fetchall()
+            rows = self.connection.execute(
+                "SELECT command_id,mt5_invoked FROM connector_commands "
+                "WHERE account_id=? AND state IN ('RECEIVED','INVOKING')",
+                (self.account_id,),
+            ).fetchall()
             recovered = []
             for row in rows:
                 if row["mt5_invoked"]:
-                    self.transition(row["command_id"], state="UNKNOWN", phase="RECONCILING")
+                    recovered.append(self.transition(row["command_id"], state="UNKNOWN", phase="RECONCILING"))
                 else:
-                    self.transition(row["command_id"], state="REJECTED", phase="RECOVERED", error_code="NOT_INVOKED_AFTER_RESTART")
-                recovered.append(self.get(row["command_id"]))
-            return [r for r in recovered if r is not None]
+                    recovered.append(self.transition(
+                        row["command_id"], state="REJECTED", phase="RECOVERED",
+                        error_code="NOT_INVOKED_AFTER_RESTART",
+                    ))
+            return recovered
 
     def record_observation(self, *, snapshot: Mapping[str, Any], source: str,
                            command_id: str | None = None, observed_at: str | None = None,
@@ -213,8 +238,15 @@ class SQLiteJournal:
             self.connection.execute("""INSERT OR IGNORE INTO connector_observations
                 (account_id,command_id,observed_at,source,snapshot_json,match_status) VALUES (?,?,?,?,?,?)""",
                 (self.account_id, command_id, observed_at or self.clock(), source,
-                 json.dumps(dict(snapshot), sort_keys=True, separators=(",", ":")), match_status))
+                 _compact_json(dict(snapshot)), match_status))
             self.connection.commit()
+
+    def has_unknown(self) -> bool:
+        with self._lock:
+            return self.connection.execute(
+                "SELECT 1 FROM connector_commands WHERE account_id=? AND state='UNKNOWN' LIMIT 1",
+                (self.account_id,),
+            ).fetchone() is not None
 
     def unknown(self) -> list[JournalCommand]:
         with self._lock:
@@ -239,20 +271,17 @@ class SQLiteJournal:
                                    result=result, error_code=error_code)
 
     def compact(self, before: str, *, acknowledged_unknown: set[str] | None = None) -> int:
-        """Delete only old resolved rows and observations, never unresolved proof."""
-        acknowledged_unknown = acknowledged_unknown or set()
+        """Delete old resolved rows and observations, never unresolved proof.
+
+        ``acknowledged_unknown`` is retained for API compatibility; UNKNOWN rows
+        are never eligible for this delete.
+        """
         with self._lock:
-            ids = {row[0] for row in self.connection.execute(
-                "SELECT command_id FROM connector_commands WHERE account_id=? AND state='UNKNOWN'",
-                (self.account_id,)).fetchall()}
-            protected = ids - acknowledged_unknown
-            placeholders = ",".join("?" for _ in protected)
-            args: list[Any] = [self.account_id, before]
-            sql = "DELETE FROM connector_commands WHERE account_id=? AND state IN ('ACCEPTED','REJECTED') AND resolved_at < ?"
-            if protected:
-                sql += f" AND command_id NOT IN ({placeholders})"
-                args.extend(sorted(protected))
-            cur = self.connection.execute(sql, args)
+            cur = self.connection.execute(
+                "DELETE FROM connector_commands WHERE account_id=? "
+                "AND state IN ('ACCEPTED','REJECTED') AND resolved_at < ?",
+                (self.account_id, before),
+            )
             self.connection.execute(
                 "DELETE FROM connector_observations WHERE account_id=? AND observed_at < ? AND "
                 "(command_id IS NULL OR command_id NOT IN (SELECT command_id FROM connector_commands WHERE account_id=? AND state='UNKNOWN'))",
