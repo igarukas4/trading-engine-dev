@@ -492,14 +492,51 @@ asyncio.run(connector_stream(socket))
 assert socket.sent and socket.sent[0]["type"] == "snapshot", socket.sent
 assert socket.sent[1]["type"] == "reconciliation.required" and socket.sent[1]["account_id"] == account.id
 assert socket.sent[2]["type"] == "reconciliation_observed"
-assert socket.sent[3]["code"] == "WRONG_ACCOUNT"
-assert socket.sent[4]["code"] == "INVALID_RECONCILIATION_OBSERVATION"
+assert socket.sent[3]["type"] == "error" and socket.sent[3]["payload"]["code"] == "WRONG_ACCOUNT"
+assert socket.sent[4]["type"] == "error" and socket.sent[4]["payload"]["code"] == "INVALID_RECONCILIATION_OBSERVATION"
 
 assert execution.orders[created.order.id].status == "SUBMITTED"
 assert execution.account(account.id).exposure_gate == "OPEN"
 assert any(event["type"] == "execution.reconciliation.observed" for event in dashboard_hub.connect({"account_cursors": {account.id: 0}})["events"])
 print("ok")
 `);
+  assert.match(output, /ok/);
+});
+
+test("reconciliation gate rejects sparse or unmatched recovery evidence", () => {
+  const output = run(`
+from backend.app.main import _reconciliation_gate_complete
+
+recovery = [{"subject_id": "command-1", "kind": "COMMAND"}]
+base = {
+    "complete": True,
+    "orders": [], "fills": [], "positions": [],
+    "commands": [{"command_id": "command-1"}],
+    "history_orders": [], "deals": [],
+    "from_server_time": "2026-09-17T23:55:00Z",
+}
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "status": "UNRESOLVED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "kind": "COMMAND", "status": "MATCHED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "status": "MATCHED"}], "from_server_time": None},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+assert not _reconciliation_gate_complete(
+    {**base, "recovery_matches": [{"subject_id": "command-1", "kind": "UNKNOWN", "status": "MATCHED"}]},
+    recovery,
+    "2026-09-17T23:55:00Z",
+)
+print("ok")
+  `);
   assert.match(output, /ok/);
 });
 

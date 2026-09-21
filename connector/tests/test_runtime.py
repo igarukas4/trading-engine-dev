@@ -15,6 +15,8 @@ class Fake:
  def closed_m1(self,s,c): return ReadSnapshot("candles",{"items":[{"open":"1"}],"closed_only":True})
  def open_orders(self): return ReadSnapshot("orders",{"items":[]})
  def open_positions(self): return ReadSnapshot("positions",{"items":[]})
+ def history_orders(self,from_server_time=None): return ReadSnapshot("history_orders",{"items":[]})
+ def history_deals(self,from_server_time=None): return ReadSnapshot("history_deals",{"items":[]})
 class Tests(unittest.TestCase):
  def test_config_and_wss(self):
   cfg=ConnectorConfig.from_dict(RAW); self.assertEqual(cfg.wss_url[:3],"wss"); self.assertEqual(set(ConnectorProtocol(cfg,Fake()).hello("SECRET")),{"type","account_id","provider","broker_server","external_account_id","key_id","secret","generation","session_id"})
@@ -28,7 +30,9 @@ class Tests(unittest.TestCase):
   a=OfficialMT5Adapter(Identity("MT5","Demo","42"),"a1"); a._mt5=Module()
   with self.assertRaises(AdapterError): a.account_snapshot()
  def test_snapshot_heartbeat_generation_and_disabled(self):
-  c=ConnectorProtocol(ConnectorConfig.from_dict(RAW),Fake()); c.accept_snapshot({"type":"snapshot","snapshot":{"account_id":"a1"},"generation":7}); self.assertEqual(c.generation,7); self.assertEqual(c.heartbeat()["type"],"heartbeat"); out=c.handle({"type":"order.submit_market","account_id":"a1","generation":7,"command_id":"x","idempotency_key":"secret-key"}); self.assertEqual(out["payload"],{"state":"REJECTED","code":"EXECUTION_DISABLED"}); self.assertEqual(c.handle({"type":"heartbeat_ack","account_id":"a1","generation":7}),{"type":"heartbeat_ack","account_id":"a1","generation":7})
+  c=ConnectorProtocol(ConnectorConfig.from_dict(RAW),Fake()); c.accept_snapshot({"type":"snapshot","snapshot":{"account_id":"a1"},"generation":7}); self.assertEqual(c.generation,7); self.assertEqual(c.heartbeat()["type"],"heartbeat")
+  with self.assertRaises(ProtocolError): c.handle({"type":"order.submit_market","account_id":"a1","generation":7,"command_id":"x","idempotency_key":"secret-key"})
+  self.assertEqual(c.handle({"type":"heartbeat_ack","account_id":"a1","generation":7}),{"type":"heartbeat_ack","account_id":"a1","generation":7})
   with self.assertRaises(ProtocolError): c.handle({"type":"heartbeat_ack","account_id":"a1","generation":8})
  def test_missing_official_package_is_safe(self):
   a=OfficialMT5Adapter(Identity("MT5","Demo","42"),"a1")
