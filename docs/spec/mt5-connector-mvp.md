@@ -624,7 +624,7 @@ Retcode classification is conservative. When the connector cannot prove that MT5
 
 ## 8. Security and safe defaults
 
-- Store the connector secret using Windows Credential Manager or a mode/ACL-restricted file outside the repository. Do not store it in `.env` committed to Git.
+- Store the connector secret in Windows Credential Manager for the Windows user running the connector. Reject file-based secret references. Do not store the secret in `.env` committed to Git.
 - The secret must never appear in URLs, command lines, crash dumps intentionally emitted by the connector, logs, screenshots, test fixtures, or WSS error payloads.
 - The backend stores only a salted hash and `key_id`; the connector receives the secret only through the authenticated provisioning flow.
 - Bind the session to the complete immutable identity, not only `account_id` or only login number.

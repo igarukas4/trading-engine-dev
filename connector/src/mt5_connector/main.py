@@ -22,15 +22,11 @@ class RuntimeErrorSafe(RuntimeError):
 def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
                 max_attempts=1, max_messages=1, preflight=None, preflight_only=False):
     execution_enabled = not config.execution_disabled and not preflight_only
+    if urlparse(config.secret_ref).scheme.lower() == "file" and not config.local_test:
+        raise RuntimeErrorSafe("SECRET_REFERENCE_UNSUPPORTED")
     if execution_enabled and secret_provider is not None and not config.local_test:
         raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
     if execution_enabled and getattr(secret_provider, "read_only_file_provider", False):
-        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
-    if (
-        execution_enabled
-        and urlparse(config.secret_ref).scheme.lower() == "file"
-        and not config.local_test
-    ):
         raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
     if execution_enabled and secret_provider is None and not config.secret_ref.startswith("credential-manager://"):
         raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
@@ -123,16 +119,6 @@ def main(argv=None, *, secret_provider=None, transport=None, preflight=None, ada
                                     config.external_account_id),
                            config.account_id).initialize(config.terminal_path)
     if args.run or args.preflight_only:
-        # A production command-capable CLI may only use the configured
-        # protected store. Test seams can inject a provider for preflight-only
-        # runs, which never dispatch a broker side effect.
-        if (
-            args.run
-            and secret_provider is not None
-            and urlparse(config.secret_ref).scheme.lower() == "file"
-            and not config.local_test
-        ):
-            raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
         protocol = run_runtime(config, secret_provider, transport=transport, adapter=adapter,
                                preflight=(preflight if preflight is not None else args.enable_manual_demo),
                                preflight_only=args.preflight_only,

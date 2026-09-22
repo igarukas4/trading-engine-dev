@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from dataclasses import asdict
 from io import StringIO
@@ -15,6 +16,7 @@ from mt5_connector.journal import canonical_request_hash, SQLiteJournal
 from mt5_connector.main import RuntimeErrorSafe, main, run_runtime
 from mt5_connector.adapter import AdapterError
 from mt5_connector.preflight import PreflightError
+from mt5_connector.secrets import SecretProviderError, secret_provider_from_ref
 from backend.app.connector_delivery import ConnectorDeliveryBridge, ConnectorDeliveryRegistry
 from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, Position, RiskReservation
 
@@ -149,6 +151,19 @@ class Issue70RuntimeTests(unittest.TestCase):
                 "sent_at": "2026-01-01T00:00:00Z", "payload": {
                     "reconciliation_complete": True, "backend_execution_gate": True,
                     "no_unknown_commands": True}}
+
+    def test_file_secret_reference_is_rejected_without_reading_file(self):
+        with patch("builtins.open", side_effect=AssertionError("file must not open")):
+            with self.assertRaisesRegex(SecretProviderError, "^SECRET_REFERENCE_UNSUPPORTED$"):
+                secret_provider_from_ref("file:///outside/secret")
+
+    def test_production_preflight_rejects_file_secret_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.config(Path(tmp) / "journal.sqlite", local_test=False,
+                                 execution_disabled=True)
+            with self.assertRaisesRegex(RuntimeErrorSafe, "^SECRET_REFERENCE_UNSUPPORTED$"):
+                run_runtime(config, lambda: "opaque", adapter=FakeAdapter(),
+                            transport=FakeTransport([]), preflight_only=True)
 
     def command_frame(self, payload=None, *, command_id="command-1", key="idem-1",
                       generation=0, epoch=4, sequence=2, typ="order.submit_market"):
