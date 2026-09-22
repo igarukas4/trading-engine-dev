@@ -235,6 +235,22 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.runtime_interlock("a").status, "BLOCKED")
         self.assertEqual(coordinator.runtime_interlock("b").status, "ELIGIBLE")
 
+    async def test_entry_acceptance_without_readback_stays_unknown(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="missing-readback")
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+        await bridge.enqueue_order("a", "order-missing-readback", identity=identity, generation=1)
+        envelope = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", envelope.command_id, "session")
+        await bridge.record_result({
+            **envelope.as_message(), "type": "command.result", "message_id": "result-missing-readback",
+            "sequence": 1, "payload": {"state": "ACCEPTED"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(coordinator.orders["order-missing-readback"].status, "UNKNOWN")
+
     async def test_position_commands_use_durable_bridge_and_project_account_locally(self):
         coordinator = ExecutionCoordinator()
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
@@ -271,7 +287,8 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await bridge.record_result({
             **first.as_message(), "type": "command.result", "message_id": "result-modify",
             "sequence": 1, "payload": {
-                "state": "ACCEPTED", "protection_confirmed": True,
+                "state": "ACCEPTED", "readback_confirmed": True,
+                "protection_confirmed": True,
                 "confirmed_stop": "1.0", "confirmed_take_profit": "2.0",
             },
         }, authenticated_account_id="a", session_id="session")
@@ -281,7 +298,9 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await bridge.mark_sent("a", second.command_id, "session")
         await bridge.record_result({
             **second.as_message(), "type": "command.result", "message_id": "result-close",
-            "sequence": 2, "payload": {"state": "ACCEPTED", "filled_volume": "0.05"},
+            "sequence": 2, "payload": {
+                "state": "ACCEPTED", "readback_confirmed": True, "filled_volume": "0.05",
+            },
         }, authenticated_account_id="a", session_id="session")
         self.assertEqual(close.status, "CONFIRMED")
         self.assertEqual(coordinator.position("a", "order-position").remaining_volume, "0.05")

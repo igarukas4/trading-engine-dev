@@ -458,9 +458,16 @@ class OfficialMT5Adapter:
             }
             linked = bool(expected_ids.intersection(row_ids))
             if typ == "position.close" and requested_ticket is not None:
-                linked = linked or str(row.get("position", row.get("position_id", ""))) == requested_ticket
+                row_position = row.get("position", row.get("position_id"))
+                # A close is proven only by a broker deal for the exact
+                # requested position. An order/deal ticket alone is not
+                # enough because it can belong to another position.
+                linked = linked and row_position is not None and str(row_position) == requested_ticket
             if correlation and str(row.get("comment", row.get("correlation_id", ""))) == correlation:
                 linked = linked or str(row.get("magic", "")) in {"", expected_magic}
+            if typ == "position.close" and requested_ticket is not None:
+                row_position = row.get("position", row.get("position_id"))
+                linked = linked and row_position is not None and str(row_position) == requested_ticket
             if linked:
                 matches.append({"_source": source, **row})
         if not matches:
@@ -477,6 +484,7 @@ class OfficialMT5Adapter:
         if typ == "position.close":
             volume = next((row.get("volume", row.get("filled_volume")) for row in matches
                            if row.get("_source") == "history_deals_get"
+                           and str(row.get("position", row.get("position_id", ""))) == requested_ticket
                            and row.get("volume", row.get("filled_volume")) is not None), None)
             if volume in (None, "", 0, "0"):
                 return None
@@ -545,6 +553,7 @@ class OfficialMT5Adapter:
                 if actual_sl != expected_sl or actual_tp != expected_tp:
                     raise ValueError
                 result["protection_confirmed"] = True
+                result["readback_confirmed"] = True
                 result["confirmed_stop"] = str(actual_sl)
                 result["confirmed_take_profit"] = str(actual_tp)
             except (AdapterError, InvalidOperation, TypeError, ValueError, KeyError):
@@ -633,7 +642,9 @@ class FakeMT5Adapter:
         symbols: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self.identity = identity or Identity("MT5", "Demo", "42")
-        self.outcome = outcome or {"retcode": 10009}
+        # The fake models an independently checked broker snapshot. Tests
+        # that omit this proof must exercise the dispatcher's UNKNOWN path.
+        self.outcome = outcome or {"retcode": 10009, "readback_confirmed": True}
         self.check_result = check if check is not None else {"retcode": 0}
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.checks: list[tuple[str, dict[str, Any]]] = []
@@ -703,6 +714,7 @@ class FakeMT5Adapter:
             return {
                 **result,
                 "protection_confirmed": True,
+                "readback_confirmed": True,
                 "confirmed_stop": payload.get("sl"),
                 "confirmed_take_profit": payload.get("tp"),
             }

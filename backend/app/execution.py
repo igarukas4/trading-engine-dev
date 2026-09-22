@@ -2869,6 +2869,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     "attempts": item.attempts,
                     "critical": item.status == "ESCALATED",
                     "recovery_legal": item.status == "PENDING",
+                    # This is permission to derive a no-effect result from a
+                    # complete connector read. The connector must still prove
+                    # the overlapping history queries succeeded and contain no
+                    # correlated broker row before it emits NO_EFFECT.
+                    "authoritative_no_effect": item.status in UNRESOLVED_RECONCILIATION_STATUSES,
                 }
                 # Backend recovery work is keyed by the domain Order ID. The
                 # connector journal is keyed by the dispatched command ID.
@@ -3132,10 +3137,21 @@ class ExecutionCoordinator(ExecutionSubstrate):
             result_payload = dict(payload or {})
             if (
                 state == "ACCEPTED"
+                and record.command_type in {
+                    "order.submit_market", "position.modify_protection", "position.close",
+                }
+                and result_payload.get("readback_confirmed") is not True
+            ):
+                state = "UNKNOWN"
+                result_payload["state"] = state
+                result_payload.setdefault("code", "EFFECT_READBACK_REQUIRED")
+            if (
+                state == "ACCEPTED"
                 and record.command_type == "position.modify_protection"
                 and result_payload.get("protection_confirmed") is not True
             ):
                 state = "UNKNOWN"
+                result_payload["state"] = state
                 result_payload.setdefault("code", "PROTECTION_READBACK_REQUIRED")
             if (
                 state == "ACCEPTED"
@@ -3146,6 +3162,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 # Keep the command fenced until a deal/read-back supplies the
                 # actual reduction.
                 state = "UNKNOWN"
+                result_payload["state"] = state
                 result_payload.setdefault("code", "CLOSE_READBACK_REQUIRED")
             record.state = state
             record.result_payload = result_payload

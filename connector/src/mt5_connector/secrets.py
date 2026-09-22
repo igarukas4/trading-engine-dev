@@ -81,6 +81,10 @@ def protected_file_secret_provider(path: str):
             raise SecretProviderError("SECRET_UNAVAILABLE")
         return value
 
+    # The runtime uses this marker to keep a read-only file callback out of
+    # command-capable sessions. ACL checks and a later path read are not an
+    # atomic proof of the same file.
+    load.read_only_file_provider = True
     return load
 
 

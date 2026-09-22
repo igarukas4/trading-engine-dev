@@ -421,6 +421,7 @@ with TemporaryDirectory() as directory:
     assert engine.account("account-b").exposure_gate == "OPEN"
     work = engine.recovery_records("account-a")[0]
     assert work["status"] == "PENDING" and work["deadline_at"]
+    assert work["authoritative_no_effect"] is True
 
     restarted = ExecutionCoordinator(state_path=path, reconciliation_deadline=timedelta(seconds=30))
     broker_truth = Broker({"status": "SUBMITTED", "external_id": "mt5-a"})

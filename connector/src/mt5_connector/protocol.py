@@ -295,12 +295,24 @@ class ConnectorProtocol:
         position_commands: list[dict[str, Any]] = []
         broker_order_ids: dict[str, str] = {}
         recovered_orders = list(orders.get("items", []))
-        allow_authoritative_no_effect = bool(payload.get("from_server_time"))
+        # An empty result is not proof by itself. Only a successful, bounded
+        # overlap of both broker history queries can authorize the backend's
+        # no-effect claim. A missing section or missing window remains UNKNOWN.
+        allow_authoritative_no_effect = (
+            bool(payload.get("from_server_time"))
+            and isinstance(history_orders.get("items"), list)
+            and isinstance(history_deals.get("items"), list)
+        )
         for record in payload.get("recovery", []):
             match, row = self._recovery_match(
                 record,
                 order_rows,
-                allow_authoritative_no_effect=allow_authoritative_no_effect,
+                allow_authoritative_no_effect=(
+                    allow_authoritative_no_effect
+                    and record.get("authoritative_no_effect") is True
+                    if isinstance(record, dict)
+                    else False
+                ),
             )
             recovery_matches.append(match)
             if row is None:

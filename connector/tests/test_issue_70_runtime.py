@@ -83,10 +83,12 @@ class FakeAdapter:
 
     def invoke(self, typ, payload):
         self.calls.append(("invoke", typ, payload))
-        result = {"retcode": 10009, "external_order_id": "fake-order"}
+        result = {"retcode": 10009, "external_order_id": "fake-order",
+                  "readback_confirmed": True}
         if typ == "position.modify_protection":
             result.update({
                 "protection_confirmed": True,
+                "readback_confirmed": True,
                 "confirmed_stop": payload.get("sl"),
                 "confirmed_take_profit": payload.get("tp"),
             })

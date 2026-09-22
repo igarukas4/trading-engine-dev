@@ -22,9 +22,12 @@ class RuntimeErrorSafe(RuntimeError):
 def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
                 max_attempts=1, max_messages=1, preflight=None, preflight_only=False):
     execution_enabled = not config.execution_disabled and not preflight_only
+    if execution_enabled and secret_provider is not None and not config.local_test:
+        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
+    if execution_enabled and getattr(secret_provider, "read_only_file_provider", False):
+        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
     if (
         execution_enabled
-        and secret_provider is not None
         and urlparse(config.secret_ref).scheme.lower() == "file"
         and not config.local_test
     ):

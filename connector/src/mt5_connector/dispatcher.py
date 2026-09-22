@@ -121,9 +121,15 @@ class Dispatcher:
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS")
             if result is None:
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS")
-            state = self._result_state(result)
+            state = self._result_state(result, typ)
             if state == "UNKNOWN":
-                return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS", result)
+                fields = self._result_fields(result)
+                code = (
+                    "EFFECT_READBACK_REQUIRED"
+                    if self._accepted_without_readback(fields)
+                    else "TRANSPORT_AMBIGUOUS"
+                )
+                return self._finish(command_id, "UNKNOWN", code, result)
             return self._finish(command_id, state, None if state == "ACCEPTED" else "BROKER_REJECTED", result)
 
     def reconcile(self, command_id: str, *, snapshot: Mapping[str, Any], source: str,
@@ -194,20 +200,33 @@ class Dispatcher:
         return fields.get("retcode") in (0, "0")
 
     @classmethod
-    def _result_state(cls, result) -> str:
+    def _result_state(cls, result, typ: str | None = None) -> str:
         fields = cls._result_fields(result)
         state, retcode = fields.get("state"), fields.get("retcode")
         if str(state).upper() in {"UNKNOWN", "AMBIGUOUS"}:
             return "UNKNOWN"
         if str(state).upper() in {"ACCEPTED", "REJECTED"}:
-            return str(state).upper()
+            state = str(state).upper()
+            if state == "ACCEPTED" and typ in SIDE_EFFECTING_TYPES and fields.get("readback_confirmed") is not True:
+                return "UNKNOWN"
+            return state
         if retcode in (10012, "10012"):
             return "UNKNOWN"
         if retcode in cls.ACCEPTED_RETCODES:
+            if typ in SIDE_EFFECTING_TYPES and fields.get("readback_confirmed") is not True:
+                return "UNKNOWN"
             return "ACCEPTED"
         if retcode in cls.REJECTED_RETCODES:
             return "REJECTED"
         return "UNKNOWN"
+
+    @classmethod
+    def _accepted_without_readback(cls, fields: Mapping[str, Any]) -> bool:
+        state = str(fields.get("state", "")).upper()
+        return (
+            state == "ACCEPTED"
+            or fields.get("retcode") in cls.ACCEPTED_RETCODES
+        ) and fields.get("readback_confirmed") is not True
 
     def _finish(self, command_id, state, code, result=None):
         result_mapping = self._result_mapping(result)
