@@ -1,30 +1,25 @@
-import asyncio
+from collections import deque
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, "connector/src")
+sys.path.insert(0, "connector/tests")
 
 from mt5_connector.adapter import FakeMT5Adapter
 from mt5_connector.config import ConnectorConfig
 from mt5_connector.dispatcher import Dispatcher
 from mt5_connector.journal import SQLiteJournal, canonical_request_hash
-from mt5_connector.models import Identity
+from mt5_connector.protocol import ConnectorProtocol, ProtocolError
 from mt5_connector.websocket_client import ConnectorClient
 
-
-RAW = {
-    "account_id": "a1", "provider": "MT5", "broker_server": "Demo",
-    "external_account_id": "42", "key_id": "k1", "secret_ref": "vault://ref",
-    "terminal_path": "unused", "wss_url": "wss://example/ws",
-    "journal_path": "unused", "execution_disabled": True,
-}
+from test_runtime import RAW
 
 
 class FakeWss:
     def __init__(self, frames):
-        self.frames = list(frames)
+        self.frames = deque(frames)
         self.sent = []
 
     async def connect(self):
@@ -34,7 +29,7 @@ class FakeWss:
         self.sent.append(frame)
 
     async def recv(self):
-        return self.frames.pop(0)
+        return self.frames.popleft()
 
     async def close(self):
         return None
@@ -60,28 +55,31 @@ class Issue67ContractTests(unittest.IsolatedAsyncioTestCase):
 
     def dispatcher(self, adapter):
         journal = SQLiteJournal(str(Path(self.tmp.name) / "connector.sqlite"), "a1")
-        self.addAsyncCleanup(self._close, journal)
+        self.addCleanup(journal.close)
         return Dispatcher(journal, adapter, generation=7, execution_epoch=4)
 
-    async def _close(self, journal):
-        journal.close()
+    def protocol_with_dispatcher(self, adapter):
+        dispatcher = self.dispatcher(adapter)
+        protocol = ConnectorProtocol(self.config(), adapter, dispatcher=dispatcher)
+        protocol.accept_snapshot(self.snapshot())
+        return protocol, dispatcher
+
+    @staticmethod
+    def snapshot():
+        return {
+            "type": "snapshot", "generation": 7, "execution_epoch": 4,
+            "snapshot": {"account_id": "a1"},
+        }
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.addAsyncCleanup(self._cleanup)
-
-    async def _cleanup(self):
-        self.tmp.cleanup()
+        self.addCleanup(self.tmp.cleanup)
 
     async def test_command_enabled_wss_session_invokes_fake_adapter_once(self):
         adapter = FakeMT5Adapter()
         dispatcher = self.dispatcher(adapter)
         command = self.command()
-        transport = FakeWss([
-            {"type": "snapshot", "generation": 7, "execution_epoch": 4,
-             "snapshot": {"account_id": "a1"}},
-            command,
-        ])
+        transport = FakeWss([self.snapshot(), command])
         client = ConnectorClient(self.config(), adapter, transport=transport,
                                  dispatcher=dispatcher)
 
@@ -95,27 +93,19 @@ class Issue67ContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_check_rejection_never_invokes_and_replay_is_durable(self):
         adapter = FakeMT5Adapter(check={"retcode": 10016})
-        dispatcher = self.dispatcher(adapter)
-        from mt5_connector.protocol import ConnectorProtocol
-        protocol = ConnectorProtocol(self.config(), adapter, dispatcher=dispatcher)
-        protocol.accept_snapshot({"type": "snapshot", "generation": 7,
-                                  "execution_epoch": 4, "snapshot": {"account_id": "a1"}})
+        protocol, _dispatcher = self.protocol_with_dispatcher(adapter)
 
         first = protocol.handle(self.command())
         replay = protocol.handle(self.command(message_id="command-2", sequence=2))
 
         self.assertEqual(first["payload"]["code"], "ORDER_CHECK_REJECTED")
         self.assertEqual(replay["payload"], first["payload"])
-        self.assertEqual(adapter.checks.__len__(), 1)
+        self.assertEqual(len(adapter.checks), 1)
         self.assertEqual(adapter.requests, [])
 
     async def test_unknown_is_invoked_once_and_ambiguous_match_reopens(self):
         adapter = FakeMT5Adapter(outcome={"state": "UNKNOWN", "code": "TRANSPORT_AMBIGUOUS"})
-        dispatcher = self.dispatcher(adapter)
-        from mt5_connector.protocol import ConnectorProtocol
-        protocol = ConnectorProtocol(self.config(), adapter, dispatcher=dispatcher)
-        protocol.accept_snapshot({"type": "snapshot", "generation": 7,
-                                  "execution_epoch": 4, "snapshot": {"account_id": "a1"}})
+        protocol, dispatcher = self.protocol_with_dispatcher(adapter)
 
         result = protocol.handle(self.command())
         self.assertEqual(result["payload"]["state"], "UNKNOWN")
@@ -131,11 +121,7 @@ class Issue67ContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_idempotency_key_reuse_is_rejected_without_broker_call(self):
         adapter = FakeMT5Adapter()
-        dispatcher = self.dispatcher(adapter)
-        from mt5_connector.protocol import ConnectorProtocol, ProtocolError
-        protocol = ConnectorProtocol(self.config(), adapter, dispatcher=dispatcher)
-        protocol.accept_snapshot({"type": "snapshot", "generation": 7,
-                                  "execution_epoch": 4, "snapshot": {"account_id": "a1"}})
+        protocol, _dispatcher = self.protocol_with_dispatcher(adapter)
         protocol.handle(self.command())
         with self.assertRaisesRegex(ProtocolError, "IDEMPOTENCY_KEY_REUSED"):
             protocol.handle(self.command(message_id="command-2", sequence=2,

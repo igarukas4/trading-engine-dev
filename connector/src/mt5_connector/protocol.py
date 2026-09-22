@@ -1,4 +1,4 @@
-"""Connector-side validation and read-only command protocol."""
+"""Connector-side validation and command protocol."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -384,37 +384,13 @@ class ConnectorProtocol:
             if command_id == envelope.command_id and prior_hash == envelope.request_hash:
                 return self._replay_result(result)
             raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
-        result = self._envelope(
-            "command.result",
-            {"state": state, "code": code},
-            envelope.command_id,
-            execution_epoch=envelope.execution_epoch,
-            request_hash=envelope.request_hash,
-        )
-        result["idempotency_key"] = envelope.idempotency_key
-        self._results[envelope.command_id or ""] = (envelope.idempotency_key, envelope.request_hash or "", result)
-        self._idempotency[envelope.idempotency_key] = (envelope.command_id or "", envelope.request_hash or "", result)
-        return result
+        return self._record_result(envelope, {"state": state, "code": code})
 
-    def _dispatch_side_effect(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
-        """Pass one validated command through the journal-first dispatcher."""
-        prior = self._results.get(envelope.command_id or "")
-        if prior is not None and self.dispatcher is None:
-            prior_key, prior_hash, result = prior
-            if prior_key == envelope.idempotency_key and prior_hash == envelope.request_hash:
-                return self._replay_result(result)
-            raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
-        command = envelope.to_dict()
-        command["dispatch_sequence"] = envelope.sequence
-        try:
-            result_payload = self.dispatcher.dispatch(command)
-        except Exception as error:
-            raise ProtocolError("DISPATCH_ERROR", "command dispatch failed") from error
-        if result_payload.get("code") == "IDEMPOTENCY_KEY_REUSED":
-            raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
+    def _record_result(self, envelope: PostHandshakeEnvelope,
+                       payload: Mapping[str, Any]) -> dict[str, Any]:
         result = self._envelope(
             "command.result",
-            dict(result_payload),
+            payload,
             envelope.command_id,
             execution_epoch=envelope.execution_epoch,
             request_hash=envelope.request_hash,
@@ -427,6 +403,17 @@ class ConnectorProtocol:
             envelope.command_id or "", envelope.request_hash or "", result,
         )
         return result
+
+    def _dispatch_side_effect(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
+        """Pass one validated command through the journal-first dispatcher."""
+        command = envelope.to_dict()
+        try:
+            result_payload = self.dispatcher.dispatch(command)
+        except Exception as error:
+            raise ProtocolError("DISPATCH_ERROR", "command dispatch failed") from error
+        if result_payload.get("code") == "IDEMPOTENCY_KEY_REUSED":
+            raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
+        return self._record_result(envelope, result_payload)
 
     def _read_only_response(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
         payload = envelope.payload
@@ -465,17 +452,7 @@ class ConnectorProtocol:
             result_payload = {"state": "ACCEPTED", "code": "RECONCILIATION_READY", "snapshot": data}
         else:
             raise ProtocolError("UNSUPPORTED_COMMAND", "unsupported command")
-        result = self._envelope(
-            "command.result",
-            result_payload,
-            envelope.command_id,
-            execution_epoch=envelope.execution_epoch,
-            request_hash=envelope.request_hash,
-        )
-        result["idempotency_key"] = envelope.idempotency_key
-        self._results[envelope.command_id or ""] = (envelope.idempotency_key, envelope.request_hash or "", result)
-        self._idempotency[envelope.idempotency_key] = (envelope.command_id or "", envelope.request_hash or "", result)
-        return result
+        return self._record_result(envelope, result_payload)
 
     def backoff(self, attempt):
         return min(

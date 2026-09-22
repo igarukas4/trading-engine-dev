@@ -1,4 +1,4 @@
-"""Injectable, read-only async WSS session boundary."""
+"""Injectable async WSS session boundary."""
 from __future__ import annotations
 
 import asyncio

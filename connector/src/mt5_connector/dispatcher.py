@@ -83,10 +83,7 @@ class Dispatcher:
             if not existing:
                 self._last_sequence = max(self._last_sequence, sequence)
             if record.state in {"ACCEPTED", "REJECTED"}:
-                resolved = dict(record.result or {})
-                resolved.setdefault("state", record.state)
-                resolved.setdefault("code", record.error_code)
-                return resolved
+                return self._resolved_result(record)
             if record.state == "UNKNOWN":
                 return {"state": "UNKNOWN", "code": record.error_code or "RECONCILIATION_REQUIRED"}
             if typ not in SIDE_EFFECTING_TYPES:
@@ -131,10 +128,14 @@ class Dispatcher:
                 match_status=match_status, state=state,
                 result=result, error_code=error_code,
             )
-            resolved = dict(row.result or {})
-            resolved.setdefault("state", row.state)
-            resolved.setdefault("code", row.error_code)
-            return resolved
+            return self._resolved_result(row)
+
+    @staticmethod
+    def _resolved_result(record: Any) -> dict[str, Any]:
+        resolved = dict(record.result or {})
+        resolved.setdefault("state", record.state)
+        resolved.setdefault("code", record.error_code)
+        return resolved
 
     def _check(self, typ, payload):
         if not hasattr(self.adapter, "order_check"):
