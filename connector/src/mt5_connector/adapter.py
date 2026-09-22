@@ -132,6 +132,29 @@ class OfficialMT5Adapter:
     def account_snapshot(self) -> AccountSnapshot:
         return self._account_snapshot(self._info())
 
+    def preflight_facts(self) -> dict[str, Any]:
+        """Read account and terminal permission without broker side effects."""
+        if not self._initialized:
+            raise AdapterError("MT5_NOT_INITIALIZED")
+        try:
+            mt5 = self._module()
+            account = self._info()
+            terminal = mt5.terminal_info()
+            if terminal is None:
+                raise AdapterError("MT5_HEALTH_UNAVAILABLE")
+            return {
+                "account_id": self.account_id,
+                **self.expected.to_dict(),
+                "trade_mode": "DEMO" if getattr(account, "trade_mode", None) == mt5.ACCOUNT_TRADE_MODE_DEMO else "OTHER",
+                "terminal_connected": bool(getattr(terminal, "connected", False)),
+                "terminal_trade_allowed": bool(getattr(terminal, "trade_allowed", False)),
+                "account_trade_allowed": bool(getattr(account, "trade_allowed", False)),
+            }
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise AdapterError("MT5_HEALTH_UNAVAILABLE") from exc
+
     def _visible_symbol(self, symbol: str) -> Any:
         mt5 = self._module()
         info = mt5.symbol_info(symbol)
@@ -236,6 +259,20 @@ class OfficialMT5Adapter:
         account = self._info()
         if not bool(getattr(account, "trade_allowed", False)) or not meta.trade_allowed:
             raise AdapterError("TRADING_NOT_ALLOWED")
+        if typ == "position.modify_protection":
+            digits = Decimal(1).scaleb(-meta.digits)
+            position = self._fresh_position(payload.get("position_ticket"))
+            if str(position.get("symbol")) != symbol:
+                raise AdapterError("POSITION_SYMBOL_MISMATCH")
+            sl = payload.get("sl") if payload.get("sl") is not None else position.get("sl")
+            tp = payload.get("tp") if payload.get("tp") is not None else position.get("tp")
+            return {
+                "action": getattr(mt5, "TRADE_ACTION_SLTP"),
+                "symbol": symbol,
+                "position": self._ticket(payload.get("position_ticket")),
+                "sl": float(self._price(sl, digits)),
+                "tp": float(self._price(tp, digits)),
+            }
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise AdapterError("QUOTE_UNAVAILABLE")
@@ -287,11 +324,6 @@ class OfficialMT5Adapter:
                 raise AdapterError("INVALID_STOPS")
             request["sl"] = float(sl)
             request["tp"] = float(tp)
-        elif typ == "position.modify_protection":
-            request["action"] = getattr(mt5, "TRADE_ACTION_SLTP")
-            request["position"] = self._ticket(payload.get("position_ticket"))
-            request["sl"] = float(self._price(payload["sl"], digits))
-            request["tp"] = float(self._price(payload["tp"], digits))
         elif typ == "position.close":
             request["position"] = self._ticket(
                 position.get("ticket", payload.get("position_ticket"))
@@ -325,7 +357,10 @@ class OfficialMT5Adapter:
         if not rows:
             raise AdapterError("POSITION_NOT_FOUND")
         row = self._plain(rows[0])
-        return row if isinstance(row, dict) else vars(row)
+        position = row if isinstance(row, dict) else vars(row)
+        if str(position.get("ticket")) != str(ticket):
+            raise AdapterError("POSITION_TICKET_MISMATCH")
+        return position
 
     def order_check(self, typ, payload):
         request = self._request(typ, payload)

@@ -3002,13 +3002,16 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
             existing = self.dispatch_records.get(command_id)
             position = self.position(account_id, command.order_id)
-            command_type = (
-                "position.modify_protection" if command.command_type == "PROTECTION"
-                else "position.close"
-            )
+            command_types = {"PROTECTION": "position.modify_protection", "CLOSE": "position.close"}
+            command_type = command_types.get(command.command_type)
+            if command_type is None:
+                raise ExecutionError("UNSUPPORTED_POSITION_COMMAND")
+            position_ticket = position.external_position_id
+            if position_ticket is None or not str(position_ticket).strip():
+                raise ExecutionError("POSITION_TICKET_REQUIRED")
             if command_type == "position.modify_protection":
                 payload = {
-                    "position_ticket": str(position.external_position_id or command.order_id),
+                    "position_ticket": str(position_ticket),
                     "symbol": position.pair or "",
                     "sl": command.requested_stop,
                     "tp": command.requested_take_profit,
@@ -3016,7 +3019,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 }
             else:
                 payload = {
-                    "position_ticket": str(position.external_position_id or command.order_id),
+                    "position_ticket": str(position_ticket),
                     "symbol": position.pair or "",
                     "direction": position.direction or "LONG",
                     "volume": command.requested_volume or position.remaining_volume,
@@ -3025,9 +3028,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 }
             request_hash = hashlib.sha256(
                 json.dumps(
-                    {"type": command_type, "payload": payload},
+                    {"command_type": command_type, "payload": payload},
                     sort_keys=True,
                     separators=(",", ":"),
+                    ensure_ascii=False,
                 ).encode()
             ).hexdigest()
             if existing is not None:

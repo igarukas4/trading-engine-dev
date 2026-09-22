@@ -62,12 +62,14 @@ class ConnectorClient:
     """Runs one bounded protocol session; commands are never initiated locally."""
 
     def __init__(self, config: ConnectorConfig, adapter, *, transport=None,
-                 transport_factory=None, random_fn=random.random, dispatcher=None):
+                 transport_factory=None, random_fn=random.random, dispatcher=None,
+                 session_preflight=None):
         self.config = config
         self.protocol = ConnectorProtocol(config, adapter, dispatcher=dispatcher,
                                           random_fn=random_fn)
         self.transport = transport
         self.transport_factory = transport_factory
+        self.session_preflight = session_preflight
         self._transport = None
 
     @staticmethod
@@ -99,6 +101,8 @@ class ConnectorClient:
         if not secret:
             raise ProtocolError("secret is required")
         self.protocol.begin_session()
+        if self.session_preflight is not None and self.protocol.dispatcher is not None:
+            self.protocol.dispatcher.execution_enabled = False
         transport = await self._open()
         try:
             await transport.send(json.dumps(self.protocol.hello(secret), separators=(",", ":")))
@@ -108,6 +112,8 @@ class ConnectorClient:
             while max_messages is None or processed < max_messages:
                 message = self._decode(await transport.recv())
                 response = self.protocol.handle(message)
+                if message.get("type") == "reconciliation_observed" and self.session_preflight is not None:
+                    self.session_preflight(snapshot, message)
                 if message.get("type") == "heartbeat_ack":
                     processed += 1
                     continue
@@ -118,6 +124,8 @@ class ConnectorClient:
                 processed += 1
             return self.protocol
         finally:
+            if self.session_preflight is not None and self.protocol.dispatcher is not None:
+                self.protocol.dispatcher.execution_enabled = False
             close = getattr(transport, "close", None)
             if close is not None:
                 await close()

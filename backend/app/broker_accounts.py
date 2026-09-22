@@ -399,6 +399,14 @@ class AccountRegistry:
         self._persist_account(account)
         return account
 
+    def mark_reconciled(self, account_id: str) -> BrokerAccount:
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
+        account.reconciliation_complete = True
+        self._persist_account(account)
+        return account
+
     def set_execution_mode(
         self,
         account_id: str,
@@ -417,6 +425,7 @@ class AccountRegistry:
         account = self.accounts[account_id]
         return {
             "account_id": account.id,
+            "environment": account.environment,
             "identity": {
                 "provider": account.provider,
                 "broker_server": account.broker_server,

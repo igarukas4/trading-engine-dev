@@ -1,7 +1,7 @@
-"""Explicit operator evidence required before enabling broker side effects."""
+"""Verify operator intent against local terminal and authenticated backend facts."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import sqlite3
 from typing import Any, Mapping
 
 
@@ -9,35 +9,47 @@ class PreflightError(RuntimeError):
     """Stable, credential-free preflight failure."""
 
 
-@dataclass(frozen=True)
-class PreflightEvidence:
-    demo_account: bool
-    manual_mode: bool
-    terminal_healthy: bool
-    trade_allowed: bool
-    journal_writable: bool
-    generation_current: bool
-    epoch_current: bool
-    reconciliation_complete: bool
-    no_unknown_commands: bool
-    backend_execution_gate: bool
+def require_preflight(operator_approved: Any) -> None:
+    if operator_approved is not True:
+        raise PreflightError("PREFLIGHT_REQUIRED")
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any] | None) -> "PreflightEvidence":
-        if not isinstance(value, Mapping):
-            raise PreflightError("PREFLIGHT_REQUIRED")
-        fields = tuple(cls.__dataclass_fields__)
-        if any(not isinstance(value.get(field), bool) for field in fields):
-            raise PreflightError("PREFLIGHT_INCOMPLETE")
-        evidence = cls(**{field: value[field] for field in fields})
-        if not all(evidence.__dict__.values()):
+
+def verify_preflight(config, adapter, journal, snapshot: Mapping[str, Any],
+                     acknowledgement: Mapping[str, Any]) -> int:
+    """Return the verified epoch; never accept operator-supplied health flags."""
+    try:
+        expected_identity = config.identity()
+        account = snapshot["snapshot"]
+        facts = adapter.preflight_facts()
+        payload = acknowledgement["payload"]
+        epoch = snapshot["execution_epoch"]
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
             raise PreflightError("PREFLIGHT_FAILED")
-        return evidence
-
-
-def require_preflight(value: PreflightEvidence | Mapping[str, Any] | None) -> PreflightEvidence:
-    if isinstance(value, PreflightEvidence):
-        if not all(value.__dict__.values()):
+        if (snapshot["generation"] != config.backend_generation
+                or acknowledgement["generation"] != config.backend_generation
+                or acknowledgement["execution_epoch"] != epoch):
+            raise PreflightError("PREFLIGHT_STALE_CONTEXT")
+        if (account["account_id"] != config.account_id
+                or account["identity"] != expected_identity
+                or facts["account_id"] != config.account_id
+                or any(facts[field] != value for field, value in expected_identity.items())):
+            raise PreflightError("PREFLIGHT_IDENTITY_MISMATCH")
+        if account["environment"] != "DEMO" or account["execution_mode"] != "MANUAL":
             raise PreflightError("PREFLIGHT_FAILED")
-        return value
-    return PreflightEvidence.from_mapping(value)
+        if facts["trade_mode"] != "DEMO" or not all(
+            facts[field] is True for field in (
+                "terminal_connected", "terminal_trade_allowed", "account_trade_allowed"
+            )
+        ):
+            raise PreflightError("PREFLIGHT_FAILED")
+        if not all(payload[field] is True for field in (
+            "reconciliation_complete", "backend_execution_gate", "no_unknown_commands"
+        )) or journal.has_unknown():
+            raise PreflightError("PREFLIGHT_FAILED")
+        journal.connection.execute("BEGIN IMMEDIATE")
+        journal.connection.rollback()
+        return epoch
+    except PreflightError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+        raise PreflightError("PREFLIGHT_FAILED") from exc

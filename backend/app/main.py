@@ -2254,15 +2254,37 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "duplicate_fill_ids": result.duplicate_fill_ids,
                         "recovery": execution.recovery_records(account.id),
                     })
-                    if _reconciliation_gate_complete(
+                    reconciliation_complete = _reconciliation_gate_complete(
                         observation, recovery, from_server_time,
-                    ):
-                        await connector_delivery.mark_reconciled(account.id, hello["session_id"])
-                        await connector_bridge.replay_unsent(account.id)
+                    )
+                    if reconciliation_complete:
+                        accounts.mark_reconciled(account.id)
+                    no_unknown_commands = not any(
+                        record.account_id == account.id and record.state == "UNKNOWN"
+                        for record in execution.dispatch_records.values()
+                    ) and not any(
+                        item["status"] in {"PENDING", "ESCALATED"}
+                        for item in execution.recovery_records(account.id)
+                    )
+                    backend_execution_gate = (
+                        reconciliation_complete and no_unknown_commands
+                        and account.environment == "DEMO"
+                        and account.execution_mode == "MANUAL"
+                        and account.lifecycle_status == "ENABLED"
+                        and account.bot_state == "RUNNING"
+                        and account.can_enable
+                        and execution.runtime_interlock(account.id).status == "ELIGIBLE"
+                    )
                     await queue_control("reconciliation_observed", {
                         "status": result.status,
                         "recovery": execution.recovery_records(account.id),
+                        "reconciliation_complete": reconciliation_complete,
+                        "no_unknown_commands": no_unknown_commands,
+                        "backend_execution_gate": backend_execution_gate,
                     })
+                    if reconciliation_complete and no_unknown_commands:
+                        await connector_delivery.mark_reconciled(account.id, hello["session_id"])
+                        await connector_bridge.replay_unsent(account.id)
                 elif message.get("type") == "command.result":
                     try:
                         result = await connector_bridge.record_result(

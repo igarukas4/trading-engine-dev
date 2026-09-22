@@ -7,7 +7,8 @@ from backend.app.connector_delivery import (
     DeliveryError,
     validate_hello,
 )
-from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, Position, RiskReservation
+from backend.app.execution import ExecutionCoordinator, ExecutionError, OrderIntent, OutboxEvent, Position, PositionCommand, RiskReservation
+from connector.src.mt5_connector.journal import canonical_request_hash
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -263,6 +264,8 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(modify_record.payload["position_ticket"], "ticket-1")
         self.assertEqual(close_record.command_type, "position.close")
         self.assertEqual(close_record.payload["position_ticket"], "ticket-1")
+        self.assertEqual(modify_record.request_hash, canonical_request_hash(modify_record.command_type, modify_record.payload))
+        self.assertEqual(close_record.request_hash, canonical_request_hash(close_record.command_type, close_record.payload))
         first = await registry.next_for_session("a", "session")
         await bridge.mark_sent("a", first.command_id, "session")
         await bridge.record_result({
@@ -280,6 +283,27 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(close.status, "CONFIRMED")
         self.assertEqual(coordinator.position("a", "order-position").remaining_volume, "0.05")
 
+    async def test_position_dispatch_requires_broker_ticket_and_supported_type(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="no-ticket")
+        coordinator.positions[("a", "order-no-ticket")] = Position(
+            "a", "order-no-ticket", "0.10", "CONFIRMED", pair="EURUSD", direction="LONG",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-no-ticket", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        with self.assertRaisesRegex(ExecutionError, "POSITION_TICKET_REQUIRED"):
+            coordinator.prepare_connector_position_dispatch("a", close.id, identity=identity, generation=0)
+        self.assertNotIn(close.id, coordinator.dispatch_records)
+        coordinator.position("a", "order-no-ticket").external_position_id = "ticket-1"
+        unsupported = PositionCommand("unsupported", "a", "order-no-ticket", "TRAIL", None)
+        coordinator.position_commands.append(unsupported)
+        with self.assertRaisesRegex(ExecutionError, "UNSUPPORTED_POSITION_COMMAND"):
+            coordinator.prepare_connector_position_dispatch("a", unsupported.id, identity=identity, generation=0)
+        self.assertNotIn(unsupported.id, coordinator.dispatch_records)
+
+    async def test_unsent_dispatch_replays_after_restart(self):
         from tempfile import TemporaryDirectory
 
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}

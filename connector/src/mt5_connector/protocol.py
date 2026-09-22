@@ -178,7 +178,7 @@ class ConnectorProtocol:
         if envelope.type == "reconciliation.required":
             return self._reconciliation_responses(envelope.payload)
         if envelope.type in CONTROL_TYPES:
-            return message
+            return None
         if envelope.type not in COMMAND_TYPES:
             raise ProtocolError("UNSUPPORTED_COMMAND", "unsupported command")
         if envelope.type in SIDE_EFFECTING_TYPES:

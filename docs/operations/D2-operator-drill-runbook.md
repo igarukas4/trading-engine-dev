@@ -27,6 +27,10 @@ Rujukan deployment: [`deploy/README.md`](../../deploy/README.md). Prasyarat dan 
 
 ## Sebelum memulai
 
+Untuk connector MVP satu akun DEMO, ikuti `connector/README.md`. Provisioning secret dilakukan lewat Windows Credential Manager pada user yang menjalankan connector; config hanya memuat `credential-manager://<target>`. Jalankan `--preflight-only` lebih dulu. Perintah ini hanya membaca terminal, journal, dan status WSS/reconciliation. Catat hasil `PASS`/`FAIL` tanpa secret. `FAIL`, journal `UNKNOWN`, identity atau generation/epoch mismatch, terminal trade permission mati, atau backend gate tertutup berarti berhenti. Jangan mengubah flag config untuk melewati kegagalan.
+
+Sesudah `PASS`, issue #68 tetap memerlukan approval manusia tersendiri untuk satu order DEMO tertentu. Baru sesudah approval itu, operator boleh menjalankan `--run --enable-manual-demo` dengan `execution_disabled=false`. Perubahan config saja tidak mengaktifkan command. Jika sesi putus, connector menonaktifkan dispatch sampai handshake dan reconciliation berikutnya tervalidasi. Untuk berhenti, hentikan penerimaan command, tunggu queue idle, dan simpan journal. Jangan hapus journal saat `INVOKING` atau `UNKNOWN`; gunakan observasi broker dan recovery, tanpa resend buta. Inspeksi health memakai account ID, status terminal, generation/epoch, heartbeat, jumlah journal per state, watermark, dan ticket eksternal yang sudah disanitasi.
+
 Catat bukti tersanitasi berikut.
 
 - VPS/DNS/firewall sesuai `deploy/README.md`; hanya SSH, 80, dan 443 terekspos.
