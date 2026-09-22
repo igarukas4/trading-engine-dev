@@ -3,7 +3,6 @@ import argparse
 import asyncio
 import json
 import sqlite3
-from urllib.parse import urlparse
 
 from .adapter import AdapterError, OfficialMT5Adapter
 from .config import ConnectorConfig
@@ -11,7 +10,7 @@ from .dispatcher import Dispatcher
 from .journal import JournalError, SQLiteJournal
 from .models import Identity
 from .preflight import PreflightError, require_preflight, verify_preflight
-from .secrets import secret_provider_from_ref
+from .secrets import SecretProviderError, secret_provider_from_ref
 from .websocket_client import ConnectorClient
 
 
@@ -22,18 +21,18 @@ class RuntimeErrorSafe(RuntimeError):
 def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
                 max_attempts=1, max_messages=1, preflight=None, preflight_only=False):
     execution_enabled = not config.execution_disabled and not preflight_only
-    if urlparse(config.secret_ref).scheme.lower() == "file" and not config.local_test:
-        raise RuntimeErrorSafe("SECRET_REFERENCE_UNSUPPORTED")
-    if execution_enabled and secret_provider is not None and not config.local_test:
-        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
-    if execution_enabled and getattr(secret_provider, "read_only_file_provider", False):
-        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
-    if execution_enabled and secret_provider is None and not config.secret_ref.startswith("credential-manager://"):
-        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
-    if secret_provider is None:
-        secret_provider = secret_provider_from_ref(config.secret_ref)
+    try:
+        if secret_provider is None:
+            secret_provider = secret_provider_from_ref(config.secret_ref)
+    except SecretProviderError as exc:
+        raise RuntimeErrorSafe(str(exc)) from exc
     if not callable(secret_provider):
         raise RuntimeErrorSafe("SECRET_PROVIDER_REQUIRED")
+    # ``local_test`` is the existing fake transport/adaptor seam. It never
+    # represents a deployable command session. Production command sessions
+    # must come from a provider created by a protected store reference.
+    if execution_enabled and not config.local_test and not getattr(secret_provider, "securely_verified", False):
+        raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
     if execution_enabled:
         try:
             require_preflight(preflight)
@@ -85,6 +84,8 @@ def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
         if preflight_only and not getattr(protocol, "preflight_ready", False):
             raise RuntimeErrorSafe("PREFLIGHT_FAILED")
         return protocol
+    except SecretProviderError as exc:
+        raise RuntimeErrorSafe(str(exc)) from exc
     except JournalError as exc:
         raise RuntimeErrorSafe(str(exc)) from exc
     except sqlite3.Error as exc:

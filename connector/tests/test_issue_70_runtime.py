@@ -1,4 +1,5 @@
 import asyncio
+import os
 from unittest.mock import patch
 from contextlib import redirect_stdout
 from dataclasses import asdict
@@ -17,6 +18,7 @@ from mt5_connector.main import RuntimeErrorSafe, main, run_runtime
 from mt5_connector.adapter import AdapterError
 from mt5_connector.preflight import PreflightError
 from mt5_connector.secrets import SecretProviderError, secret_provider_from_ref
+import mt5_connector.secrets as secrets_module
 from backend.app.connector_delivery import ConnectorDeliveryBridge, ConnectorDeliveryRegistry
 from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, Position, RiskReservation
 
@@ -152,18 +154,84 @@ class Issue70RuntimeTests(unittest.TestCase):
                     "reconciliation_complete": True, "backend_execution_gate": True,
                     "no_unknown_commands": True}}
 
-    def test_file_secret_reference_is_rejected_without_reading_file(self):
+    def test_file_secret_reference_builds_protected_provider_without_reading_at_startup(self):
         with patch("builtins.open", side_effect=AssertionError("file must not open")):
-            with self.assertRaisesRegex(SecretProviderError, "^SECRET_REFERENCE_UNSUPPORTED$"):
-                secret_provider_from_ref("file:///outside/secret")
+            provider = secret_provider_from_ref("file:///C:/ProgramData/mt5/secret")
+        self.assertTrue(getattr(provider, "securely_verified", False))
+        self.assertTrue(getattr(provider, "protected_file_provider", False))
 
-    def test_production_preflight_rejects_file_secret_reference(self):
+    def test_production_command_runtime_rejects_unverified_injected_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = self.config(Path(tmp) / "journal.sqlite", local_test=False,
-                                 execution_disabled=True)
-            with self.assertRaisesRegex(RuntimeErrorSafe, "^SECRET_REFERENCE_UNSUPPORTED$"):
+                                 execution_disabled=False)
+            with self.assertRaisesRegex(RuntimeErrorSafe, "^PROTECTED_SECRET_REQUIRED$"):
                 run_runtime(config, lambda: "opaque", adapter=FakeAdapter(),
-                            transport=FakeTransport([]), preflight_only=True)
+                            transport=FakeTransport([]), preflight=True)
+
+    @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
+    def test_secure_file_provider_reads_protected_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret"
+            path.write_bytes(os.urandom(19))
+            path.chmod(0o600)
+            provider = secret_provider_from_ref(path.as_uri())
+            self.assertEqual(len(provider()), 38)
+
+    @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
+    def test_secure_file_provider_rejects_broad_permissions_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            target.write_bytes(os.urandom(19))
+            target.chmod(0o644)
+            with self.assertRaisesRegex(SecretProviderError, "^SECRET_FILE_UNSAFE$"):
+                secret_provider_from_ref(target.as_uri())()
+
+            target.chmod(0o600)
+            link = root / "link"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(SecretProviderError, "^SECRET_FILE_UNSAFE$"):
+                secret_provider_from_ref(link.as_uri())()
+
+    @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
+    def test_secure_file_provider_reads_same_handle_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret"
+            replacement = Path(tmp) / "replacement"
+            path.write_bytes(os.urandom(17))
+            replacement.write_bytes(os.urandom(31))
+            path.chmod(0o600)
+            replacement.chmod(0o600)
+            provider = secret_provider_from_ref(path.as_uri())
+            real_fstat = secrets_module.os.fstat
+            swapped = False
+
+            def replace_after_open(fd):
+                nonlocal swapped
+                info = real_fstat(fd)
+                if not swapped:
+                    os.replace(replacement, path)
+                    swapped = True
+                return info
+
+            with patch.object(secrets_module.os, "fstat", side_effect=replace_after_open):
+                value = provider()
+            self.assertEqual(len(value), 34)
+
+    @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
+    def test_secure_file_provider_rejects_empty_and_invalid_utf8(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            empty = root / "empty"
+            empty.write_bytes(b"")
+            empty.chmod(0o600)
+            with self.assertRaisesRegex(SecretProviderError, "^SECRET_UNAVAILABLE$"):
+                secret_provider_from_ref(empty.as_uri())()
+            invalid = root / "invalid"
+            invalid.write_bytes(b"\xff")
+            invalid.chmod(0o600)
+            with self.assertRaisesRegex(SecretProviderError, "^SECRET_UNAVAILABLE$"):
+                secret_provider_from_ref(invalid.as_uri())()
 
     def command_frame(self, payload=None, *, command_id="command-1", key="idem-1",
                       generation=0, epoch=4, sequence=2, typ="order.submit_market"):
