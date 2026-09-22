@@ -62,9 +62,10 @@ class ConnectorClient:
     """Runs one bounded protocol session; commands are never initiated locally."""
 
     def __init__(self, config: ConnectorConfig, adapter, *, transport=None,
-                 transport_factory=None, random_fn=random.random):
+                 transport_factory=None, random_fn=random.random, dispatcher=None):
         self.config = config
-        self.protocol = ConnectorProtocol(config, adapter, random_fn=random_fn)
+        self.protocol = ConnectorProtocol(config, adapter, dispatcher=dispatcher,
+                                          random_fn=random_fn)
         self.transport = transport
         self.transport_factory = transport_factory
         self._transport = None

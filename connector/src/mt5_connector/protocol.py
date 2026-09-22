@@ -30,9 +30,11 @@ class ProtocolError(ContractError):
 
 
 class ConnectorProtocol:
-    def __init__(self, cfg, adapter, transport=None, clock=time.time, random_fn=random.random):
+    def __init__(self, cfg, adapter, transport=None, clock=time.time, random_fn=random.random,
+                 dispatcher=None):
         self.cfg = cfg
         self.adapter = adapter
+        self.dispatcher = dispatcher
         self.transport = transport
         self.clock = clock
         self.random = random_fn
@@ -182,7 +184,9 @@ class ConnectorProtocol:
         if envelope.type in SIDE_EFFECTING_TYPES:
             if envelope.execution_epoch != self.execution_epoch:
                 return self._context_rejection(envelope, "STALE_EPOCH")
-            return self._result_for(envelope, "REJECTED", "EXECUTION_DISABLED")
+            if self.dispatcher is None:
+                return self._result_for(envelope, "REJECTED", "EXECUTION_DISABLED")
+            return self._dispatch_side_effect(envelope)
         return self._read_only_response(envelope)
 
     def _validate_legacy_context(self, message: Mapping[str, Any]) -> None:
@@ -390,6 +394,38 @@ class ConnectorProtocol:
         result["idempotency_key"] = envelope.idempotency_key
         self._results[envelope.command_id or ""] = (envelope.idempotency_key, envelope.request_hash or "", result)
         self._idempotency[envelope.idempotency_key] = (envelope.command_id or "", envelope.request_hash or "", result)
+        return result
+
+    def _dispatch_side_effect(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
+        """Pass one validated command through the journal-first dispatcher."""
+        prior = self._results.get(envelope.command_id or "")
+        if prior is not None and self.dispatcher is None:
+            prior_key, prior_hash, result = prior
+            if prior_key == envelope.idempotency_key and prior_hash == envelope.request_hash:
+                return self._replay_result(result)
+            raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
+        command = envelope.to_dict()
+        command["dispatch_sequence"] = envelope.sequence
+        try:
+            result_payload = self.dispatcher.dispatch(command)
+        except Exception as error:
+            raise ProtocolError("DISPATCH_ERROR", "command dispatch failed") from error
+        if result_payload.get("code") == "IDEMPOTENCY_KEY_REUSED":
+            raise ProtocolError("IDEMPOTENCY_KEY_REUSED", "idempotency key was reused")
+        result = self._envelope(
+            "command.result",
+            dict(result_payload),
+            envelope.command_id,
+            execution_epoch=envelope.execution_epoch,
+            request_hash=envelope.request_hash,
+        )
+        result["idempotency_key"] = envelope.idempotency_key
+        self._results[envelope.command_id or ""] = (
+            envelope.idempotency_key, envelope.request_hash or "", result,
+        )
+        self._idempotency[envelope.idempotency_key] = (
+            envelope.command_id or "", envelope.request_hash or "", result,
+        )
         return result
 
     def _read_only_response(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
