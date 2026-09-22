@@ -10,7 +10,8 @@ from .dispatcher import Dispatcher
 from .journal import JournalError, SQLiteJournal
 from .models import Identity
 from .preflight import PreflightError, require_preflight, verify_preflight
-from .secrets import SecretProviderError, secret_provider_from_ref
+from .secrets import (SecretProviderError, is_protected_secret_provider,
+                      secret_provider_from_ref)
 from .websocket_client import ConnectorClient
 
 
@@ -26,12 +27,14 @@ def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
             secret_provider = secret_provider_from_ref(config.secret_ref)
     except SecretProviderError as exc:
         raise RuntimeErrorSafe(str(exc)) from exc
+    except (OSError, ValueError, ImportError, AttributeError, TypeError, RuntimeError) as exc:
+        raise RuntimeErrorSafe("SECRET_UNAVAILABLE") from exc
     if not callable(secret_provider):
         raise RuntimeErrorSafe("SECRET_PROVIDER_REQUIRED")
     # ``local_test`` is the existing fake transport/adaptor seam. It never
     # represents a deployable command session. Production command sessions
     # must come from a provider created by a protected store reference.
-    if execution_enabled and not config.local_test and not getattr(secret_provider, "securely_verified", False):
+    if execution_enabled and not config.local_test and not is_protected_secret_provider(secret_provider):
         raise RuntimeErrorSafe("PROTECTED_SECRET_REQUIRED")
     if execution_enabled:
         try:

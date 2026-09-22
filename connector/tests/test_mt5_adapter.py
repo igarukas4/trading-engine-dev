@@ -156,6 +156,56 @@ class MT5AdapterTests(unittest.TestCase):
         self.assertEqual(result["state"], "ACCEPTED")
         self.assertTrue(result["readback_confirmed"])
 
+    def test_multiple_plausible_market_readbacks_stay_unknown(self):
+        class Module:
+            TRADE_ACTION_DEAL = 1
+            ORDER_TYPE_BUY = 0
+            ORDER_TYPE_SELL = 1
+            ORDER_TIME_GTC = 0
+            ORDER_FILLING_IOC = 1
+
+            def account_info(self):
+                return type("Account", (), {"login": 42, "server": "Demo",
+                                            "trade_allowed": True})()
+
+            def symbol_info(self, symbol):
+                return type("Symbol", (), {
+                    "visible": True, "digits": 5, "point": 0.00001,
+                    "volume_min": 0.01, "volume_max": 10, "volume_step": 0.01,
+                    "trade_stops_level": 0, "trade_freeze_level": 0,
+                    "filling_mode": 0, "trade_allowed": True,
+                })()
+
+            def symbol_info_tick(self, symbol):
+                return type("Tick", (), {"ask": 1.10002, "bid": 1.1})()
+
+            def order_send(self, request):
+                return {"retcode": 10009, "order": 101}
+
+            def orders_get(self):
+                return []
+
+            def history_orders_get(self, start, end):
+                return [
+                    {"ticket": 101, "status": "FILLED", "comment": "corr"},
+                    {"ticket": 202, "status": "FILLED", "comment": "corr"},
+                ]
+
+            def history_deals_get(self, start, end):
+                return []
+
+            def positions_get(self):
+                return []
+
+        adapter = OfficialMT5Adapter(Identity("MT5", "Demo", "42"), "a1")
+        adapter._mt5 = Module()
+        result = adapter.submit_market({
+            "symbol": "EURUSD", "side": "BUY", "volume": "0.01",
+            "sl": "1.09", "tp": "1.11", "comment": "corr",
+        })
+        self.assertEqual(result["state"], "UNKNOWN")
+        self.assertEqual(result["code"], "EFFECT_READBACK_REQUIRED")
+
     def test_accepted_close_without_deal_volume_stays_unknown(self):
         class Module:
             TRADE_ACTION_DEAL = 1

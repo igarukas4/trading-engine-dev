@@ -473,6 +473,36 @@ class OfficialMT5Adapter:
         if not matches:
             return None
 
+        # One broker effect can appear in several overlapping collections,
+        # such as an order row and its linked deal row. Coalesce only rows
+        # joined by a durable broker identifier. Distinct candidate clusters
+        # are ambiguous, even when each candidate looks individually valid.
+        clusters: list[dict[str, Any]] = []
+        for match in matches:
+            match_ids = {
+                str(match.get(name))
+                for name in ("ticket", "order", "deal", "position",
+                             "order_id", "deal_id", "position_id")
+                if match.get(name) is not None
+            }
+            overlapping = [
+                cluster for cluster in clusters
+                if match_ids.intersection(cluster["ids"])
+            ]
+            if not overlapping:
+                clusters.append({"ids": set(match_ids), "rows": [match]})
+                continue
+            primary = overlapping[0]
+            primary["rows"].append(match)
+            primary["ids"].update(match_ids)
+            for duplicate in overlapping[1:]:
+                primary["rows"].extend(duplicate["rows"])
+                primary["ids"].update(duplicate["ids"])
+                clusters.remove(duplicate)
+        if len(clusters) != 1:
+            return None
+        matches = clusters[0]["rows"]
+
         evidence: dict[str, Any] = {"readback_confirmed": True}
         for source, target in (("order", "external_order_id"), ("deal", "external_deal_id")):
             value = result.get(source)

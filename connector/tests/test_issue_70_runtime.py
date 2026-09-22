@@ -168,6 +168,32 @@ class Issue70RuntimeTests(unittest.TestCase):
                 run_runtime(config, lambda: "opaque", adapter=FakeAdapter(),
                             transport=FakeTransport([]), preflight=True)
 
+    def test_mutable_provider_marker_cannot_authorize_production(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.config(Path(tmp) / "journal.sqlite", local_test=False)
+            provider = lambda: "opaque"
+            provider.securely_verified = True
+            with self.assertRaisesRegex(RuntimeErrorSafe, "^PROTECTED_SECRET_REQUIRED$"):
+                run_runtime(config, provider, adapter=FakeAdapter(),
+                            transport=FakeTransport([]), preflight=True)
+
+    def test_protected_provider_is_immutable_and_uses_store_type(self):
+        provider = secret_provider_from_ref("credential-manager://mt5-test")
+        self.assertTrue(getattr(provider, "credential_manager_provider", False))
+        with self.assertRaises(AttributeError):
+            provider.securely_verified = False
+
+    def test_secret_load_failure_is_not_reported_as_journal_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self.config(Path(tmp) / "journal.sqlite")
+
+            def unavailable():
+                raise OSError("SECRET_MARKER")
+
+            with self.assertRaisesRegex(RuntimeErrorSafe, "^SECRET_UNAVAILABLE$"):
+                run_runtime(config, unavailable, adapter=FakeAdapter(),
+                            transport=FakeTransport([]), preflight=True)
+
     @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
     def test_secure_file_provider_reads_protected_file(self):
         with tempfile.TemporaryDirectory() as tmp:

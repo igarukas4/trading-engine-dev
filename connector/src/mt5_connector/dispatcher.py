@@ -106,7 +106,10 @@ class Dispatcher:
             if error:
                 return self._finish(command_id, "REJECTED", error)
             try:
-                self.journal.transition(command_id, state="INVOKING", phase="CHECKING")
+                # Keep the journal pre-invocation until the broker check has
+                # passed. A crash during order_check must recover as
+                # NOT_INVOKED_AFTER_RESTART.
+                self.journal.transition(command_id, phase="CHECKING")
                 checked = self._check(typ, payload)
             except Exception:
                 return self._finish(command_id, "REJECTED", "ADAPTER_CHECK_ERROR")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import errno
+import ntpath
 import os
 import stat
 from pathlib import Path
@@ -10,6 +11,52 @@ from urllib.parse import unquote, urlparse
 
 class SecretProviderError(RuntimeError):
     """Stable errors that never contain a secret or filesystem detail."""
+
+
+_PROVIDER_TOKEN = object()
+
+
+class _ProtectedSecretProvider:
+    """Callable created only by a protected-store factory."""
+
+    __slots__ = ("_loader", "_kind")
+
+    def __init__(self, token, loader, kind: str):
+        if token is not _PROVIDER_TOKEN:
+            raise TypeError("protected provider must come from its factory")
+        object.__setattr__(self, "_loader", loader)
+        object.__setattr__(self, "_kind", kind)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("protected provider is immutable")
+
+    def __call__(self) -> str:
+        try:
+            value = self._loader()
+        except SecretProviderError:
+            raise
+        except Exception as exc:
+            raise SecretProviderError("SECRET_UNAVAILABLE") from exc
+        if not isinstance(value, str) or not value.strip():
+            raise SecretProviderError("SECRET_UNAVAILABLE")
+        return value
+
+    @property
+    def securely_verified(self) -> bool:
+        return True
+
+    @property
+    def protected_file_provider(self) -> bool:
+        return self._kind == "file"
+
+    @property
+    def credential_manager_provider(self) -> bool:
+        return self._kind == "credential-manager"
+
+
+def is_protected_secret_provider(value) -> bool:
+    """Return whether a provider came from a protected secret-store factory."""
+    return isinstance(value, _ProtectedSecretProvider)
 
 
 def _read_posix_secret(path: Path) -> str:
@@ -79,8 +126,31 @@ def _read_posix_secret(path: Path) -> str:
                 pass
 
 
-def _read_windows_secret(path: str) -> str:
-    """Read a regular, ACL-restricted Windows file from one non-reparse handle."""
+def _windows_path_prefixes(path: str) -> tuple[list[str], str]:
+    """Split an absolute Windows path into prefixes and its final component."""
+    normalized = ntpath.normpath(path)
+    drive, tail = ntpath.splitdrive(normalized)
+    if not drive or not tail.startswith("\\"):
+        raise SecretProviderError("SECRET_FILE_MUST_BE_ABSOLUTE")
+    parts = [part for part in tail.split("\\") if part]
+    if not parts:
+        raise SecretProviderError("SECRET_FILE_UNSAFE")
+    if drive.startswith("\\\\"):
+        server_share = drive.rstrip("\\")
+        root = server_share + "\\"
+    else:
+        root = drive.rstrip("\\") + "\\"
+    prefixes = [root]
+    for part in parts[:-1]:
+        if part in {".", ".."}:
+            raise SecretProviderError("SECRET_FILE_UNSAFE")
+        prefixes.append(ntpath.join(prefixes[-1], part))
+    final = ntpath.join(prefixes[-1], parts[-1])
+    return prefixes, final
+
+
+def _read_windows_secret_unchecked(path: str) -> str:
+    """Read an ACL-restricted file after checking every parent component."""
     import ctypes
     from ctypes import wintypes
 
@@ -89,8 +159,13 @@ def _read_windows_secret(path: str) -> str:
     HANDLE = wintypes.HANDLE
     INVALID_HANDLE_VALUE = HANDLE(-1).value
     GENERIC_READ = 0x80000000
+    FILE_READ_ATTRIBUTES = 0x00000080
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
     OPEN_EXISTING = 3
     FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     FILE_ATTRIBUTE_DIRECTORY = 0x00000010
     SE_FILE_OBJECT = 1
@@ -157,17 +232,54 @@ def _read_windows_secret(path: str) -> str:
     kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
     kernel32.LocalFree.restype = wintypes.HLOCAL
 
-    handle = kernel32.CreateFileW(
-        path,
-        GENERIC_READ,
-        0,  # no sharing: a rename/delete cannot race this opened object
-        None,
-        OPEN_EXISTING,
-        FILE_FLAG_OPEN_REPARSE_POINT,
-        None,
-    )
+    try:
+        parents, final_path = _windows_path_prefixes(path)
+    except SecretProviderError:
+        raise
+
+    # OPEN_REPARSE_POINT applies only to the final component of one call.
+    # Validate every parent with a separate handle before opening the file.
+    # A junction in any existing component therefore fails closed instead of
+    # redirecting the final CreateFileW call outside the configured tree.
+    parent_handles = []
+    try:
+        for parent in parents:
+            handle = kernel32.CreateFileW(
+                parent,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+            handle_value = getattr(handle, "value", handle)
+            if not handle or handle_value in (INVALID_HANDLE_VALUE, -1):
+                raise SecretProviderError("SECRET_UNAVAILABLE")
+            parent_handles.append(handle)
+            info = FileInformation()
+            if (not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)) or
+                    not info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY or
+                    info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT):
+                raise SecretProviderError("SECRET_FILE_UNSAFE")
+
+        handle = kernel32.CreateFileW(
+            final_path,
+            GENERIC_READ,
+            0,  # no sharing: a rename/delete cannot race this opened object
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    finally:
+        for parent_handle in reversed(parent_handles):
+            try:
+                kernel32.CloseHandle(parent_handle)
+            except Exception:
+                pass
     handle_value = getattr(handle, "value", handle)
-    if not handle or handle_value == INVALID_HANDLE_VALUE:
+    if not handle or handle_value in (INVALID_HANDLE_VALUE, -1):
         raise SecretProviderError("SECRET_UNAVAILABLE")
     security_descriptor = wintypes.LPVOID()
     try:
@@ -209,8 +321,11 @@ def _read_windows_secret(path: str) -> str:
             if not advapi32.GetAce(dacl, index, ctypes.byref(ace)) or not ace:
                 raise SecretProviderError("SECRET_FILE_ACL_UNAVAILABLE")
             header = ctypes.cast(ace, ctypes.POINTER(AceHeader)).contents
+            # The parser intentionally understands only basic allow/deny ACEs.
+            # Object, callback, compound, and other variants can carry access
+            # semantics this small parser cannot prove safe.
             if header.AceType not in (ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE):
-                continue
+                raise SecretProviderError("SECRET_FILE_UNSAFE")
             sid = ctypes.c_void_p(ace.value + ctypes.sizeof(AceHeader) + ctypes.sizeof(wintypes.DWORD))
             sid_text = wintypes.LPWSTR()
             if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
@@ -240,12 +355,31 @@ def _read_windows_secret(path: str) -> str:
     finally:
         if security_descriptor:
             kernel32.LocalFree(security_descriptor)
-        kernel32.CloseHandle(handle)
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _read_windows_secret(path: str) -> str:
+    try:
+        return _read_windows_secret_unchecked(path)
+    except SecretProviderError:
+        raise
+    except (OSError, ValueError, ImportError, AttributeError, TypeError) as exc:
+        raise SecretProviderError("SECRET_UNAVAILABLE") from exc
+    except Exception as exc:
+        # ctypes can surface platform-specific exceptions that do not share a
+        # stable public type. Never expose those details to the runtime.
+        raise SecretProviderError("SECRET_UNAVAILABLE") from exc
 
 
 def protected_file_secret_provider(path: str):
     """Return a provider that verifies and reads one protected file handle."""
-    candidate = Path(path).expanduser()
+    try:
+        candidate = Path(path).expanduser()
+    except (TypeError, ValueError) as exc:
+        raise SecretProviderError("SECRET_REFERENCE_INVALID") from exc
     if not candidate.is_absolute():
         raise SecretProviderError("SECRET_FILE_MUST_BE_ABSOLUTE")
 
@@ -254,9 +388,7 @@ def protected_file_secret_provider(path: str):
             return _read_windows_secret(str(candidate))
         return _read_posix_secret(candidate)
 
-    load.securely_verified = True
-    load.protected_file_provider = True
-    return load
+    return _ProtectedSecretProvider(_PROVIDER_TOKEN, load, "file")
 
 
 def _file_path_from_ref(parsed) -> str:
@@ -271,28 +403,75 @@ def _file_path_from_ref(parsed) -> str:
     return path
 
 
+def _read_windows_credential(target: str) -> str:
+    """Read one generic credential through the native Windows API."""
+    if os.name != "nt":
+        raise SecretProviderError("SECRET_UNAVAILABLE")
+    import ctypes
+    from ctypes import wintypes
+
+    class Credential(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                   wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(Credential))]
+    advapi32.CredReadW.restype = wintypes.BOOL
+    advapi32.CredFree.argtypes = [ctypes.c_void_p]
+    advapi32.CredFree.restype = None
+    credential = ctypes.POINTER(Credential)()
+    CRED_TYPE_GENERIC = 1
+    if not advapi32.CredReadW(target, CRED_TYPE_GENERIC, 0, ctypes.byref(credential)):
+        raise SecretProviderError("SECRET_UNAVAILABLE")
+    try:
+        item = credential.contents
+        if not item.CredentialBlob or not item.CredentialBlobSize:
+            raise SecretProviderError("SECRET_UNAVAILABLE")
+        raw = ctypes.string_at(item.CredentialBlob, item.CredentialBlobSize)
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeError as exc:
+            raise SecretProviderError("SECRET_UNAVAILABLE") from exc
+        if not value:
+            raise SecretProviderError("SECRET_UNAVAILABLE")
+        return value
+    finally:
+        try:
+            advapi32.CredFree(credential)
+        except Exception:
+            pass
+
+
 def secret_provider_from_ref(secret_ref: str):
     """Build a securely verified provider for the configured protected store."""
-    parsed = urlparse(secret_ref)
+    try:
+        parsed = urlparse(secret_ref)
+    except (TypeError, ValueError) as exc:
+        raise SecretProviderError("SECRET_REFERENCE_INVALID") from exc
     scheme = parsed.scheme.lower()
     if scheme == "file":
         return protected_file_secret_provider(_file_path_from_ref(parsed))
     if scheme == "credential-manager":
-        target = parsed.netloc or parsed.path.lstrip("/")
+        target = unquote(parsed.netloc or parsed.path.lstrip("/"))
         if not target:
             raise SecretProviderError("SECRET_REFERENCE_INVALID")
 
-        def load() -> str:
-            try:
-                import keyring
-                value = keyring.get_password("mt5-connector", target)
-            except Exception as exc:
-                raise SecretProviderError("SECRET_UNAVAILABLE") from exc
-            if not value:
-                raise SecretProviderError("SECRET_UNAVAILABLE")
-            return value
-
-        load.securely_verified = True
-        load.credential_manager_provider = True
-        return load
+        return _ProtectedSecretProvider(
+            _PROVIDER_TOKEN,
+            lambda: _read_windows_credential(target),
+            "credential-manager",
+        )
     raise SecretProviderError("SECRET_REFERENCE_UNSUPPORTED")

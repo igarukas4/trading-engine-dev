@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from .config import ConnectorConfig
 from .protocol import ConnectorProtocol, ProtocolError
+from .secrets import SecretProviderError
 
 
 class TransportError(RuntimeError):
@@ -137,7 +138,13 @@ class ConnectorClient:
             raise TypeError("secret_provider callback is required")
         for attempt in range(max_attempts):
             try:
-                return await self.connect_once(secret_provider(), max_messages=max_messages)
+                try:
+                    secret = secret_provider()
+                except SecretProviderError:
+                    raise
+                except (OSError, ValueError, ImportError, AttributeError, TypeError) as exc:
+                    raise SecretProviderError("SECRET_UNAVAILABLE") from exc
+                return await self.connect_once(secret, max_messages=max_messages)
             except (OSError, TransportError, ProtocolError):
                 if attempt + 1 >= max_attempts:
                     raise
