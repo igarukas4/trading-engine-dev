@@ -149,6 +149,24 @@ class OutboxEvent:
 
 
 @dataclass
+class ConnectorDispatchRecord:
+    """Durable backend-to-connector delivery attempt."""
+
+    command_id: str
+    account_id: str
+    identity: dict[str, str]
+    command_type: str
+    dispatch_sequence: int
+    generation: int
+    execution_epoch: int
+    idempotency_key: str
+    request_hash: str
+    payload: dict[str, Any]
+    result_payload: dict[str, Any] | None = None
+    state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN"] = "QUEUED"
+
+
+@dataclass
 class ConnectorJournalEntry:
     id: str
     account_id: str
@@ -448,6 +466,7 @@ class ExecutionSubstrate:
         self.reservations: dict[str, RiskReservation] = {}
         self.orders: dict[str, OrderIntent] = {}
         self.events: dict[str, OutboxEvent] = {}
+        self.dispatch_records: dict[str, ConnectorDispatchRecord] = {}
         self.journal: dict[str, ConnectorJournalEntry] = {}
         self.fills: dict[str, Fill] = {}
         self.positions: dict[tuple[str, str], Position] = {}
@@ -2307,6 +2326,9 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 },
                 "orders": {key: value.__dict__ for key, value in self.orders.items()},
                 "events": {key: value.__dict__ for key, value in self.events.items()},
+                "dispatch_records": {
+                    key: value.__dict__ for key, value in self.dispatch_records.items()
+                },
                 "journal": {
                     key: value.__dict__ for key, value in self.journal.items()
                 },
@@ -2388,6 +2410,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self.orders[key] = OrderIntent(**value)
         for key, value in state.get("events", {}).items():
             self.events[key] = OutboxEvent(**value)
+        for key, value in state.get("dispatch_records", {}).items():
+            self.dispatch_records[key] = ConnectorDispatchRecord(**value)
         for key, value in state.get("journal", {}).items():
             value["observed_at"] = _state_datetime(value["observed_at"])
             self.journal[key] = ConnectorJournalEntry(**value)
@@ -2879,6 +2903,122 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def schedule_automated_signal(self, **kwargs: Any) -> PreOrderResult:
         with self._mutation():
             return super().schedule_automated_signal(**kwargs)
+
+    def prepare_connector_dispatch(
+        self,
+        account_id: str,
+        order_id: str,
+        *,
+        identity: dict[str, str],
+        generation: int,
+    ) -> ConnectorDispatchRecord:
+        """Create the durable delivery row after the execution intent commits."""
+        with self._mutation(), self._lock_for(account_id):
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            if set(identity) != {"provider", "broker_server", "external_account_id"}:
+                raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+            command_id = order.command_id or order.id
+            existing = self.dispatch_records.get(command_id)
+            if existing is not None:
+                if (
+                    existing.account_id != account_id
+                    or existing.idempotency_key != order.idempotency_key
+                    or existing.request_hash != order.canonical_hash
+                ):
+                    raise ExecutionError("COMMAND_CONTEXT_MISMATCH")
+                return existing
+            record = ConnectorDispatchRecord(
+                command_id=command_id,
+                account_id=account_id,
+                identity=dict(identity),
+                command_type="order.submit_market",
+                dispatch_sequence=order.dispatch_sequence,
+                generation=generation,
+                execution_epoch=order.execution_epoch,
+                idempotency_key=order.idempotency_key,
+                request_hash=order.canonical_hash,
+                payload=json.loads(json.dumps(order.payload)),
+            )
+            self.dispatch_records[command_id] = record
+            self._audit(account_id, "execution.dispatch.queued", command_id=command_id)
+            return record
+
+    def connector_dispatch_result(
+        self,
+        account_id: str,
+        command_id: str,
+        state: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> ConnectorDispatchRecord:
+        """Persist a validated connector result before transport acknowledgement."""
+        with self._mutation(), self._lock_for(account_id):
+            record = self.dispatch_records.get(command_id)
+            if record is None or record.account_id != account_id:
+                raise ExecutionError("UNKNOWN_COMMAND")
+            if state not in {"ACCEPTED", "REJECTED", "UNKNOWN"}:
+                raise ExecutionError("INVALID_COMMAND_RESULT")
+            if record.state in {"ACCEPTED", "REJECTED", "UNKNOWN"}:
+                if record.state == state:
+                    return record
+                raise ExecutionError("STALE_COMMAND_RESULT")
+            record.state = state
+            record.result_payload = dict(payload or {})
+            order = self.orders.get(next(
+                (item.id for item in self.orders.values() if item.command_id == command_id),
+                command_id,
+            ))
+            if order is not None and order.account_id == account_id:
+                if state == "ACCEPTED":
+                    order.status = "SUBMITTED"
+                    self._event_for(order.id).status = "PUBLISHED"
+                    journal = self.journal.get(order.id)
+                    if journal is not None:
+                        journal.state = "ACCEPTED"
+                        journal.external_id = str((payload or {}).get("external_id")) if (payload or {}).get("external_id") is not None else None
+                elif state == "REJECTED":
+                    order.status = "REJECTED"
+                    self._event_for(order.id).status = "ABORTED"
+                    self._reservation_for(order.id).status = "RELEASED"
+                    journal = self.journal.get(order.id)
+                    if journal is not None:
+                        journal.state = "REJECTED"
+                else:
+                    order.status = "UNKNOWN"
+                    self._record_unknown(account_id, order.id)
+            self._audit(account_id, "execution.dispatch.result", command_id=command_id, state=state)
+            return record
+
+    def pending_connector_dispatches(self, account_id: str) -> tuple[ConnectorDispatchRecord, ...]:
+        with self._lock_for(account_id):
+            return tuple(sorted(
+                (item for item in self.dispatch_records.values()
+                 if item.account_id == account_id and item.state == "QUEUED"),
+                key=lambda item: item.dispatch_sequence,
+            ))
+
+    def mark_connector_dispatch_sent(self, account_id: str, command_id: str) -> ConnectorDispatchRecord:
+        with self._mutation(), self._lock_for(account_id):
+            record = self.dispatch_records.get(command_id)
+            if record is None or record.account_id != account_id:
+                raise ExecutionError("UNKNOWN_COMMAND")
+            if record.state == "QUEUED":
+                record.state = "SENT"
+            elif record.state != "SENT":
+                raise ExecutionError("INVALID_PENDING_COMMAND")
+            return record
+
+    def mark_connector_session_lost(self, account_id: str) -> tuple[ConnectorDispatchRecord, ...]:
+        """Fence sent commands after disconnect; never replay an ambiguous send."""
+        with self._mutation(), self._lock_for(account_id):
+            changed: list[ConnectorDispatchRecord] = []
+            for record in self.dispatch_records.values():
+                if record.account_id == account_id and record.state == "SENT":
+                    self.connector_dispatch_result(account_id, record.command_id, "UNKNOWN", payload={"reason": "SESSION_LOST"})
+                    changed.append(record)
+            return tuple(changed)
 
     def dispatch_next(self, account_id: str, connector: BrokerAdapter) -> DispatchResult:
         with self._mutation():

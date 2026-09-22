@@ -182,6 +182,71 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
                 dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1",
             )
         self.assertIsNone(registry.pending_state("a", "c1"))
+    async def test_bridge_projects_result_and_keeps_accounts_isolated(self):
+        from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
+        from backend.app.connector_delivery import ConnectorDeliveryBridge
+
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        for account_id, suffix in (("a", "1"), ("b", "2")):
+            order_id = "order-" + suffix
+            command_id = "command-" + suffix
+            coordinator.orders[order_id] = OrderIntent(
+                order_id, account_id, "signal-" + suffix, "idem-" + suffix,
+                "hash-" + suffix, 1, 1, {"symbol": "EURUSD"}, command_id=command_id,
+            )
+            reservation_id = "reservation-" + suffix
+            coordinator.reservations[reservation_id] = RiskReservation(
+                reservation_id, account_id, "signal-" + suffix,
+            )
+            coordinator._order_reservations[order_id] = reservation_id
+            coordinator.events["event-" + suffix] = OutboxEvent(
+                "event-" + suffix, account_id, order_id, 1,
+            )
+
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        for account_id, suffix in (("a", "1"), ("b", "2")):
+            await registry.open_session(account_id, 1, "session-" + suffix, identity=identity, execution_epoch=1)
+            await bridge.enqueue_order(
+                account_id, "order-" + suffix, identity=identity, generation=1,
+            )
+
+        first = await registry.next_for_session("a", "session-1")
+        await bridge.mark_sent("a", first.command_id, "session-1")
+        result = {
+            **first.as_message(), "type": "command.result", "message_id": "result-a",
+            "sequence": 1, "payload": {"state": "UNKNOWN"},
+        }
+        await bridge.record_result(result, authenticated_account_id="a", session_id="session-1")
+        self.assertEqual(coordinator.orders["order-1"].status, "UNKNOWN")
+        self.assertEqual(coordinator.orders["order-2"].status, "INTENT")
+        self.assertEqual(coordinator.runtime_interlock("a").status, "BLOCKED")
+        self.assertEqual(coordinator.runtime_interlock("b").status, "ELIGIBLE")
+
+    async def test_bridge_restart_replays_only_queued_records(self):
+        from tempfile import TemporaryDirectory
+        from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
+        from backend.app.connector_delivery import ConnectorDeliveryBridge
+
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        with TemporaryDirectory() as directory:
+            coordinator = ExecutionCoordinator(state_path=directory + "/execution.json")
+            coordinator.orders["order"] = OrderIntent(
+                "order", "a", "signal", "idem", "hash", 1, 1,
+                {"symbol": "EURUSD"}, command_id="command",
+            )
+            coordinator.reservations["reservation"] = RiskReservation("reservation", "a", "signal")
+            coordinator._order_reservations["order"] = "reservation"
+            coordinator.events["event"] = OutboxEvent("event", "a", "order", 1)
+            record = coordinator.prepare_connector_dispatch(
+                "a", "order", identity=identity, generation=1,
+            )
+            restarted = ExecutionCoordinator(state_path=directory + "/execution.json")
+            registry = ConnectorDeliveryRegistry()
+            await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+            delivered = await ConnectorDeliveryBridge(restarted, registry).replay_unsent("a")
+            self.assertEqual([item.command_id for item in delivered], [record.command_id])
 
 
 if __name__ == "__main__":

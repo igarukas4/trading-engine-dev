@@ -454,4 +454,96 @@ class ConnectorDeliveryRegistry:
         return item.state if item else None
 
 
+class ConnectorDeliveryBridge:
+    """Connect durable Execution Coordination records to the WSS registry."""
+
+    def __init__(self, coordinator: Any, registry: ConnectorDeliveryRegistry | None = None) -> None:
+        self.coordinator = coordinator
+        self.registry = registry or ConnectorDeliveryRegistry()
+
+    async def enqueue_order(
+        self,
+        account_id: str,
+        order_id: str,
+        *,
+        identity: dict[str, str],
+        generation: int,
+    ) -> Any:
+        record = self.coordinator.prepare_connector_dispatch(
+            account_id, order_id, identity=identity, generation=generation,
+        )
+        try:
+            await self.registry.enqueue(
+                account_id=record.account_id,
+                identity=record.identity,
+                connector_generation=record.generation,
+                dispatch_sequence=record.dispatch_sequence,
+                execution_epoch=record.execution_epoch,
+                command_id=record.command_id,
+                idempotency_key=record.idempotency_key,
+                request_hash=record.request_hash,
+                type=record.command_type,
+                payload=record.payload,
+            )
+        except DeliveryError as error:
+            if error.code not in {"SESSION_NOT_ACTIVE", "RECONCILIATION_REQUIRED", "DUPLICATE_PENDING_COMMAND"}:
+                raise
+        return record
+
+    async def replay_unsent(self, account_id: str) -> tuple[Any, ...]:
+        """Replay only durable QUEUED records; SENT/UNKNOWN are reconciliation work."""
+        delivered: list[Any] = []
+        for record in self.coordinator.pending_connector_dispatches(account_id):
+            try:
+                envelope = await self.registry.enqueue(
+                    account_id=record.account_id,
+                    identity=record.identity,
+                    connector_generation=record.generation,
+                    dispatch_sequence=record.dispatch_sequence,
+                    execution_epoch=record.execution_epoch,
+                    command_id=record.command_id,
+                    idempotency_key=record.idempotency_key,
+                    request_hash=record.request_hash,
+                    type=record.command_type,
+                    payload=record.payload,
+                )
+            except DeliveryError as error:
+                if error.code in {"DUPLICATE_PENDING_COMMAND", "SESSION_NOT_ACTIVE", "RECONCILIATION_REQUIRED"}:
+                    continue
+                raise
+            delivered.append(envelope)
+        return tuple(delivered)
+
+    async def mark_sent(self, account_id: str, command_id: str, session_id: str) -> Any:
+        envelope = await self.registry.mark_sent(account_id, command_id, session_id)
+        self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
+        return envelope
+
+    def session_lost(self, account_id: str) -> tuple[Any, ...]:
+        return self.coordinator.mark_connector_session_lost(account_id)
+
+    async def record_result(
+        self,
+        message: dict[str, Any],
+        *,
+        authenticated_account_id: str,
+        session_id: str,
+    ) -> str:
+        result = await self.registry.record_result(
+            message,
+            authenticated_account_id=authenticated_account_id,
+            session_id=session_id,
+        )
+        try:
+            self.coordinator.connector_dispatch_result(
+                authenticated_account_id,
+                message["command_id"],
+                result,
+                payload=message.get("payload"),
+            )
+        except Exception as error:
+            raise DeliveryError(getattr(error, "code", "PROJECTION_FAILED")) from error
+        return result
+
+
 connector_delivery = ConnectorDeliveryRegistry()

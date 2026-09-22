@@ -43,7 +43,12 @@ from .execution import (
     canonical_order_hash,
 )
 from .dashboard import audit_hub, dashboard_hub
-from .connector_delivery import DeliveryError, connector_delivery, validate_hello
+from .connector_delivery import (
+    ConnectorDeliveryBridge,
+    DeliveryError,
+    connector_delivery,
+    validate_hello,
+)
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
 execution = ExecutionCoordinator(database_url=settings.database_url or None)
+connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
@@ -1529,6 +1535,20 @@ def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str,
             order_payload=payload,
             account_ready=account.lifecycle_status == "ENABLED" and account.can_enable,
         )
+    if (
+        scheduled.order.id in execution.orders
+        and execution.orders[scheduled.order.id].account_id == account.id
+    ):
+        execution.prepare_connector_dispatch(
+            account.id,
+            scheduled.order.id,
+            identity={
+                "provider": account.provider,
+                "broker_server": account.broker_server,
+                "external_account_id": account.external_account_id,
+            },
+            generation=account.connector_generation,
+        )
     _audit(
         account.id, "execution.full_auto.scheduled", "eligible Signal scheduled",
         {"signal_id": signal.id, "order_id": scheduled.order.id},
@@ -1820,6 +1840,16 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
         code = getattr(error, "code", str(error))
         raise HTTPException(status_code=409, detail={"code": code}) from error
     command = _command_for_idempotency(account_id, signal_id, request.idempotency_key)
+    execution.prepare_connector_dispatch(
+        account_id,
+        result.order.id,
+        identity={
+            "provider": account.provider,
+            "broker_server": account.broker_server,
+            "external_account_id": account.external_account_id,
+        },
+        generation=account.connector_generation,
+    )
     return _accepted_command_response(account_id, command, order=result.order.__dict__)
 
 
@@ -2160,7 +2190,7 @@ async def connector_stream(websocket: WebSocket) -> None:
         async def deliver() -> None:
             while True:
                 envelope = await connector_delivery.next_for_session(account.id, hello["session_id"])
-                await connector_delivery.mark_sent(account.id, envelope.command_id, hello["session_id"])
+                await connector_bridge.mark_sent(account.id, envelope.command_id, hello["session_id"])
                 await outbound.put((envelope.sequence, envelope.as_message()))
 
         writer = asyncio.create_task(send_ordered())
@@ -2234,13 +2264,14 @@ async def connector_stream(websocket: WebSocket) -> None:
                         observation, recovery, from_server_time,
                     ):
                         await connector_delivery.mark_reconciled(account.id, hello["session_id"])
+                        await connector_bridge.replay_unsent(account.id)
                     await queue_control("reconciliation_observed", {
                         "status": result.status,
                         "recovery": execution.recovery_records(account.id),
                     })
                 elif message.get("type") == "command.result":
                     try:
-                        result = await connector_delivery.record_result(
+                        result = await connector_bridge.record_result(
                             message,
                             authenticated_account_id=account.id,
                             session_id=hello["session_id"],
@@ -2270,6 +2301,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 await sender
             with suppress(asyncio.CancelledError):
                 await writer
+            connector_bridge.session_lost(account.id)
             await connector_delivery.close_session(account.id, hello["session_id"])
     except WebSocketDisconnect as error:
         if bound_account is not None and error.code not in {1000, 1001}:
