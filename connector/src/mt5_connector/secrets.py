@@ -149,13 +149,16 @@ def _windows_path_prefixes(path: str) -> tuple[list[str], str]:
     return prefixes, final
 
 
-def _read_windows_secret_unchecked(path: str) -> str:
+def _read_windows_secret_unchecked(path: str, *, windows_api=None) -> str:
     """Read an ACL-restricted file after checking every parent component."""
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    if windows_api is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    else:
+        kernel32, advapi32 = windows_api
     HANDLE = wintypes.HANDLE
     INVALID_HANDLE_VALUE = HANDLE(-1).value
     GENERIC_READ = 0x80000000
@@ -163,6 +166,7 @@ def _read_windows_secret_unchecked(path: str) -> str:
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
     FILE_SHARE_DELETE = 0x00000004
+    FILE_TYPE_DISK = 0x0001
     OPEN_EXISTING = 3
     FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
     FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -212,6 +216,8 @@ def _read_windows_secret_unchecked(path: str) -> str:
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.GetFileInformationByHandle.argtypes = [HANDLE, ctypes.POINTER(FileInformation)]
     kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileType.argtypes = [HANDLE]
+    kernel32.GetFileType.restype = wintypes.DWORD
     kernel32.ReadFile.argtypes = [HANDLE, wintypes.LPVOID, wintypes.DWORD,
                                   ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
     kernel32.ReadFile.restype = wintypes.BOOL
@@ -242,12 +248,15 @@ def _read_windows_secret_unchecked(path: str) -> str:
     # A junction in any existing component therefore fails closed instead of
     # redirecting the final CreateFileW call outside the configured tree.
     parent_handles = []
+    handle = None
     try:
         for parent in parents:
             handle = kernel32.CreateFileW(
                 parent,
                 FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                # Keep the directory identity pinned through final open/read.
+                # Read/write sharing remains allowed for normal consumers.
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
@@ -272,17 +281,20 @@ def _read_windows_secret_unchecked(path: str) -> str:
             FILE_FLAG_OPEN_REPARSE_POINT,
             None,
         )
-    finally:
+    except BaseException:
         for parent_handle in reversed(parent_handles):
             try:
                 kernel32.CloseHandle(parent_handle)
             except Exception:
                 pass
+        raise
     handle_value = getattr(handle, "value", handle)
-    if not handle or handle_value in (INVALID_HANDLE_VALUE, -1):
-        raise SecretProviderError("SECRET_UNAVAILABLE")
     security_descriptor = wintypes.LPVOID()
     try:
+        if not handle or handle_value in (INVALID_HANDLE_VALUE, -1):
+            raise SecretProviderError("SECRET_UNAVAILABLE")
+        if kernel32.GetFileType(handle) != FILE_TYPE_DISK:
+            raise SecretProviderError("SECRET_FILE_UNSAFE")
         info = FileInformation()
         if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
             raise SecretProviderError("SECRET_UNAVAILABLE")
@@ -355,10 +367,16 @@ def _read_windows_secret_unchecked(path: str) -> str:
     finally:
         if security_descriptor:
             kernel32.LocalFree(security_descriptor)
-        try:
-            kernel32.CloseHandle(handle)
-        except Exception:
-            pass
+        if handle and handle_value not in (INVALID_HANDLE_VALUE, -1):
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+        for parent_handle in reversed(parent_handles):
+            try:
+                kernel32.CloseHandle(parent_handle)
+            except Exception:
+                pass
 
 
 def _read_windows_secret(path: str) -> str:

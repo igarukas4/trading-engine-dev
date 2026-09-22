@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 import os
 from unittest.mock import patch
 from contextlib import redirect_stdout
@@ -36,6 +37,97 @@ class FakeTransport:
 
     async def close(self):
         pass
+
+
+class FakeWindowsSecretApi:
+    """Small injectable Win32 boundary for secret path-resolution tests."""
+
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    FILE_TYPE_DISK = 0x0001
+    FILE_TYPE_PIPE = 0x0003
+    DIRECTORY = 0x00000010
+
+    class _Function:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    def __init__(self, *, final_type=None):
+        self.final_type = final_type or self.FILE_TYPE_DISK
+        self.events = []
+        self.next_handle = 100
+        self.parents = {}
+        self.files = {}
+        self.kernel32 = type("Kernel32", (), {})()
+        self.advapi32 = type("Advapi32", (), {})()
+        self.kernel32.CreateFileW = self._Function(self.create_file)
+        self.kernel32.CloseHandle = self._Function(self.close_handle)
+        self.kernel32.GetFileInformationByHandle = self._Function(self.file_info)
+        self.kernel32.GetFileType = self._Function(self.file_type)
+        self.kernel32.ReadFile = self._Function(self.read_file)
+        self.kernel32.LocalFree = self._Function(lambda value: None)
+        self.advapi32.GetSecurityInfo = self._Function(self.security_info)
+        self.advapi32.GetSecurityDescriptorDacl = self._Function(self.security_dacl)
+        self.advapi32.GetAclInformation = self._Function(self.acl_info)
+        self.advapi32.GetAce = self._Function(lambda *args: False)
+        self.advapi32.ConvertSidToStringSidW = self._Function(lambda *args: False)
+
+    def create_file(self, path, access, share, *_args):
+        self.events.append(("open", path, share))
+        handle = self.next_handle
+        self.next_handle += 1
+        if access == 0x00000080:
+            self.parents[handle] = {"share": share}
+            return handle
+        # A replacement attempted during final path resolution succeeds only
+        # if a parent was opened with delete sharing or has already closed.
+        blocked = bool(self.parents) and all(
+            not item["share"] & self.FILE_SHARE_DELETE
+            for item in self.parents.values()
+        )
+        content = b"original" if blocked else b"replacement"
+        self.files[handle] = {"content": content, "offset": 0}
+        return handle
+
+    def close_handle(self, handle):
+        self.events.append(("close", handle, handle in self.parents))
+        self.parents.pop(handle, None)
+        return True
+
+    def file_info(self, handle, info_ptr):
+        attributes = self.DIRECTORY if handle in self.parents else 0
+        ctypes.cast(info_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = attributes
+        return True
+
+    def file_type(self, handle):
+        return self.final_type if handle in self.files else self.FILE_TYPE_DISK
+
+    def security_info(self, _handle, *_args):
+        descriptor_ptr = _args[-1]
+        ctypes.cast(descriptor_ptr, ctypes.POINTER(ctypes.c_void_p)).contents.value = 1
+        return 0
+
+    def security_dacl(self, _descriptor, present_ptr, dacl_ptr, _defaulted_ptr):
+        ctypes.cast(present_ptr, ctypes.POINTER(ctypes.c_int)).contents.value = 1
+        ctypes.cast(dacl_ptr, ctypes.POINTER(ctypes.c_void_p)).contents.value = 1
+        return True
+
+    def acl_info(self, _dacl, info_ptr, *_args):
+        ctypes.cast(info_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = 0
+        return True
+
+    def read_file(self, handle, buffer, size, read_ptr, _overlapped):
+        item = self.files[handle]
+        payload = item["content"][item["offset"]:item["offset"] + size]
+        item["offset"] += len(payload)
+        if payload:
+            ctypes.memmove(buffer, payload, len(payload))
+        ctypes.cast(read_ptr, ctypes.POINTER(ctypes.c_uint32)).contents.value = len(payload)
+        return True
 
 
 class RegistryWssTransport:
@@ -218,6 +310,40 @@ class Issue70RuntimeTests(unittest.TestCase):
             link.symlink_to(target)
             with self.assertRaisesRegex(SecretProviderError, "^SECRET_FILE_UNSAFE$"):
                 secret_provider_from_ref(link.as_uri())()
+
+    def test_windows_parent_handles_block_resolution_replacement(self):
+        boundary = FakeWindowsSecretApi()
+        value = secrets_module._read_windows_secret_unchecked(
+            r"C:\ProgramData\mt5\secret",
+            windows_api=(boundary.kernel32, boundary.advapi32),
+        )
+        self.assertEqual(value, "original")
+        parent_opens = [
+            event for event in boundary.events
+            if event[0] == "open" and event[2] is not None
+            and event[2] != 0
+        ]
+        self.assertGreaterEqual(len(parent_opens), 2)
+        for _event, _path, share in parent_opens[:-1]:
+            self.assertEqual(share & FakeWindowsSecretApi.FILE_SHARE_DELETE, 0)
+            self.assertEqual(
+                share & (FakeWindowsSecretApi.FILE_SHARE_READ |
+                         FakeWindowsSecretApi.FILE_SHARE_WRITE),
+                FakeWindowsSecretApi.FILE_SHARE_READ |
+                FakeWindowsSecretApi.FILE_SHARE_WRITE,
+            )
+        close_events = [event for event in boundary.events if event[0] == "close"]
+        self.assertGreater(len(close_events), 1)
+        self.assertFalse(close_events[0][2], "final handle must close first")
+        self.assertTrue(all(event[2] for event in close_events[1:]))
+
+    def test_windows_non_disk_handle_is_rejected_as_unsafe(self):
+        boundary = FakeWindowsSecretApi(final_type=FakeWindowsSecretApi.FILE_TYPE_PIPE)
+        with self.assertRaisesRegex(SecretProviderError, "^SECRET_FILE_UNSAFE$"):
+            secrets_module._read_windows_secret_unchecked(
+                r"C:\ProgramData\mt5\secret",
+                windows_api=(boundary.kernel32, boundary.advapi32),
+            )
 
     @unittest.skipUnless(os.name != "nt", "POSIX descriptor checks are covered on POSIX hosts")
     def test_secure_file_provider_reads_same_handle_after_path_replacement(self):
