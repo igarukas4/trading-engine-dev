@@ -2,8 +2,9 @@
 import argparse
 import asyncio
 import json
+import sqlite3
 
-from .adapter import OfficialMT5Adapter
+from .adapter import AdapterError, OfficialMT5Adapter
 from .config import ConnectorConfig
 from .dispatcher import Dispatcher
 from .journal import JournalError, SQLiteJournal
@@ -51,7 +52,10 @@ def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
             raise RuntimeErrorSafe("RECONCILIATION_REQUIRED")
         initialize = getattr(adapter, "initialize", None)
         if callable(initialize):
-            initialized = initialize(config.terminal_path)
+            try:
+                initialized = initialize(config.terminal_path)
+            except AdapterError as exc:
+                raise RuntimeErrorSafe("TERMINAL_UNAVAILABLE") from exc
             if initialized is False:
                 raise RuntimeErrorSafe("TERMINAL_UNAVAILABLE")
         client = None
@@ -73,8 +77,14 @@ def run_runtime(config, secret_provider=None, *, adapter=None, transport=None,
         if preflight_only and not getattr(protocol, "preflight_ready", False):
             raise RuntimeErrorSafe("PREFLIGHT_FAILED")
         return protocol
-    except (JournalError, OSError) as exc:
+    except JournalError as exc:
         raise RuntimeErrorSafe(str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise RuntimeErrorSafe("JOURNAL_UNAVAILABLE") from exc
+    except OSError as exc:
+        raise RuntimeErrorSafe("JOURNAL_UNAVAILABLE") from exc
+    except AdapterError as exc:
+        raise RuntimeErrorSafe("TERMINAL_UNAVAILABLE") from exc
     finally:
         if journal is not None:
             journal.close()

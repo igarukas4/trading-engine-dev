@@ -4,6 +4,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Mapping
 
+from .adapter import AdapterError
+
 
 class PreflightError(RuntimeError):
     """Stable, credential-free preflight failure."""
@@ -51,5 +53,9 @@ def verify_preflight(config, adapter, journal, snapshot: Mapping[str, Any],
         return epoch
     except PreflightError:
         raise
+    except AdapterError as exc:
+        # Adapter errors may carry implementation-specific detail. Startup
+        # exposes one stable code and never serializes that detail.
+        raise PreflightError("PREFLIGHT_FAILED") from exc
     except (AttributeError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
         raise PreflightError("PREFLIGHT_FAILED") from exc
