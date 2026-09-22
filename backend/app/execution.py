@@ -2854,8 +2854,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def recovery_records(self, account_id: str) -> list[dict[str, Any]]:
         """Dashboard-safe, account-scoped recovery progress."""
         with self._lock_for(account_id):
-            return [
-                {
+            records: list[dict[str, Any]] = []
+            for item in self.reconciliation_work.values():
+                if item.account_id != account_id:
+                    continue
+                record = {
                     "kind": item.subject_kind,
                     "order_id": item.subject_id,
                     "subject_id": item.subject_id,
@@ -2867,9 +2870,17 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     "critical": item.status == "ESCALATED",
                     "recovery_legal": item.status == "PENDING",
                 }
-                for item in self.reconciliation_work.values()
-                if item.account_id == account_id
-            ]
+                # Backend recovery work is keyed by the domain Order ID. The
+                # connector journal is keyed by the dispatched command ID.
+                # Carry both identifiers so reconciliation can resolve the
+                # local row without changing the account-facing subject.
+                if item.subject_kind == "ORDER":
+                    order = self.orders.get(item.subject_id)
+                    if order is not None and order.account_id == account_id:
+                        command_id = order.command_id or order.id
+                        record["command_id"] = command_id
+                records.append(record)
+            return records
 
     def _accept_execution(
         self,
@@ -3126,6 +3137,16 @@ class ExecutionCoordinator(ExecutionSubstrate):
             ):
                 state = "UNKNOWN"
                 result_payload.setdefault("code", "PROTECTION_READBACK_REQUIRED")
+            if (
+                state == "ACCEPTED"
+                and record.command_type == "position.close"
+                and result_payload.get("filled_volume") in (None, "", 0, "0")
+            ):
+                # A requested close volume is intent, not broker evidence.
+                # Keep the command fenced until a deal/read-back supplies the
+                # actual reduction.
+                state = "UNKNOWN"
+                result_payload.setdefault("code", "CLOSE_READBACK_REQUIRED")
             record.state = state
             record.result_payload = result_payload
             position_command = next(

@@ -306,6 +306,32 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             coordinator.prepare_connector_position_dispatch("a", unsupported.id, identity=identity, generation=0)
         self.assertNotIn(unsupported.id, coordinator.dispatch_records)
 
+    async def test_close_acceptance_without_broker_volume_stays_unknown(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="no-volume")
+        coordinator.positions[("a", "order-no-volume")] = Position(
+            "a", "order-no-volume", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-no-volume",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-no-volume", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        record = await bridge.enqueue_position_close(
+            "a", close.id, identity=identity, generation=0,
+        )
+        envelope = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", envelope.command_id, "session")
+        await bridge.record_result({
+            **envelope.as_message(), "type": "command.result", "message_id": "result-no-volume",
+            "sequence": 1, "payload": {"state": "ACCEPTED"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(close.status, "UNKNOWN")
+        self.assertEqual(coordinator.position("a", "order-no-volume").remaining_volume, "0.10")
+
     async def test_position_dispatch_rejects_identity_values_not_bound_to_broker_account(self):
         actual = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
         coordinator = ExecutionCoordinator(account_identity_provider=lambda _account_id: actual)

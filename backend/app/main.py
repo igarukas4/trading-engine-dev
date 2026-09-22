@@ -2008,7 +2008,14 @@ def _reconciliation_gate_complete(
         isinstance(recovery_matches, list)
         and matched_ids == recovery_ids
         and len(recovery_matches) == len(recovery_ids)
-        and all(match.get("status") == "MATCHED" for match in recovery_matches)
+        and all(
+            match.get("status") == "MATCHED"
+            or (
+                match.get("status") == "NO_EFFECT"
+                and match.get("authoritative_no_effect") is True
+            )
+            for match in recovery_matches
+        )
         and observation.get("from_server_time") == from_server_time
     ):
         return False

@@ -90,6 +90,10 @@ class FakeAdapter:
                 "confirmed_stop": payload.get("sl"),
                 "confirmed_take_profit": payload.get("tp"),
             })
+        if typ == "position.close":
+            # A fake broker must provide the same read-back fact required by
+            # the real adapter. The requested volume is intent, not evidence.
+            result["filled_volume"] = payload.get("volume")
         return result
 
 
@@ -109,6 +113,14 @@ class AmbiguousAdapter(FakeAdapter):
         raise OSError("SECRET_MARKER transport detail")
 
 
+class TicketCheckingAdapter(FakeAdapter):
+    def order_check(self, typ, payload):
+        self.calls.append(("check", typ, payload))
+        if typ.startswith("position.") and payload.get("position_ticket") != "ticket-1":
+            return {"retcode": 10016}
+        return {"retcode": 0}
+
+
 class Issue70RuntimeTests(unittest.TestCase):
     def config(self, path, **updates):
         raw = {
@@ -116,6 +128,7 @@ class Issue70RuntimeTests(unittest.TestCase):
             "external_account_id": "42", "key_id": "key-1", "secret_ref": "file:///outside/secret",
             "terminal_path": "C:/terminal64.exe", "wss_url": "wss://backend/ws",
             "journal_path": str(path), "execution_disabled": False,
+            "local_test": True,
         }
         raw.update(updates)
         return ConnectorConfig.from_dict(raw)
@@ -409,6 +422,47 @@ class Issue70RuntimeTests(unittest.TestCase):
                 self.assertEqual(transport.sent[-1]["payload"]["state"], "REJECTED")
                 if name == "epoch":
                     self.assertEqual(transport.sent[-1]["payload"]["code"], "STALE_EPOCH")
+
+    def test_runtime_rejects_wrong_account_hash_and_ticket_without_side_effect(self):
+        cases = ("account", "hash", "ticket")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                if case == "ticket":
+                    payload = {
+                        "symbol": "EURUSD", "position_ticket": "wrong-ticket",
+                        "sl": "1", "tp": "2",
+                    }
+                    command = self.command_frame(
+                        payload=payload, typ="position.modify_protection",
+                    )
+                    adapter = TicketCheckingAdapter()
+                else:
+                    command = self.command_frame()
+                    adapter = FakeAdapter()
+                    if case == "account":
+                        command["account_id"] = "foreign-account"
+                    else:
+                        command["request_hash"] = "wrong-hash"
+                transport = FakeTransport([self.snapshot(), self.reconciliation_ack(), command])
+                if case == "account":
+                    with self.assertRaises(Exception):
+                        run_runtime(
+                            self.config(Path(tmp) / "journal.sqlite"), lambda: "opaque",
+                            adapter=adapter, transport=transport, preflight=True, max_messages=2,
+                        )
+                elif case == "hash":
+                    run_runtime(
+                        self.config(Path(tmp) / "journal.sqlite"), lambda: "opaque",
+                        adapter=adapter, transport=transport, preflight=True, max_messages=2,
+                    )
+                    self.assertEqual(transport.sent[-1]["payload"]["code"], "REQUEST_HASH_MISMATCH")
+                else:
+                    run_runtime(
+                        self.config(Path(tmp) / "journal.sqlite"), lambda: "opaque",
+                        adapter=adapter, transport=transport, preflight=True, max_messages=2,
+                    )
+                    self.assertEqual(transport.sent[-1]["payload"]["code"], "ORDER_CHECK_REJECTED")
+                self.assertEqual([item[0] for item in adapter.calls], [] if case != "ticket" else ["check"])
 
     def test_post_invocation_disconnect_stays_unknown_across_restart(self):
         with tempfile.TemporaryDirectory() as tmp:

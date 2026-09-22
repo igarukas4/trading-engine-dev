@@ -400,6 +400,86 @@ class OfficialMT5Adapter:
             raise AdapterError("POSITION_TICKET_MISMATCH")
         return position
 
+    def _effect_readback(self, typ: str, payload: Mapping[str, Any],
+                         result: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Find broker evidence for an accepted market side effect.
+
+        An accepted retcode is not enough to project a confirmed effect. The
+        terminal must return a matching order, deal, or position from a fresh
+        broker read. Missing read APIs, query failures, and unmatched rows all
+        stay ambiguous so recovery can reconcile them later.
+        """
+        mt5 = self._module()
+        expected_ids = {
+            str(result.get(name))
+            for name in ("order", "deal", "position", "ticket", "external_order_id", "external_deal_id")
+            if result.get(name) is not None
+        }
+        requested_ticket = str(payload.get("position_ticket")) if typ == "position.close" else None
+        correlation = str(payload.get("comment") or payload.get("correlation_id") or "")
+        expected_magic = str(payload.get("magic", self.magic))
+        rows: list[tuple[str, dict[str, Any]]] = []
+
+        def collect(name: str, *args: Any, **kwargs: Any) -> None:
+            reader = getattr(mt5, name, None)
+            if not callable(reader):
+                return
+            try:
+                values = reader(*args, **kwargs)
+            except Exception:
+                return
+            if values is None:
+                return
+            for value in values:
+                plain = self._plain(value)
+                if isinstance(plain, dict):
+                    rows.append((name, plain))
+
+        # Active orders cover PLACED responses. History covers completed market
+        # orders and deals. Positions provide the remaining broker-side proof.
+        collect("orders_get")
+        start, end = self._history_window(None)
+        collect("history_orders_get", start, end)
+        collect("history_deals_get", start, end)
+        if requested_ticket is not None:
+            collect("positions_get", ticket=int(requested_ticket))
+        else:
+            collect("positions_get")
+
+        matches: list[dict[str, Any]] = []
+        for source, row in rows:
+            row_ids = {
+                str(row.get(name))
+                for name in ("ticket", "order", "deal", "position", "order_id", "deal_id", "position_id")
+                if row.get(name) is not None
+            }
+            linked = bool(expected_ids.intersection(row_ids))
+            if typ == "position.close" and requested_ticket is not None:
+                linked = linked or str(row.get("position", row.get("position_id", ""))) == requested_ticket
+            if correlation and str(row.get("comment", row.get("correlation_id", ""))) == correlation:
+                linked = linked or str(row.get("magic", "")) in {"", expected_magic}
+            if linked:
+                matches.append({"_source": source, **row})
+        if not matches:
+            return None
+
+        evidence: dict[str, Any] = {"readback_confirmed": True}
+        for source, target in (("order", "external_order_id"), ("deal", "external_deal_id")):
+            value = result.get(source)
+            if value is None:
+                value = next((row.get(source, row.get(target)) for row in matches
+                              if row.get(source, row.get(target)) is not None), None)
+            if value is not None:
+                evidence[target] = str(value)
+        if typ == "position.close":
+            volume = next((row.get("volume", row.get("filled_volume")) for row in matches
+                           if row.get("_source") == "history_deals_get"
+                           and row.get("volume", row.get("filled_volume")) is not None), None)
+            if volume in (None, "", 0, "0"):
+                return None
+            evidence["filled_volume"] = str(volume)
+        return evidence
+
     def order_check(self, typ, payload):
         request = self._request(typ, payload)
         result = self._module().order_check(request)
@@ -410,7 +490,8 @@ class OfficialMT5Adapter:
             return plain
         return {"retcode": getattr(result, "retcode", None)}
 
-    def _send(self, request, *, protection: Mapping[str, Any] | None = None):
+    def _send(self, request, *, protection: Mapping[str, Any] | None = None,
+              effect: tuple[str, Mapping[str, Any]] | None = None):
         try:
             result = self._module().order_send(request)
         except Exception:
@@ -467,10 +548,21 @@ class OfficialMT5Adapter:
                 result["state"] = "UNKNOWN"
                 result["code"] = "PROTECTION_READBACK_MISMATCH"
                 result["protection_confirmed"] = False
+        if effect is not None and state == "ACCEPTED":
+            evidence = self._effect_readback(effect[0], effect[1], result)
+            if evidence is None:
+                result["state"] = "UNKNOWN"
+                result["code"] = "EFFECT_READBACK_REQUIRED"
+                result["readback_confirmed"] = False
+            else:
+                result.update(evidence)
         return result
 
     def submit_market(self, payload):
-        return self._send(self._request("order.submit_market", payload))
+        return self._send(
+            self._request("order.submit_market", payload),
+            effect=("order.submit_market", payload),
+        )
 
     def modify_protection(self, payload):
         request = self._request("position.modify_protection", payload)
@@ -486,7 +578,10 @@ class OfficialMT5Adapter:
         )
 
     def close(self, payload):
-        return self._send(self._request("position.close", payload))
+        return self._send(
+            self._request("position.close", payload),
+            effect=("position.close", payload),
+        )
 
     def invoke(self, typ, payload):
         if typ == "order.submit_market":
