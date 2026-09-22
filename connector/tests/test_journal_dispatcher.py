@@ -28,9 +28,12 @@ class JournalDispatcherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = str(Path(self.tmp.name) / "journal.sqlite")
+        self.addCleanup(self.tmp.cleanup)
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def open_journal(self):
+        journal = SQLiteJournal(self.path, "a1")
+        self.addCleanup(journal.close)
+        return journal
 
     def command(self, command_id="c1", key="k1", sequence=1, payload=None):
         return {
@@ -40,7 +43,7 @@ class JournalDispatcherTests(unittest.TestCase):
         }
 
     def test_durable_lifecycle_and_same_hash_replay(self):
-        journal = SQLiteJournal(self.path, "a1")
+        journal = self.open_journal()
         adapter = Adapter()
         dispatcher = Dispatcher(journal, adapter)
         command = self.command()
@@ -53,27 +56,26 @@ class JournalDispatcherTests(unittest.TestCase):
         self.assertEqual(journal.get("c1").request_hash, canonical_request_hash(command["type"], command["payload"]))
 
     def test_timeout_is_unknown_and_fences_later_commands(self):
-        journal = SQLiteJournal(self.path, "a1")
+        journal = self.open_journal()
         dispatcher = Dispatcher(journal, Adapter({"retcode": 10012}))
         self.assertEqual(dispatcher.dispatch(self.command())["state"], "UNKNOWN")
         later = self.command("c2", "k2", 2)
         self.assertEqual(dispatcher.dispatch(later)["code"], "ACCOUNT_FENCED_UNKNOWN")
 
     def test_restart_rejects_uninvoked_and_keeps_invoked_unknown(self):
-        journal = SQLiteJournal(self.path, "a1")
+        journal = self.open_journal()
         journal.receive(command_id="before", generation=1, dispatch_sequence=1, idempotency_key="b",
                          request_hash="h", execution_epoch=1, command_type="order.submit_market", request={})
         journal.receive(command_id="after", generation=1, dispatch_sequence=2, idempotency_key="a",
                          request_hash="h2", execution_epoch=1, command_type="order.submit_market", request={})
         journal.transition("after", state="INVOKING", phase="DISPATCHING", mt5_invoked=True)
         journal.close()
-        restarted = SQLiteJournal(self.path, "a1")
-        self.addCleanup(restarted.close)
+        restarted = self.open_journal()
         recovered = restarted.recover()
         self.assertEqual({row.command_id: row.state for row in recovered}, {"before": "REJECTED", "after": "UNKNOWN"})
 
     def test_reconciliation_persists_evidence_before_resolution(self):
-        journal = SQLiteJournal(self.path, "a1")
+        journal = self.open_journal()
         journal.receive(command_id="c1", generation=1, dispatch_sequence=1, idempotency_key="k1",
                          request_hash="h", execution_epoch=1, command_type="order.submit_market", request={})
         journal.transition("c1", state="UNKNOWN", phase="RECONCILING", mt5_invoked=True)
@@ -84,7 +86,7 @@ class JournalDispatcherTests(unittest.TestCase):
         self.assertEqual(journal.connection.execute("SELECT COUNT(*) FROM connector_observations").fetchone()[0], 1)
 
     def test_same_idempotency_key_different_hash_never_invokes(self):
-        journal = SQLiteJournal(self.path, "a1")
+        journal = self.open_journal()
         adapter = Adapter()
         dispatcher = Dispatcher(journal, adapter)
         first = self.command()
