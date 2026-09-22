@@ -93,6 +93,17 @@ class MT5AdapterTests(unittest.TestCase):
         })
         self.assertEqual(stop_only["tp"], 1.12)
 
+    def test_unrecognised_retcodes_remain_unknown(self):
+        class Module:
+            def order_send(self, request):
+                return {"retcode": 19999}
+
+        adapter = OfficialMT5Adapter(Identity("MT5", "Demo", "42"), "a1")
+        adapter._mt5 = Module()
+        result = adapter._send({"action": 1})
+        self.assertEqual(result["state"], "UNKNOWN")
+        self.assertEqual(result["code"], "UNKNOWN_RETCODE")
+
 
 if __name__ == "__main__":
     unittest.main()

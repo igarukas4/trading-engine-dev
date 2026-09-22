@@ -233,7 +233,11 @@ class ConnectorProtocol:
         if len(matches) != 1:
             evidence.update({
                 "status": "UNRESOLVED",
-                "reason": "CORRELATION_ABSENT" if not matches else "MULTIPLE_CORRELATIONS",
+                "reason": (
+                    "NO_EFFECT"
+                    if not matches and record.get("authoritative_no_effect") is True
+                    else "CORRELATION_ABSENT" if not matches else "MULTIPLE_CORRELATIONS"
+                ),
             })
             return evidence, None
         source, row = matches[0]
@@ -318,10 +322,107 @@ class ConnectorProtocol:
             "recovery_matches": recovery_matches,
             "sequence_watermark": self.sequence,
         }
+        for record, evidence in zip(payload.get("recovery", []), recovery_matches):
+            if not isinstance(record, dict) or not isinstance(evidence, dict):
+                continue
+            subject_id = evidence.get("subject_id")
+            kind = evidence.get("kind")
+            if not isinstance(subject_id, str):
+                continue
+            row_status = "UNKNOWN"
+            if evidence.get("status") == "MATCHED":
+                matching_row = next(
+                    (item for source, item in order_rows if source == evidence.get("source") and any(
+                        str(item.get(field, "")) == subject_id
+                        for field in ("command_id", "correlation_id", "position_id", "order_id")
+                    )),
+                    None,
+                )
+                if matching_row is not None:
+                    row_status = str(matching_row.get("status", matching_row.get("state", "UNKNOWN"))).upper()
+            elif evidence.get("reason") == "NO_EFFECT":
+                row_status = "REJECTED"
+            target = {
+                "ORDER": observation["orders"],
+                "POSITION_COMMAND": observation["position_commands"],
+                "COMMAND": observation["commands"],
+            }.get(kind)
+            if target is not None and not any(
+                str(item.get("order_id", item.get("command_id", ""))) == subject_id
+                for item in target
+            ):
+                item = {"status": row_status}
+                item["order_id" if kind == "ORDER" else "command_id"] = subject_id
+                target.append(item)
+        self._reconcile_local_unknowns(payload, observation, recovery_matches, order_rows)
         return [
             self._envelope("account_snapshot", account),
             self._envelope("reconciliation_observation", {"observation": observation}),
         ]
+
+    def _reconcile_local_unknowns(
+        self,
+        payload: Mapping[str, Any],
+        observation: dict[str, Any],
+        matches: list[dict[str, Any]],
+        rows: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        """Persist broker evidence for every local UNKNOWN without resending."""
+        if self.dispatcher is None:
+            return
+        recovery = payload.get("recovery", [])
+        for record, evidence in zip(recovery, matches):
+            if not isinstance(record, dict) or not isinstance(evidence, dict):
+                continue
+            subject_id = evidence.get("subject_id")
+            kind = evidence.get("kind")
+            if not isinstance(subject_id, str) or kind not in {"ORDER", "POSITION_COMMAND", "COMMAND"}:
+                continue
+            journal = self.dispatcher.journal.get(subject_id)
+            if journal is None or journal.state != "UNKNOWN":
+                continue
+            row = next(
+                (item for source, item in rows if source == evidence.get("source") and any(
+                    str(item.get(field, "")) == subject_id
+                    for field in ("command_id", "correlation_id", "position_id", "order_id")
+                )),
+                None,
+            )
+            match_status = "CONFLICT"
+            state = "UNKNOWN"
+            result: dict[str, Any] = {"state": "UNKNOWN", "code": "RECONCILIATION_REQUIRED"}
+            if evidence.get("status") == "MATCHED" and row is not None:
+                observed = str(row.get("status", row.get("state", "UNKNOWN"))).upper()
+                if observed in {"ACCEPTED", "PLACED", "DONE", "FILLED", "PARTIALLY_FILLED", "CONFIRMED", "EXECUTED"}:
+                    match_status, state = "UNIQUE_MATCH", "ACCEPTED"
+                    result = {"state": state, "code": "RECONCILED", **row}
+                elif observed in {"REJECTED", "CANCELLED", "CANCELED", "NOT_FOUND", "EXPIRED"}:
+                    match_status, state = "UNIQUE_MATCH", "REJECTED"
+                    result = {"state": state, "code": "RECONCILED", **row}
+            elif (
+                evidence.get("status") == "UNRESOLVED"
+                and evidence.get("reason") == "NO_EFFECT"
+                and payload.get("complete") is not False
+                and record.get("authoritative_no_effect") is True
+            ):
+                match_status, state = "NO_EFFECT", "REJECTED"
+                result = {"state": state, "code": "NO_EFFECT"}
+            elif evidence.get("reason") in {"CORRELATION_ABSENT", "MULTIPLE_CORRELATIONS"}:
+                match_status = "INCOMPLETE" if evidence.get("reason") == "CORRELATION_ABSENT" else "CONFLICT"
+            try:
+                resolved = self.dispatcher.reconcile(
+                    subject_id,
+                    snapshot=observation,
+                    source="mt5.reconciliation",
+                    match_status=match_status,
+                    state=state,
+                    result=result,
+                    error_code=result.get("code"),
+                )
+            except Exception:
+                continue
+            evidence["journal_state"] = resolved.get("state")
+            evidence["resolution_code"] = resolved.get("code")
 
     def _replay_result(self, result: dict[str, Any]) -> dict[str, Any]:
         replay = dict(result)

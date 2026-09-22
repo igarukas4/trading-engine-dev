@@ -437,6 +437,12 @@ class ConnectorDeliveryRegistry:
             session.seen_message_ids.add(message["message_id"])
             self._received_sequence[session.account_id] = message["sequence"]
             self._received_message_ids[session.account_id] = set(session.seen_message_ids)
+            if (
+                result == "ACCEPTED"
+                and envelope.type == "position.modify_protection"
+                and payload.get("protection_confirmed") is not True
+            ):
+                result = "UNKNOWN"
             if item.state != "SENT":
                 if item.state == result:
                     return result

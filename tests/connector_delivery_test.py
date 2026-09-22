@@ -270,7 +270,10 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await bridge.mark_sent("a", first.command_id, "session")
         await bridge.record_result({
             **first.as_message(), "type": "command.result", "message_id": "result-modify",
-            "sequence": 1, "payload": {"state": "ACCEPTED"},
+            "sequence": 1, "payload": {
+                "state": "ACCEPTED", "protection_confirmed": True,
+                "confirmed_stop": "1.0", "confirmed_take_profit": "2.0",
+            },
         }, authenticated_account_id="a", session_id="session")
         self.assertEqual(modify.status, "CONFIRMED")
         self.assertEqual(coordinator.position("a", "order-position").native_stop_loss, "1.0")
@@ -302,6 +305,25 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ExecutionError, "UNSUPPORTED_POSITION_COMMAND"):
             coordinator.prepare_connector_position_dispatch("a", unsupported.id, identity=identity, generation=0)
         self.assertNotIn(unsupported.id, coordinator.dispatch_records)
+
+    async def test_position_dispatch_rejects_identity_values_not_bound_to_broker_account(self):
+        actual = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        coordinator = ExecutionCoordinator(account_identity_provider=lambda _account_id: actual)
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="identity")
+        coordinator.positions[("a", "order-identity")] = Position(
+            "a", "order-identity", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-identity",
+        )
+        command = coordinator.request_position_close(
+            "a", "order-identity", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        with self.assertRaisesRegex(ExecutionError, "ACCOUNT_IDENTITY_MISMATCH"):
+            coordinator.prepare_connector_position_dispatch(
+                "a", command.id,
+                identity={"provider": "mt5", "broker_server": "other", "external_account_id": "42"},
+                generation=0,
+            )
+        self.assertNotIn(command.id, coordinator.dispatch_records)
 
     async def test_unsent_dispatch_replays_after_restart(self):
         from tempfile import TemporaryDirectory

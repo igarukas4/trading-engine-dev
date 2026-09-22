@@ -49,6 +49,12 @@ class OfficialMT5Adapter:
     """Thin, fail-closed wrapper around the official MetaTrader5 module."""
 
     ACCEPTED_RETCODES = {10008, 10009, 10010}
+    # These are terminal decisions documented by MT5. Anything else is kept
+    # ambiguous because an unrecognised code may describe a broker side effect.
+    REJECTED_RETCODES = {
+        10006, 10007, 10011, 10013, 10014, 10015, 10016, 10017, 10018,
+        10019, 10022, 10025, 10026, 10027, 10029, 10030, 10035,
+    }
     UNKNOWN_RETCODES = {10012}
 
     def __init__(self, expected: Identity, account_id: str, *, magic: int = 65065,
@@ -266,6 +272,7 @@ class OfficialMT5Adapter:
                 raise AdapterError("POSITION_SYMBOL_MISMATCH")
             sl = payload.get("sl") if payload.get("sl") is not None else position.get("sl")
             tp = payload.get("tp") if payload.get("tp") is not None else position.get("tp")
+            self._validate_protection_distance(position, sl, tp, meta)
             return {
                 "action": getattr(mt5, "TRADE_ACTION_SLTP"),
                 "symbol": symbol,
@@ -333,6 +340,37 @@ class OfficialMT5Adapter:
                 raise AdapterError("VOLUME_EXCEEDS_POSITION")
         return request
 
+    def _validate_protection_distance(self, position: Mapping[str, Any], sl: Any,
+                                      tp: Any, meta: _Symbol) -> None:
+        """Reject protection levels inside the broker's stop/freeze distance."""
+        minimum = meta.point * max(meta.trade_stops_level, meta.trade_freeze_level)
+        if minimum <= 0:
+            return
+        tick = self._module().symbol_info_tick(str(position.get("symbol", "")))
+        if tick is None:
+            raise AdapterError("QUOTE_UNAVAILABLE")
+        position_type = str(position.get("type", position.get("position_type", ""))).upper()
+        if position_type not in {"0", "1", "BUY", "SELL"}:
+            raise AdapterError("INVALID_POSITION_DIRECTION")
+        is_buy = position_type in {"0", "BUY"}
+        reference = self._decimal(
+            getattr(tick, "bid" if is_buy else "ask", 0), "price"
+        )
+        stop = self._decimal(sl, "stop") if sl not in (None, "", 0, "0") else None
+        target = self._decimal(tp, "take_profit") if tp not in (None, "", 0, "0") else None
+        if is_buy:
+            invalid = (
+                (stop is not None and stop >= reference - minimum)
+                or (target is not None and target <= reference + minimum)
+            )
+        else:
+            invalid = (
+                (stop is not None and stop <= reference + minimum)
+                or (target is not None and target >= reference - minimum)
+            )
+        if invalid:
+            raise AdapterError("INVALID_STOPS")
+
     def _price(self, value, digits):
         result = self._quantize(value, digits, "price")
         if result <= 0:
@@ -372,7 +410,7 @@ class OfficialMT5Adapter:
             return plain
         return {"retcode": getattr(result, "retcode", None)}
 
-    def _send(self, request):
+    def _send(self, request, *, protection: Mapping[str, Any] | None = None):
         try:
             result = self._module().order_send(request)
         except Exception:
@@ -389,13 +427,19 @@ class OfficialMT5Adapter:
 
         if retcode in self.ACCEPTED_RETCODES:
             state = "ACCEPTED"
+        elif retcode in self.REJECTED_RETCODES:
+            state = "REJECTED"
         elif retcode in self.UNKNOWN_RETCODES:
             state = "UNKNOWN"
         else:
-            state = "REJECTED"
+            state = "UNKNOWN"
 
         result["state"] = state
-        result["code"] = "BROKER_REJECTED" if state == "REJECTED" else None
+        result["code"] = (
+            "BROKER_REJECTED" if state == "REJECTED"
+            else "UNKNOWN_RETCODE" if state == "UNKNOWN" and retcode is not None
+            else None
+        )
         for source, target in (
             ("order", "external_order_id"),
             ("deal", "external_deal_id"),
@@ -406,13 +450,40 @@ class OfficialMT5Adapter:
                     result[target] = [str(result[source])]
                 else:
                     result[target] = str(result[source])
+        if protection is not None and state == "ACCEPTED":
+            try:
+                position = self._fresh_position(protection["position_ticket"])
+                digits = Decimal(1).scaleb(-int(protection["digits"]))
+                expected_sl = Decimal(str(protection["sl"])).quantize(digits)
+                expected_tp = Decimal(str(protection["tp"])).quantize(digits)
+                actual_sl = Decimal(str(position.get("sl"))).quantize(digits)
+                actual_tp = Decimal(str(position.get("tp"))).quantize(digits)
+                if actual_sl != expected_sl or actual_tp != expected_tp:
+                    raise ValueError
+                result["protection_confirmed"] = True
+                result["confirmed_stop"] = str(actual_sl)
+                result["confirmed_take_profit"] = str(actual_tp)
+            except (AdapterError, InvalidOperation, TypeError, ValueError, KeyError):
+                result["state"] = "UNKNOWN"
+                result["code"] = "PROTECTION_READBACK_MISMATCH"
+                result["protection_confirmed"] = False
         return result
 
     def submit_market(self, payload):
         return self._send(self._request("order.submit_market", payload))
 
     def modify_protection(self, payload):
-        return self._send(self._request("position.modify_protection", payload))
+        request = self._request("position.modify_protection", payload)
+        _, meta = self._symbol(str(payload.get("symbol") or ""))
+        return self._send(
+            request,
+            protection={
+                "position_ticket": payload.get("position_ticket"),
+                "digits": meta.digits,
+                "sl": request["sl"],
+                "tp": request["tp"],
+            },
+        )
 
     def close(self, payload):
         return self._send(self._request("position.close", payload))
@@ -440,6 +511,8 @@ class OfficialMT5Adapter:
 
 class FakeMT5Adapter:
     """Deterministic adapter for unit tests; records exact requests and outcomes."""
+
+    ACCEPTED_RETCODES = OfficialMT5Adapter.ACCEPTED_RETCODES
 
     DEFAULT_SYMBOLS = {
         "EURUSD": {
@@ -527,7 +600,15 @@ class FakeMT5Adapter:
         return self._record("order.submit_market", payload)
 
     def modify_protection(self, payload):
-        return self._record("position.modify_protection", payload)
+        result = self._record("position.modify_protection", payload)
+        if isinstance(result, Mapping) and result.get("retcode") in self.ACCEPTED_RETCODES:
+            return {
+                **result,
+                "protection_confirmed": True,
+                "confirmed_stop": payload.get("sl"),
+                "confirmed_take_profit": payload.get("tp"),
+            }
+        return result
 
     def close(self, payload):
         return self._record("position.close", payload)

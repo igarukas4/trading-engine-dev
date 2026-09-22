@@ -2322,6 +2322,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         *,
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
+        account_identity_provider: Any | None = None,
         reconciliation_deadline: timedelta = timedelta(minutes=5),
         max_protection_repair_attempts: int = 3,
     ) -> None:
@@ -2344,6 +2345,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
         else:
             self._state_store = None
         self._mutation_depth = 0
+        self._account_identity_provider = account_identity_provider
+        self._account_identities: dict[str, dict[str, str]] = {}
         self.reconciliation_deadline = reconciliation_deadline
         self.max_protection_repair_attempts = max_protection_repair_attempts
         self.reconciliation_work: dict[str, ReconciliationWork] = {}
@@ -2355,12 +2358,54 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 self._begin_restart_recovery()
                 self._recover_inflight_dispatches()
 
+    def bind_account_identity(self, account_id: str, identity: dict[str, str]) -> None:
+        """Bind the immutable BrokerAccount identity used by connector dispatch."""
+        if not isinstance(account_id, str) or not account_id:
+            raise ExecutionError("WRONG_ACCOUNT")
+        if set(identity) != {"provider", "broker_server", "external_account_id"}:
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        if any(not isinstance(value, str) or not value for value in identity.values()):
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        prior = self._account_identities.get(account_id)
+        if prior is not None and prior != identity:
+            raise ExecutionError("ACCOUNT_IDENTITY_MISMATCH")
+        self._account_identities[account_id] = dict(identity)
+
+    def _expected_account_identity(self, account_id: str) -> dict[str, str] | None:
+        if self._account_identity_provider is not None:
+            try:
+                value = self._account_identity_provider(account_id)
+            except (KeyError, AttributeError, TypeError):
+                value = None
+            if hasattr(value, "identity"):
+                value = value.identity
+            if isinstance(value, tuple):
+                value = dict(zip(("provider", "broker_server", "external_account_id"), value))
+            if isinstance(value, dict) and set(value) == {
+                "provider", "broker_server", "external_account_id"
+            }:
+                return {key: str(item) for key, item in value.items()}
+        bound = self._account_identities.get(account_id)
+        return dict(bound) if bound is not None else None
+
+    def _validate_connector_identity(self, account_id: str, identity: dict[str, str]) -> None:
+        if set(identity) != {"provider", "broker_server", "external_account_id"}:
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        if any(not isinstance(value, str) or not value for value in identity.values()):
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        expected = self._expected_account_identity(account_id)
+        if self._account_identity_provider is not None and expected is None:
+            raise ExecutionError("ACCOUNT_IDENTITY_UNAVAILABLE")
+        if expected is not None and identity != expected:
+            raise ExecutionError("ACCOUNT_IDENTITY_MISMATCH")
+
     def _snapshot(self) -> dict[str, Any]:
         return _serialize_state_value(
             {
                 "accounts": {
                     key: value.__dict__ for key, value in self._accounts.items()
                 },
+                "account_identities": self._account_identities,
                 "reservations": {
                     key: value.__dict__ for key, value in self.reservations.items()
                 },
@@ -2434,6 +2479,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if not state:
             return
         state = _deserialize_state_value(state)
+        self._account_identities = {
+            str(account_id): dict(identity)
+            for account_id, identity in state.get("account_identities", {}).items()
+        }
         for key, value in state.get("accounts", {}).items():
             value["interlock_reasons"] = tuple(value.get("interlock_reasons", ()))
             for timestamp_key in (
@@ -2957,8 +3006,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             order = self.orders.get(order_id)
             if order is None or order.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            if set(identity) != {"provider", "broker_server", "external_account_id"}:
-                raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+            self._validate_connector_identity(account_id, identity)
             command_id = order.command_id or order.id
             existing = self.dispatch_records.get(command_id)
             if existing is not None:
@@ -2998,8 +3046,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             command = next((item for item in self.position_commands if item.id == command_id), None)
             if command is None or command.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            if set(identity) != {"provider", "broker_server", "external_account_id"}:
-                raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+            self._validate_connector_identity(account_id, identity)
             existing = self.dispatch_records.get(command_id)
             position = self.position(account_id, command.order_id)
             command_types = {"PROTECTION": "position.modify_protection", "CLOSE": "position.close"}
@@ -3071,8 +3118,15 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 if record.state == state:
                     return record
                 raise ExecutionError("STALE_COMMAND_RESULT")
-            record.state = state
             result_payload = dict(payload or {})
+            if (
+                state == "ACCEPTED"
+                and record.command_type == "position.modify_protection"
+                and result_payload.get("protection_confirmed") is not True
+            ):
+                state = "UNKNOWN"
+                result_payload.setdefault("code", "PROTECTION_READBACK_REQUIRED")
+            record.state = state
             record.result_payload = result_payload
             position_command = next(
                 (item for item in self.position_commands if item.id == command_id), None,

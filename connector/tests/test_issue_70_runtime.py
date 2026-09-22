@@ -34,6 +34,40 @@ class FakeTransport:
         pass
 
 
+class RegistryWssTransport:
+    """Fake WSS server that owns delivery and result projection end to end."""
+
+    def __init__(self, registry, bridge, snapshot, acknowledgement, account_id, session_id):
+        self.registry = registry
+        self.bridge = bridge
+        self.snapshot = snapshot
+        self.acknowledgement = acknowledgement
+        self.account_id = account_id
+        self.session_id = session_id
+        self.frames = [snapshot, acknowledgement]
+        self.sent = []
+
+    async def send(self, message):
+        frame = json.loads(message)
+        self.sent.append(frame)
+        if frame.get("type") == "command.result":
+            await self.bridge.record_result(
+                frame,
+                authenticated_account_id=self.account_id,
+                session_id=self.session_id,
+            )
+
+    async def recv(self):
+        if self.frames:
+            return self.frames.pop(0)
+        envelope = await self.registry.next_for_session(self.account_id, self.session_id)
+        await self.bridge.mark_sent(self.account_id, envelope.command_id, self.session_id)
+        return envelope.as_message()
+
+    async def close(self):
+        pass
+
+
 class FakeAdapter:
     def __init__(self):
         self.calls = []
@@ -49,7 +83,14 @@ class FakeAdapter:
 
     def invoke(self, typ, payload):
         self.calls.append(("invoke", typ, payload))
-        return {"retcode": 10009, "external_order_id": "fake-order"}
+        result = {"retcode": 10009, "external_order_id": "fake-order"}
+        if typ == "position.modify_protection":
+            result.update({
+                "protection_confirmed": True,
+                "confirmed_stop": payload.get("sl"),
+                "confirmed_take_profit": payload.get("tp"),
+            })
+        return result
 
 
 class FailingInitializeAdapter(FakeAdapter):
@@ -215,6 +256,70 @@ class Issue70RuntimeTests(unittest.TestCase):
                     self.assertEqual(coordinator.position("account-1", order_id).native_stop_loss, "1.0")
                 else:
                     self.assertEqual(coordinator.position("account-1", order_id).remaining_volume, "0.05")
+
+    def test_three_commands_cross_registry_wss_sqlite_adapter_and_projection(self):
+        identity = {"provider": "MT5", "broker_server": "Demo", "external_account_id": "42"}
+        coordinator = ExecutionCoordinator()
+        coordinator.account("account-1").execution_epoch = 4
+        coordinator.bind_account_identity("account-1", identity)
+        coordinator.orders["entry-order"] = OrderIntent(
+            "entry-order", "account-1", "entry-signal", "entry-key",
+            canonical_request_hash("order.submit_market", {
+                "symbol": "EURUSD", "volume": "0.01", "sl": "1", "tp": "2",
+            }), 4, 1, {"symbol": "EURUSD", "volume": "0.01", "sl": "1", "tp": "2"},
+            command_id="entry-command",
+        )
+        coordinator.reservations["entry-reservation"] = RiskReservation(
+            "entry-reservation", "account-1", "entry-signal",
+        )
+        coordinator._order_reservations["entry-order"] = "entry-reservation"
+        coordinator.events["entry-event"] = OutboxEvent("entry-event", "account-1", "entry-order", 1)
+        coordinator.orders["position-order"] = OrderIntent(
+            "position-order", "account-1", "position-signal", "position-key", "position-hash",
+            4, 0, {"symbol": "EURUSD"}, command_id="position-command-source",
+        )
+        coordinator.positions[("account-1", "position-order")] = Position(
+            "account-1", "position-order", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-position",
+        )
+        coordinator.account("account-1").next_dispatch_sequence = 2
+        modify = coordinator.request_position_modify_protection(
+            "account-1", "position-order", "1.0", "2.0", "EURUSD", "operator",
+            confirmed=True, idempotency_key="modify-key",
+        )
+        close = coordinator.request_position_close(
+            "account-1", "position-order", "0.05", "EURUSD", "operator",
+            confirmed=True, idempotency_key="close-key",
+        )
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        session_id = "session-end-to-end"
+        asyncio.run(registry.open_session(
+            "account-1", 0, session_id, identity=identity, execution_epoch=4,
+        ))
+        asyncio.run(registry.reserve_sequence("account-1", session_id))
+        asyncio.run(bridge.enqueue_order("account-1", "entry-order", identity=identity, generation=0))
+        asyncio.run(bridge.enqueue_position_command("account-1", modify.id, identity=identity, generation=0))
+        asyncio.run(bridge.enqueue_position_command("account-1", close.id, identity=identity, generation=0))
+        transport = RegistryWssTransport(
+            registry, bridge, self.snapshot(), self.reconciliation_ack(), "account-1", session_id,
+        )
+        adapter = FakeAdapter()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_runtime(
+                self.config(Path(tmp) / "journal.sqlite"), lambda: "opaque",
+                adapter=adapter, transport=transport, preflight=True, max_messages=4,
+            )
+        results = [frame for frame in transport.sent if frame.get("type") == "command.result"]
+        self.assertEqual(len(results), 3)
+        self.assertEqual([frame["payload"]["state"] for frame in results], ["ACCEPTED"] * 3)
+        self.assertEqual([item[0] for item in adapter.calls], [
+            "check", "invoke", "check", "invoke", "check", "invoke",
+        ])
+        self.assertEqual(coordinator.orders["entry-order"].status, "SUBMITTED")
+        self.assertEqual(modify.status, "CONFIRMED")
+        self.assertEqual(close.status, "CONFIRMED")
+        self.assertEqual(coordinator.position("account-1", "position-order").remaining_volume, "0.05")
 
     def test_unverified_backend_preflight_never_invokes_fake_broker(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,14 @@ class DispatchError(RuntimeError):
 
 
 class Dispatcher:
+    ACCEPTED_RETCODES = {10008, 10009, 10010, "10008", "10009", "10010"}
+    REJECTED_RETCODES = {
+        10006, 10007, 10011, 10013, 10014, 10015, 10016, 10017, 10018,
+        10019, 10022, 10025, 10026, 10027, 10029, 10030, 10035,
+        "10006", "10007", "10011", "10013", "10014", "10015", "10016",
+        "10017", "10018", "10019", "10022", "10025", "10026", "10027",
+        "10029", "10030", "10035",
+    }
     def __init__(self, journal: SQLiteJournal, adapter: Any, *, account_id: str | None = None,
                  generation: int | None = None, execution_epoch: int | None = None,
                  execution_enabled: bool = True):
@@ -195,9 +203,9 @@ class Dispatcher:
             return str(state).upper()
         if retcode in (10012, "10012"):
             return "UNKNOWN"
-        if retcode in (10008, 10009, 10010, "10008", "10009", "10010"):
+        if retcode in cls.ACCEPTED_RETCODES:
             return "ACCEPTED"
-        if retcode is not None:
+        if retcode in cls.REJECTED_RETCODES:
             return "REJECTED"
         return "UNKNOWN"
 

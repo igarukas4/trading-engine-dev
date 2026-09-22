@@ -139,7 +139,7 @@ accounts = AccountRegistry(settings.database_url)
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
-execution = ExecutionCoordinator(database_url=settings.database_url or None)
+execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
 connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
