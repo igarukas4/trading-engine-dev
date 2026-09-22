@@ -13,6 +13,7 @@ from mt5_connector.dispatcher import Dispatcher
 from mt5_connector.journal import SQLiteJournal, canonical_request_hash
 from mt5_connector.protocol import ConnectorProtocol, ProtocolError
 from mt5_connector.websocket_client import ConnectorClient
+from mt5_connector.models import ReadSnapshot
 
 from test_runtime import RAW
 
@@ -117,6 +118,58 @@ class Issue67ContractTests(unittest.IsolatedAsyncioTestCase):
         )["state"], "ACCEPTED")
         replay = protocol.handle(self.command(message_id="command-2", sequence=2))
         self.assertEqual(replay["payload"]["state"], "ACCEPTED")
+        self.assertEqual(len(adapter.requests), 1)
+
+    async def test_reconciliation_observation_resolves_local_unknown_without_resend(self):
+        adapter = FakeMT5Adapter(outcome={"state": "UNKNOWN", "code": "TRANSPORT_AMBIGUOUS"})
+        adapter.history_orders = lambda _from_server_time=None: ReadSnapshot(
+            "history_orders", {"items": [{"order_id": "order-1", "ticket": "broker-1", "status": "FILLED"}]}
+        )
+        protocol, dispatcher = self.protocol_with_dispatcher(adapter)
+        command = self.command()
+        self.assertEqual(protocol.handle(command)["payload"]["state"], "UNKNOWN")
+        reconciliation = {
+            "schema_version": 1, "type": "reconciliation.required", "message_id": "recovery-1",
+            "account_id": "a1", "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 2,
+            "execution_epoch": 4, "command_id": None, "idempotency_key": "recovery-key",
+            "sent_at": "2026-09-22T00:00:00Z",
+            "payload": {"recovery": [{"kind": "ORDER", "subject_id": "order-1"}]},
+        }
+        responses = protocol.handle(reconciliation)
+        observation = responses[1]["payload"]["observation"]
+        self.assertEqual(observation["recovery_matches"][0]["status"], "MATCHED")
+        self.assertEqual(dispatcher.journal.get("order-1").state, "ACCEPTED")
+        replay = protocol.handle(self.command(message_id="command-2", sequence=3))
+        self.assertEqual(replay["payload"]["state"], "ACCEPTED")
+        self.assertEqual(len(adapter.requests), 1)
+
+    async def test_authoritative_no_effect_resolves_unknown_without_resend(self):
+        adapter = FakeMT5Adapter(outcome={"state": "UNKNOWN", "code": "TRANSPORT_AMBIGUOUS"})
+        protocol, dispatcher = self.protocol_with_dispatcher(adapter)
+        command = self.command()
+        self.assertEqual(protocol.handle(command)["payload"]["state"], "UNKNOWN")
+        reconciliation = {
+            "schema_version": 1, "type": "reconciliation.required", "message_id": "recovery-no-effect",
+            "account_id": "a1", "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 2,
+            "execution_epoch": 4, "command_id": None, "idempotency_key": "recovery-no-effect-key",
+            "sent_at": "2026-09-22T00:00:00Z",
+            "payload": {
+                "from_server_time": "2026-09-22T00:00:00Z",
+                "recovery": [{
+                    "kind": "ORDER", "subject_id": "order-1",
+                    "authoritative_no_effect": True,
+                }],
+            },
+        }
+        responses = protocol.handle(reconciliation)
+        evidence = responses[1]["payload"]["observation"]["recovery_matches"][0]
+        self.assertEqual(evidence["status"], "NO_EFFECT")
+        self.assertEqual(dispatcher.journal.get("order-1").state, "REJECTED")
+        self.assertEqual(len(adapter.requests), 1)
+        replay = protocol.handle(self.command(message_id="command-after-recovery", sequence=3))
+        self.assertEqual(replay["payload"]["state"], "REJECTED")
         self.assertEqual(len(adapter.requests), 1)
 
     async def test_idempotency_key_reuse_is_rejected_without_broker_call(self):

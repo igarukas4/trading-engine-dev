@@ -7,7 +7,8 @@ from backend.app.connector_delivery import (
     DeliveryError,
     validate_hello,
 )
-from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
+from backend.app.execution import ExecutionCoordinator, ExecutionError, OrderIntent, OutboxEvent, Position, PositionCommand, RiskReservation
+from connector.src.mt5_connector.journal import canonical_request_hash
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -234,7 +235,142 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.runtime_interlock("a").status, "BLOCKED")
         self.assertEqual(coordinator.runtime_interlock("b").status, "ELIGIBLE")
 
-    async def test_bridge_restart_replays_only_queued_records(self):
+    async def test_entry_acceptance_without_readback_stays_unknown(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="missing-readback")
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+        await bridge.enqueue_order("a", "order-missing-readback", identity=identity, generation=1)
+        envelope = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", envelope.command_id, "session")
+        await bridge.record_result({
+            **envelope.as_message(), "type": "command.result", "message_id": "result-missing-readback",
+            "sequence": 1, "payload": {"state": "ACCEPTED"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(coordinator.orders["order-missing-readback"].status, "UNKNOWN")
+
+    async def test_position_commands_use_durable_bridge_and_project_account_locally(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="position")
+        coordinator.positions[("a", "order-position")] = Position(
+            "a", "order-position", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-1",
+        )
+        modify = coordinator.request_position_modify_protection(
+            "a", "order-position", "1.0", "2.0", "EURUSD", "operator",
+            confirmed=True, idempotency_key="modify-key",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-position", "0.05", "EURUSD", "operator",
+            confirmed=True, idempotency_key="close-key",
+        )
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        modify_record = await bridge.enqueue_position_modify_protection(
+            "a", modify.id, identity=identity, generation=0,
+        )
+        close_record = await bridge.enqueue_position_close(
+            "a", close.id, identity=identity, generation=0,
+        )
+        self.assertEqual(modify_record.command_type, "position.modify_protection")
+        self.assertEqual(modify_record.payload["position_ticket"], "ticket-1")
+        self.assertEqual(close_record.command_type, "position.close")
+        self.assertEqual(close_record.payload["position_ticket"], "ticket-1")
+        self.assertEqual(modify_record.request_hash, canonical_request_hash(modify_record.command_type, modify_record.payload))
+        self.assertEqual(close_record.request_hash, canonical_request_hash(close_record.command_type, close_record.payload))
+        first = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", first.command_id, "session")
+        await bridge.record_result({
+            **first.as_message(), "type": "command.result", "message_id": "result-modify",
+            "sequence": 1, "payload": {
+                "state": "ACCEPTED", "readback_confirmed": True,
+                "protection_confirmed": True,
+                "confirmed_stop": "1.0", "confirmed_take_profit": "2.0",
+            },
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(modify.status, "CONFIRMED")
+        self.assertEqual(coordinator.position("a", "order-position").native_stop_loss, "1.0")
+        second = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", second.command_id, "session")
+        await bridge.record_result({
+            **second.as_message(), "type": "command.result", "message_id": "result-close",
+            "sequence": 2, "payload": {
+                "state": "ACCEPTED", "readback_confirmed": True, "filled_volume": "0.05",
+            },
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(close.status, "CONFIRMED")
+        self.assertEqual(coordinator.position("a", "order-position").remaining_volume, "0.05")
+
+    async def test_position_dispatch_requires_broker_ticket_and_supported_type(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="no-ticket")
+        coordinator.positions[("a", "order-no-ticket")] = Position(
+            "a", "order-no-ticket", "0.10", "CONFIRMED", pair="EURUSD", direction="LONG",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-no-ticket", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        with self.assertRaisesRegex(ExecutionError, "POSITION_TICKET_REQUIRED"):
+            coordinator.prepare_connector_position_dispatch("a", close.id, identity=identity, generation=0)
+        self.assertNotIn(close.id, coordinator.dispatch_records)
+        coordinator.position("a", "order-no-ticket").external_position_id = "ticket-1"
+        unsupported = PositionCommand("unsupported", "a", "order-no-ticket", "TRAIL", None)
+        coordinator.position_commands.append(unsupported)
+        with self.assertRaisesRegex(ExecutionError, "UNSUPPORTED_POSITION_COMMAND"):
+            coordinator.prepare_connector_position_dispatch("a", unsupported.id, identity=identity, generation=0)
+        self.assertNotIn(unsupported.id, coordinator.dispatch_records)
+
+    async def test_close_acceptance_without_broker_volume_stays_unknown(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="no-volume")
+        coordinator.positions[("a", "order-no-volume")] = Position(
+            "a", "order-no-volume", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-no-volume",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-no-volume", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        record = await bridge.enqueue_position_close(
+            "a", close.id, identity=identity, generation=0,
+        )
+        envelope = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", envelope.command_id, "session")
+        await bridge.record_result({
+            **envelope.as_message(), "type": "command.result", "message_id": "result-no-volume",
+            "sequence": 1, "payload": {"state": "ACCEPTED"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(close.status, "UNKNOWN")
+        self.assertEqual(coordinator.position("a", "order-no-volume").remaining_volume, "0.10")
+
+    async def test_position_dispatch_rejects_identity_values_not_bound_to_broker_account(self):
+        actual = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        coordinator = ExecutionCoordinator(account_identity_provider=lambda _account_id: actual)
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="identity")
+        coordinator.positions[("a", "order-identity")] = Position(
+            "a", "order-identity", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-identity",
+        )
+        command = coordinator.request_position_close(
+            "a", "order-identity", "0.05", "EURUSD", "operator", confirmed=True,
+        )
+        with self.assertRaisesRegex(ExecutionError, "ACCOUNT_IDENTITY_MISMATCH"):
+            coordinator.prepare_connector_position_dispatch(
+                "a", command.id,
+                identity={"provider": "mt5", "broker_server": "other", "external_account_id": "42"},
+                generation=0,
+            )
+        self.assertNotIn(command.id, coordinator.dispatch_records)
+
+    async def test_unsent_dispatch_replays_after_restart(self):
         from tempfile import TemporaryDirectory
 
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}

@@ -49,6 +49,12 @@ class OfficialMT5Adapter:
     """Thin, fail-closed wrapper around the official MetaTrader5 module."""
 
     ACCEPTED_RETCODES = {10008, 10009, 10010}
+    # These are terminal decisions documented by MT5. Anything else is kept
+    # ambiguous because an unrecognised code may describe a broker side effect.
+    REJECTED_RETCODES = {
+        10006, 10007, 10011, 10013, 10014, 10015, 10016, 10017, 10018,
+        10019, 10022, 10025, 10026, 10027, 10029, 10030, 10035,
+    }
     UNKNOWN_RETCODES = {10012}
 
     def __init__(self, expected: Identity, account_id: str, *, magic: int = 65065,
@@ -131,6 +137,29 @@ class OfficialMT5Adapter:
 
     def account_snapshot(self) -> AccountSnapshot:
         return self._account_snapshot(self._info())
+
+    def preflight_facts(self) -> dict[str, Any]:
+        """Read account and terminal permission without broker side effects."""
+        if not self._initialized:
+            raise AdapterError("MT5_NOT_INITIALIZED")
+        try:
+            mt5 = self._module()
+            account = self._info()
+            terminal = mt5.terminal_info()
+            if terminal is None:
+                raise AdapterError("MT5_HEALTH_UNAVAILABLE")
+            return {
+                "account_id": self.account_id,
+                **self.expected.to_dict(),
+                "trade_mode": "DEMO" if getattr(account, "trade_mode", None) == mt5.ACCOUNT_TRADE_MODE_DEMO else "OTHER",
+                "terminal_connected": bool(getattr(terminal, "connected", False)),
+                "terminal_trade_allowed": bool(getattr(terminal, "trade_allowed", False)),
+                "account_trade_allowed": bool(getattr(account, "trade_allowed", False)),
+            }
+        except AdapterError:
+            raise
+        except Exception as exc:
+            raise AdapterError("MT5_HEALTH_UNAVAILABLE") from exc
 
     def _visible_symbol(self, symbol: str) -> Any:
         mt5 = self._module()
@@ -236,6 +265,21 @@ class OfficialMT5Adapter:
         account = self._info()
         if not bool(getattr(account, "trade_allowed", False)) or not meta.trade_allowed:
             raise AdapterError("TRADING_NOT_ALLOWED")
+        if typ == "position.modify_protection":
+            digits = Decimal(1).scaleb(-meta.digits)
+            position = self._fresh_position(payload.get("position_ticket"))
+            if str(position.get("symbol")) != symbol:
+                raise AdapterError("POSITION_SYMBOL_MISMATCH")
+            sl = payload.get("sl") if payload.get("sl") is not None else position.get("sl")
+            tp = payload.get("tp") if payload.get("tp") is not None else position.get("tp")
+            self._validate_protection_distance(position, sl, tp, meta)
+            return {
+                "action": getattr(mt5, "TRADE_ACTION_SLTP"),
+                "symbol": symbol,
+                "position": self._ticket(payload.get("position_ticket")),
+                "sl": float(self._price(sl, digits)),
+                "tp": float(self._price(tp, digits)),
+            }
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise AdapterError("QUOTE_UNAVAILABLE")
@@ -287,11 +331,6 @@ class OfficialMT5Adapter:
                 raise AdapterError("INVALID_STOPS")
             request["sl"] = float(sl)
             request["tp"] = float(tp)
-        elif typ == "position.modify_protection":
-            request["action"] = getattr(mt5, "TRADE_ACTION_SLTP")
-            request["position"] = self._ticket(payload.get("position_ticket"))
-            request["sl"] = float(self._price(payload["sl"], digits))
-            request["tp"] = float(self._price(payload["tp"], digits))
         elif typ == "position.close":
             request["position"] = self._ticket(
                 position.get("ticket", payload.get("position_ticket"))
@@ -300,6 +339,37 @@ class OfficialMT5Adapter:
             if volume > available:
                 raise AdapterError("VOLUME_EXCEEDS_POSITION")
         return request
+
+    def _validate_protection_distance(self, position: Mapping[str, Any], sl: Any,
+                                      tp: Any, meta: _Symbol) -> None:
+        """Reject protection levels inside the broker's stop/freeze distance."""
+        minimum = meta.point * max(meta.trade_stops_level, meta.trade_freeze_level)
+        if minimum <= 0:
+            return
+        tick = self._module().symbol_info_tick(str(position.get("symbol", "")))
+        if tick is None:
+            raise AdapterError("QUOTE_UNAVAILABLE")
+        position_type = str(position.get("type", position.get("position_type", ""))).upper()
+        if position_type not in {"0", "1", "BUY", "SELL"}:
+            raise AdapterError("INVALID_POSITION_DIRECTION")
+        is_buy = position_type in {"0", "BUY"}
+        reference = self._decimal(
+            getattr(tick, "bid" if is_buy else "ask", 0), "price"
+        )
+        stop = self._decimal(sl, "stop") if sl not in (None, "", 0, "0") else None
+        target = self._decimal(tp, "take_profit") if tp not in (None, "", 0, "0") else None
+        if is_buy:
+            invalid = (
+                (stop is not None and stop >= reference - minimum)
+                or (target is not None and target <= reference + minimum)
+            )
+        else:
+            invalid = (
+                (stop is not None and stop <= reference + minimum)
+                or (target is not None and target >= reference - minimum)
+            )
+        if invalid:
+            raise AdapterError("INVALID_STOPS")
 
     def _price(self, value, digits):
         result = self._quantize(value, digits, "price")
@@ -325,7 +395,131 @@ class OfficialMT5Adapter:
         if not rows:
             raise AdapterError("POSITION_NOT_FOUND")
         row = self._plain(rows[0])
-        return row if isinstance(row, dict) else vars(row)
+        position = row if isinstance(row, dict) else vars(row)
+        if str(position.get("ticket")) != str(ticket):
+            raise AdapterError("POSITION_TICKET_MISMATCH")
+        return position
+
+    def _effect_readback(self, typ: str, payload: Mapping[str, Any],
+                         result: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Find broker evidence for an accepted market side effect.
+
+        An accepted retcode is not enough to project a confirmed effect. The
+        terminal must return a matching order, deal, or position from a fresh
+        broker read. Missing read APIs, query failures, and unmatched rows all
+        stay ambiguous so recovery can reconcile them later.
+        """
+        mt5 = self._module()
+        expected_ids = {
+            str(result.get(name))
+            for name in ("order", "deal", "position", "ticket", "external_order_id", "external_deal_id")
+            if result.get(name) is not None
+        }
+        requested_ticket = str(payload.get("position_ticket")) if typ == "position.close" else None
+        correlation = str(payload.get("comment") or payload.get("correlation_id") or "")
+        expected_magic = str(payload.get("magic", self.magic))
+        rows: list[tuple[str, dict[str, Any]]] = []
+
+        def collect(name: str, *args: Any, **kwargs: Any) -> None:
+            reader = getattr(mt5, name, None)
+            if not callable(reader):
+                return
+            try:
+                values = reader(*args, **kwargs)
+            except Exception:
+                return
+            if values is None:
+                return
+            for value in values:
+                plain = self._plain(value)
+                if isinstance(plain, dict):
+                    rows.append((name, plain))
+
+        # Active orders cover PLACED responses. History covers completed market
+        # orders and deals. Positions provide the remaining broker-side proof.
+        collect("orders_get")
+        start, end = self._history_window(None)
+        collect("history_orders_get", start, end)
+        collect("history_deals_get", start, end)
+        if requested_ticket is not None:
+            collect("positions_get", ticket=int(requested_ticket))
+        else:
+            collect("positions_get")
+
+        matches: list[dict[str, Any]] = []
+        for source, row in rows:
+            status = str(row.get("status", row.get("state", ""))).upper()
+            if status in {"REJECTED", "CANCELLED", "CANCELED", "EXPIRED", "NOT_FOUND"}:
+                continue
+            row_ids = {
+                str(row.get(name))
+                for name in ("ticket", "order", "deal", "position", "order_id", "deal_id", "position_id")
+                if row.get(name) is not None
+            }
+            linked = bool(expected_ids.intersection(row_ids))
+            if typ == "position.close" and requested_ticket is not None:
+                row_position = row.get("position", row.get("position_id"))
+                # A close is proven only by a broker deal for the exact
+                # requested position. An order/deal ticket alone is not
+                # enough because it can belong to another position.
+                linked = linked and row_position is not None and str(row_position) == requested_ticket
+            if correlation and str(row.get("comment", row.get("correlation_id", ""))) == correlation:
+                linked = linked or str(row.get("magic", "")) in {"", expected_magic}
+            if typ == "position.close" and requested_ticket is not None:
+                row_position = row.get("position", row.get("position_id"))
+                linked = linked and row_position is not None and str(row_position) == requested_ticket
+            if linked:
+                matches.append({"_source": source, **row})
+        if not matches:
+            return None
+
+        # One broker effect can appear in several overlapping collections,
+        # such as an order row and its linked deal row. Coalesce only rows
+        # joined by a durable broker identifier. Distinct candidate clusters
+        # are ambiguous, even when each candidate looks individually valid.
+        clusters: list[dict[str, Any]] = []
+        for match in matches:
+            match_ids = {
+                str(match.get(name))
+                for name in ("ticket", "order", "deal", "position",
+                             "order_id", "deal_id", "position_id")
+                if match.get(name) is not None
+            }
+            overlapping = [
+                cluster for cluster in clusters
+                if match_ids.intersection(cluster["ids"])
+            ]
+            if not overlapping:
+                clusters.append({"ids": set(match_ids), "rows": [match]})
+                continue
+            primary = overlapping[0]
+            primary["rows"].append(match)
+            primary["ids"].update(match_ids)
+            for duplicate in overlapping[1:]:
+                primary["rows"].extend(duplicate["rows"])
+                primary["ids"].update(duplicate["ids"])
+                clusters.remove(duplicate)
+        if len(clusters) != 1:
+            return None
+        matches = clusters[0]["rows"]
+
+        evidence: dict[str, Any] = {"readback_confirmed": True}
+        for source, target in (("order", "external_order_id"), ("deal", "external_deal_id")):
+            value = result.get(source)
+            if value is None:
+                value = next((row.get(source, row.get(target)) for row in matches
+                              if row.get(source, row.get(target)) is not None), None)
+            if value is not None:
+                evidence[target] = str(value)
+        if typ == "position.close":
+            volume = next((row.get("volume", row.get("filled_volume")) for row in matches
+                           if row.get("_source") == "history_deals_get"
+                           and str(row.get("position", row.get("position_id", ""))) == requested_ticket
+                           and row.get("volume", row.get("filled_volume")) is not None), None)
+            if volume in (None, "", 0, "0"):
+                return None
+            evidence["filled_volume"] = str(volume)
+        return evidence
 
     def order_check(self, typ, payload):
         request = self._request(typ, payload)
@@ -337,7 +531,8 @@ class OfficialMT5Adapter:
             return plain
         return {"retcode": getattr(result, "retcode", None)}
 
-    def _send(self, request):
+    def _send(self, request, *, protection: Mapping[str, Any] | None = None,
+              effect: tuple[str, Mapping[str, Any]] | None = None):
         try:
             result = self._module().order_send(request)
         except Exception:
@@ -354,13 +549,19 @@ class OfficialMT5Adapter:
 
         if retcode in self.ACCEPTED_RETCODES:
             state = "ACCEPTED"
+        elif retcode in self.REJECTED_RETCODES:
+            state = "REJECTED"
         elif retcode in self.UNKNOWN_RETCODES:
             state = "UNKNOWN"
         else:
-            state = "REJECTED"
+            state = "UNKNOWN"
 
         result["state"] = state
-        result["code"] = "BROKER_REJECTED" if state == "REJECTED" else None
+        result["code"] = (
+            "BROKER_REJECTED" if state == "REJECTED"
+            else "UNKNOWN_RETCODE" if state == "UNKNOWN" and retcode is not None
+            else None
+        )
         for source, target in (
             ("order", "external_order_id"),
             ("deal", "external_deal_id"),
@@ -371,16 +572,58 @@ class OfficialMT5Adapter:
                     result[target] = [str(result[source])]
                 else:
                     result[target] = str(result[source])
+        if protection is not None and state == "ACCEPTED":
+            try:
+                position = self._fresh_position(protection["position_ticket"])
+                digits = Decimal(1).scaleb(-int(protection["digits"]))
+                expected_sl = Decimal(str(protection["sl"])).quantize(digits)
+                expected_tp = Decimal(str(protection["tp"])).quantize(digits)
+                actual_sl = Decimal(str(position.get("sl"))).quantize(digits)
+                actual_tp = Decimal(str(position.get("tp"))).quantize(digits)
+                if actual_sl != expected_sl or actual_tp != expected_tp:
+                    raise ValueError
+                result["protection_confirmed"] = True
+                result["readback_confirmed"] = True
+                result["confirmed_stop"] = str(actual_sl)
+                result["confirmed_take_profit"] = str(actual_tp)
+            except (AdapterError, InvalidOperation, TypeError, ValueError, KeyError):
+                result["state"] = "UNKNOWN"
+                result["code"] = "PROTECTION_READBACK_MISMATCH"
+                result["protection_confirmed"] = False
+        if effect is not None and state == "ACCEPTED":
+            evidence = self._effect_readback(effect[0], effect[1], result)
+            if evidence is None:
+                result["state"] = "UNKNOWN"
+                result["code"] = "EFFECT_READBACK_REQUIRED"
+                result["readback_confirmed"] = False
+            else:
+                result.update(evidence)
         return result
 
     def submit_market(self, payload):
-        return self._send(self._request("order.submit_market", payload))
+        return self._send(
+            self._request("order.submit_market", payload),
+            effect=("order.submit_market", payload),
+        )
 
     def modify_protection(self, payload):
-        return self._send(self._request("position.modify_protection", payload))
+        request = self._request("position.modify_protection", payload)
+        _, meta = self._symbol(str(payload.get("symbol") or ""))
+        return self._send(
+            request,
+            protection={
+                "position_ticket": payload.get("position_ticket"),
+                "digits": meta.digits,
+                "sl": request["sl"],
+                "tp": request["tp"],
+            },
+        )
 
     def close(self, payload):
-        return self._send(self._request("position.close", payload))
+        return self._send(
+            self._request("position.close", payload),
+            effect=("position.close", payload),
+        )
 
     def invoke(self, typ, payload):
         if typ == "order.submit_market":
@@ -406,6 +649,8 @@ class OfficialMT5Adapter:
 class FakeMT5Adapter:
     """Deterministic adapter for unit tests; records exact requests and outcomes."""
 
+    ACCEPTED_RETCODES = OfficialMT5Adapter.ACCEPTED_RETCODES
+
     DEFAULT_SYMBOLS = {
         "EURUSD": {
             "digits": 5,
@@ -427,7 +672,9 @@ class FakeMT5Adapter:
         symbols: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self.identity = identity or Identity("MT5", "Demo", "42")
-        self.outcome = outcome or {"retcode": 10009}
+        # The fake models an independently checked broker snapshot. Tests
+        # that omit this proof must exercise the dispatcher's UNKNOWN path.
+        self.outcome = outcome or {"retcode": 10009, "readback_confirmed": True}
         self.check_result = check if check is not None else {"retcode": 0}
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.checks: list[tuple[str, dict[str, Any]]] = []
@@ -492,7 +739,16 @@ class FakeMT5Adapter:
         return self._record("order.submit_market", payload)
 
     def modify_protection(self, payload):
-        return self._record("position.modify_protection", payload)
+        result = self._record("position.modify_protection", payload)
+        if isinstance(result, Mapping) and result.get("retcode") in self.ACCEPTED_RETCODES:
+            return {
+                **result,
+                "protection_confirmed": True,
+                "readback_confirmed": True,
+                "confirmed_stop": payload.get("sl"),
+                "confirmed_take_profit": payload.get("tp"),
+            }
+        return result
 
     def close(self, payload):
         return self._record("position.close", payload)

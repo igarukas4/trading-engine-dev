@@ -13,13 +13,23 @@ class DispatchError(RuntimeError):
 
 
 class Dispatcher:
+    ACCEPTED_RETCODES = {10008, 10009, 10010, "10008", "10009", "10010"}
+    REJECTED_RETCODES = {
+        10006, 10007, 10011, 10013, 10014, 10015, 10016, 10017, 10018,
+        10019, 10022, 10025, 10026, 10027, 10029, 10030, 10035,
+        "10006", "10007", "10011", "10013", "10014", "10015", "10016",
+        "10017", "10018", "10019", "10022", "10025", "10026", "10027",
+        "10029", "10030", "10035",
+    }
     def __init__(self, journal: SQLiteJournal, adapter: Any, *, account_id: str | None = None,
-                 generation: int | None = None, execution_epoch: int | None = None):
+                 generation: int | None = None, execution_epoch: int | None = None,
+                 execution_enabled: bool = True):
         self.journal = journal
         self.adapter = adapter
         self.account_id = account_id or journal.account_id
         self.generation = generation
         self.execution_epoch = execution_epoch
+        self.execution_enabled = execution_enabled
         self._lock = threading.RLock()
         # Recovery is part of construction: no caller can accidentally dispatch
         # while an old ambiguity boundary is still unresolved.
@@ -88,13 +98,18 @@ class Dispatcher:
                 return {"state": "UNKNOWN", "code": record.error_code or "RECONCILIATION_REQUIRED"}
             if typ not in SIDE_EFFECTING_TYPES:
                 return self._finish(command_id, "REJECTED", "UNSUPPORTED_DISPATCH_TYPE")
+            if not self.execution_enabled:
+                return self._finish(command_id, "REJECTED", "EXECUTION_DISABLED")
             if self.blocked:
                 return self._finish(command_id, "REJECTED", "ACCOUNT_FENCED_UNKNOWN")
             error = self._validate(typ, payload)
             if error:
                 return self._finish(command_id, "REJECTED", error)
             try:
-                self.journal.transition(command_id, state="INVOKING", phase="CHECKING")
+                # Keep the journal pre-invocation until the broker check has
+                # passed. A crash during order_check must recover as
+                # NOT_INVOKED_AFTER_RESTART.
+                self.journal.transition(command_id, phase="CHECKING")
                 checked = self._check(typ, payload)
             except Exception:
                 return self._finish(command_id, "REJECTED", "ADAPTER_CHECK_ERROR")
@@ -109,9 +124,15 @@ class Dispatcher:
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS")
             if result is None:
                 return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS")
-            state = self._result_state(result)
+            state = self._result_state(result, typ)
             if state == "UNKNOWN":
-                return self._finish(command_id, "UNKNOWN", "TRANSPORT_AMBIGUOUS", result)
+                fields = self._result_fields(result)
+                code = (
+                    "EFFECT_READBACK_REQUIRED"
+                    if self._accepted_without_readback(fields)
+                    else "TRANSPORT_AMBIGUOUS"
+                )
+                return self._finish(command_id, "UNKNOWN", code, result)
             return self._finish(command_id, state, None if state == "ACCEPTED" else "BROKER_REJECTED", result)
 
     def reconcile(self, command_id: str, *, snapshot: Mapping[str, Any], source: str,
@@ -182,20 +203,33 @@ class Dispatcher:
         return fields.get("retcode") in (0, "0")
 
     @classmethod
-    def _result_state(cls, result) -> str:
+    def _result_state(cls, result, typ: str | None = None) -> str:
         fields = cls._result_fields(result)
         state, retcode = fields.get("state"), fields.get("retcode")
         if str(state).upper() in {"UNKNOWN", "AMBIGUOUS"}:
             return "UNKNOWN"
         if str(state).upper() in {"ACCEPTED", "REJECTED"}:
-            return str(state).upper()
+            state = str(state).upper()
+            if state == "ACCEPTED" and typ in SIDE_EFFECTING_TYPES and fields.get("readback_confirmed") is not True:
+                return "UNKNOWN"
+            return state
         if retcode in (10012, "10012"):
             return "UNKNOWN"
-        if retcode in (10008, 10009, 10010, "10008", "10009", "10010"):
+        if retcode in cls.ACCEPTED_RETCODES:
+            if typ in SIDE_EFFECTING_TYPES and fields.get("readback_confirmed") is not True:
+                return "UNKNOWN"
             return "ACCEPTED"
-        if retcode is not None:
+        if retcode in cls.REJECTED_RETCODES:
             return "REJECTED"
         return "UNKNOWN"
+
+    @classmethod
+    def _accepted_without_readback(cls, fields: Mapping[str, Any]) -> bool:
+        state = str(fields.get("state", "")).upper()
+        return (
+            state == "ACCEPTED"
+            or fields.get("retcode") in cls.ACCEPTED_RETCODES
+        ) and fields.get("readback_confirmed") is not True
 
     def _finish(self, command_id, state, code, result=None):
         result_mapping = self._result_mapping(result)

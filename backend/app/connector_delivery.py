@@ -437,6 +437,22 @@ class ConnectorDeliveryRegistry:
             session.seen_message_ids.add(message["message_id"])
             self._received_sequence[session.account_id] = message["sequence"]
             self._received_message_ids[session.account_id] = set(session.seen_message_ids)
+            if (
+                result == "ACCEPTED"
+                and envelope.type in SIDE_EFFECTING_COMMANDS
+                and payload.get("readback_confirmed") is not True
+            ):
+                result = "UNKNOWN"
+                payload["state"] = result
+                payload.setdefault("code", "EFFECT_READBACK_REQUIRED")
+            if (
+                result == "ACCEPTED"
+                and envelope.type == "position.modify_protection"
+                and payload.get("protection_confirmed") is not True
+            ):
+                result = "UNKNOWN"
+                payload["state"] = result
+                payload.setdefault("code", "PROTECTION_READBACK_REQUIRED")
             if item.state != "SENT":
                 if item.state == result:
                     return result
@@ -498,6 +514,27 @@ class ConnectorDeliveryBridge:
             if error.code not in DEFERRED_DELIVERY_ERRORS:
                 raise
         return record
+
+    async def enqueue_position_command(
+        self,
+        account_id: str,
+        command_id: str,
+        *,
+        identity: dict[str, str],
+        generation: int,
+    ) -> ConnectorDispatchRecord:
+        record = self.coordinator.prepare_connector_position_dispatch(
+            account_id, command_id, identity=identity, generation=generation,
+        )
+        try:
+            await self._enqueue_record(record)
+        except DeliveryError as error:
+            if error.code not in DEFERRED_DELIVERY_ERRORS:
+                raise
+        return record
+
+    enqueue_position_modify_protection = enqueue_position_command
+    enqueue_position_close = enqueue_position_command
 
     async def replay_unsent(self, account_id: str) -> tuple[OutboundEnvelope, ...]:
         """Replay only durable QUEUED records; SENT/UNKNOWN are reconciliation work."""

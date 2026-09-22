@@ -10,7 +10,8 @@ from mt5_connector.journal import SQLiteJournal, canonical_request_hash
 
 class Adapter:
     def __init__(self, result=None):
-        self.result = result or {"retcode": 10009, "external_order_id": "o1"}
+        self.result = result or {"retcode": 10009, "external_order_id": "o1",
+                                 "readback_confirmed": True}
         self.calls = []
 
     def order_check(self, typ, payload):
@@ -61,6 +62,18 @@ class JournalDispatcherTests(unittest.TestCase):
         self.assertEqual(dispatcher.dispatch(self.command())["state"], "UNKNOWN")
         later = self.command("c2", "k2", 2)
         self.assertEqual(dispatcher.dispatch(later)["code"], "ACCOUNT_FENCED_UNKNOWN")
+
+    def test_accepted_without_broker_readback_stays_unknown_and_is_not_retried(self):
+        journal = self.open_journal()
+        adapter = Adapter({"retcode": 10009, "external_order_id": "o1"})
+        dispatcher = Dispatcher(journal, adapter)
+        command = self.command()
+        first = dispatcher.dispatch(command)
+        replay = dispatcher.dispatch(command)
+        self.assertEqual(first["state"], "UNKNOWN")
+        self.assertEqual(first["code"], "EFFECT_READBACK_REQUIRED")
+        self.assertEqual(replay["state"], "UNKNOWN")
+        self.assertEqual([call[0] for call in adapter.calls], ["check", "invoke"])
 
     def test_restart_rejects_uninvoked_and_keeps_invoked_unknown(self):
         journal = self.open_journal()

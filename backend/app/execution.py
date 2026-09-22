@@ -8,6 +8,7 @@ the journal/broker for truth before any further side effect.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -212,6 +213,7 @@ class Position:
     entry_price: str | None = None
     current_pnl: str | None = None
     data_status: Literal["CONFIRMED", "UNKNOWN", "STALE"] = "UNKNOWN"
+    version: int = 0
 
     def __post_init__(self) -> None:
         if self.remaining_volume is None:
@@ -223,11 +225,12 @@ class PositionCommand:
     id: str
     account_id: str
     order_id: str
-    command_type: Literal["TP1", "TP2", "TRAIL", "CLOSE"]
+    command_type: Literal["TP1", "TP2", "TRAIL", "CLOSE", "PROTECTION"]
     requested_volume: str | None
     reduce_only: bool = True
     status: Literal["RECEIVED", "DISPATCHING", "CONFIRMED", "UNKNOWN", "REJECTED"] = "RECEIVED"
     requested_stop: str | None = None
+    requested_take_profit: str | None = None
     confirmed_stop: str | None = None
     reason: str | None = None
     idempotency_key: str | None = None
@@ -2226,6 +2229,43 @@ class ExecutionSubstrate:
             position.stage = "CLOSING"
             return command
 
+    def request_position_modify_protection(
+        self, account_id: str, order_id: str, stop_loss: str | None,
+        take_profit: str | None, confirmed_pair: str, reason: str,
+        *, confirmed: bool = False, idempotency_key: str | None = None,
+    ) -> PositionCommand:
+        """Create an explicitly approved native protection modification."""
+        with self._lock_for(account_id):
+            order = self.orders.get(order_id)
+            if order is None or order.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            position = self.position(account_id, order_id)
+            if confirmed_pair != (position.pair or "UNKNOWN"):
+                raise ExecutionError("POSITION_PAIR_MISMATCH")
+            if not confirmed:
+                raise ExecutionError("OPERATOR_CONFIRMATION_REQUIRED")
+            if stop_loss is None and take_profit is None:
+                raise ExecutionError("PROTECTION_REQUIRED")
+            if not reason.strip():
+                raise ExecutionError("OPERATOR_REASON_REQUIRED")
+            if idempotency_key:
+                prior_id = self._position_command_keys.get((account_id, idempotency_key))
+                if prior_id:
+                    return next(command for command in self.position_commands if command.id == prior_id)
+            command = PositionCommand(
+                id=str(uuid4()), account_id=account_id, order_id=order_id,
+                command_type="PROTECTION", requested_volume=None,
+                requested_stop=str(stop_loss) if stop_loss is not None else None,
+                requested_take_profit=str(take_profit) if take_profit is not None else None,
+                reason=reason, idempotency_key=idempotency_key,
+            )
+            self.position_commands.append(command)
+            if idempotency_key:
+                self._position_command_keys[(account_id, idempotency_key)] = command.id
+            return command
+
+    request_position_protection = request_position_modify_protection
+
     def install_fence(self, account_id: str, kind: str = "SAFETY_FENCE") -> SafetyFence:
         account = self.account(account_id)
         account.fence_sequence += 1
@@ -2282,6 +2322,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         *,
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
+        account_identity_provider: Any | None = None,
         reconciliation_deadline: timedelta = timedelta(minutes=5),
         max_protection_repair_attempts: int = 3,
     ) -> None:
@@ -2304,6 +2345,8 @@ class ExecutionCoordinator(ExecutionSubstrate):
         else:
             self._state_store = None
         self._mutation_depth = 0
+        self._account_identity_provider = account_identity_provider
+        self._account_identities: dict[str, dict[str, str]] = {}
         self.reconciliation_deadline = reconciliation_deadline
         self.max_protection_repair_attempts = max_protection_repair_attempts
         self.reconciliation_work: dict[str, ReconciliationWork] = {}
@@ -2315,12 +2358,54 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 self._begin_restart_recovery()
                 self._recover_inflight_dispatches()
 
+    def bind_account_identity(self, account_id: str, identity: dict[str, str]) -> None:
+        """Bind the immutable BrokerAccount identity used by connector dispatch."""
+        if not isinstance(account_id, str) or not account_id:
+            raise ExecutionError("WRONG_ACCOUNT")
+        if set(identity) != {"provider", "broker_server", "external_account_id"}:
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        if any(not isinstance(value, str) or not value for value in identity.values()):
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        prior = self._account_identities.get(account_id)
+        if prior is not None and prior != identity:
+            raise ExecutionError("ACCOUNT_IDENTITY_MISMATCH")
+        self._account_identities[account_id] = dict(identity)
+
+    def _expected_account_identity(self, account_id: str) -> dict[str, str] | None:
+        if self._account_identity_provider is not None:
+            try:
+                value = self._account_identity_provider(account_id)
+            except (KeyError, AttributeError, TypeError):
+                value = None
+            if hasattr(value, "identity"):
+                value = value.identity
+            if isinstance(value, tuple):
+                value = dict(zip(("provider", "broker_server", "external_account_id"), value))
+            if isinstance(value, dict) and set(value) == {
+                "provider", "broker_server", "external_account_id"
+            }:
+                return {key: str(item) for key, item in value.items()}
+        bound = self._account_identities.get(account_id)
+        return dict(bound) if bound is not None else None
+
+    def _validate_connector_identity(self, account_id: str, identity: dict[str, str]) -> None:
+        if set(identity) != {"provider", "broker_server", "external_account_id"}:
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        if any(not isinstance(value, str) or not value for value in identity.values()):
+            raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+        expected = self._expected_account_identity(account_id)
+        if self._account_identity_provider is not None and expected is None:
+            raise ExecutionError("ACCOUNT_IDENTITY_UNAVAILABLE")
+        if expected is not None and identity != expected:
+            raise ExecutionError("ACCOUNT_IDENTITY_MISMATCH")
+
     def _snapshot(self) -> dict[str, Any]:
         return _serialize_state_value(
             {
                 "accounts": {
                     key: value.__dict__ for key, value in self._accounts.items()
                 },
+                "account_identities": self._account_identities,
                 "reservations": {
                     key: value.__dict__ for key, value in self.reservations.items()
                 },
@@ -2394,6 +2479,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
         if not state:
             return
         state = _deserialize_state_value(state)
+        self._account_identities = {
+            str(account_id): dict(identity)
+            for account_id, identity in state.get("account_identities", {}).items()
+        }
         for key, value in state.get("accounts", {}).items():
             value["interlock_reasons"] = tuple(value.get("interlock_reasons", ()))
             for timestamp_key in (
@@ -2765,8 +2854,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def recovery_records(self, account_id: str) -> list[dict[str, Any]]:
         """Dashboard-safe, account-scoped recovery progress."""
         with self._lock_for(account_id):
-            return [
-                {
+            records: list[dict[str, Any]] = []
+            for item in self.reconciliation_work.values():
+                if item.account_id != account_id:
+                    continue
+                record = {
                     "kind": item.subject_kind,
                     "order_id": item.subject_id,
                     "subject_id": item.subject_id,
@@ -2777,10 +2869,23 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     "attempts": item.attempts,
                     "critical": item.status == "ESCALATED",
                     "recovery_legal": item.status == "PENDING",
+                    # This is permission to derive a no-effect result from a
+                    # complete connector read. The connector must still prove
+                    # the overlapping history queries succeeded and contain no
+                    # correlated broker row before it emits NO_EFFECT.
+                    "authoritative_no_effect": item.status in UNRESOLVED_RECONCILIATION_STATUSES,
                 }
-                for item in self.reconciliation_work.values()
-                if item.account_id == account_id
-            ]
+                # Backend recovery work is keyed by the domain Order ID. The
+                # connector journal is keyed by the dispatched command ID.
+                # Carry both identifiers so reconciliation can resolve the
+                # local row without changing the account-facing subject.
+                if item.subject_kind == "ORDER":
+                    order = self.orders.get(item.subject_id)
+                    if order is not None and order.account_id == account_id:
+                        command_id = order.command_id or order.id
+                        record["command_id"] = command_id
+                records.append(record)
+            return records
 
     def _accept_execution(
         self,
@@ -2917,8 +3022,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
             order = self.orders.get(order_id)
             if order is None or order.account_id != account_id:
                 raise ExecutionError("WRONG_ACCOUNT")
-            if set(identity) != {"provider", "broker_server", "external_account_id"}:
-                raise ExecutionError("INVALID_ACCOUNT_IDENTITY")
+            self._validate_connector_identity(account_id, identity)
             command_id = order.command_id or order.id
             existing = self.dispatch_records.get(command_id)
             if existing is not None:
@@ -2945,6 +3049,72 @@ class ExecutionCoordinator(ExecutionSubstrate):
             self._audit(account_id, "execution.dispatch.queued", command_id=command_id)
             return record
 
+    def prepare_connector_position_dispatch(
+        self,
+        account_id: str,
+        command_id: str,
+        *,
+        identity: dict[str, str],
+        generation: int,
+    ) -> ConnectorDispatchRecord:
+        """Create the same durable delivery row for a position command."""
+        with self._mutation(), self._lock_for(account_id):
+            command = next((item for item in self.position_commands if item.id == command_id), None)
+            if command is None or command.account_id != account_id:
+                raise ExecutionError("WRONG_ACCOUNT")
+            self._validate_connector_identity(account_id, identity)
+            existing = self.dispatch_records.get(command_id)
+            position = self.position(account_id, command.order_id)
+            command_types = {"PROTECTION": "position.modify_protection", "CLOSE": "position.close"}
+            command_type = command_types.get(command.command_type)
+            if command_type is None:
+                raise ExecutionError("UNSUPPORTED_POSITION_COMMAND")
+            position_ticket = position.external_position_id
+            if position_ticket is None or not str(position_ticket).strip():
+                raise ExecutionError("POSITION_TICKET_REQUIRED")
+            if command_type == "position.modify_protection":
+                payload = {
+                    "position_ticket": str(position_ticket),
+                    "symbol": position.pair or "",
+                    "sl": command.requested_stop,
+                    "tp": command.requested_take_profit,
+                    "expected_position_version": position.version,
+                }
+            else:
+                payload = {
+                    "position_ticket": str(position_ticket),
+                    "symbol": position.pair or "",
+                    "direction": position.direction or "LONG",
+                    "volume": command.requested_volume or position.remaining_volume,
+                    "expected_position_volume": position.remaining_volume,
+                    "comment": "te:" + command.id,
+                }
+            request_hash = hashlib.sha256(
+                json.dumps(
+                    {"command_type": command_type, "payload": payload},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            if existing is not None:
+                if existing.account_id != account_id or existing.request_hash != request_hash:
+                    raise ExecutionError("COMMAND_CONTEXT_MISMATCH")
+                return existing
+            account = self.account(account_id)
+            dispatch_sequence = account.next_dispatch_sequence
+            account.next_dispatch_sequence += 1
+            record = ConnectorDispatchRecord(
+                command_id=command.id, account_id=account_id, identity=dict(identity),
+                command_type=command_type, dispatch_sequence=dispatch_sequence,
+                generation=generation, execution_epoch=account.execution_epoch,
+                idempotency_key=command.idempotency_key or command.id,
+                request_hash=request_hash, payload=payload,
+            )
+            self.dispatch_records[command.id] = record
+            self._audit(account_id, "execution.position_dispatch.queued", command_id=command.id)
+            return record
+
     def connector_dispatch_result(
         self,
         account_id: str,
@@ -2964,9 +3134,73 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 if record.state == state:
                     return record
                 raise ExecutionError("STALE_COMMAND_RESULT")
-            record.state = state
             result_payload = dict(payload or {})
+            if (
+                state == "ACCEPTED"
+                and record.command_type in {
+                    "order.submit_market", "position.modify_protection", "position.close",
+                }
+                and result_payload.get("readback_confirmed") is not True
+            ):
+                state = "UNKNOWN"
+                result_payload["state"] = state
+                result_payload.setdefault("code", "EFFECT_READBACK_REQUIRED")
+            if (
+                state == "ACCEPTED"
+                and record.command_type == "position.modify_protection"
+                and result_payload.get("protection_confirmed") is not True
+            ):
+                state = "UNKNOWN"
+                result_payload["state"] = state
+                result_payload.setdefault("code", "PROTECTION_READBACK_REQUIRED")
+            if (
+                state == "ACCEPTED"
+                and record.command_type == "position.close"
+                and result_payload.get("filled_volume") in (None, "", 0, "0")
+            ):
+                # A requested close volume is intent, not broker evidence.
+                # Keep the command fenced until a deal/read-back supplies the
+                # actual reduction.
+                state = "UNKNOWN"
+                result_payload["state"] = state
+                result_payload.setdefault("code", "CLOSE_READBACK_REQUIRED")
+            record.state = state
             record.result_payload = result_payload
+            position_command = next(
+                (item for item in self.position_commands if item.id == command_id), None,
+            )
+            if position_command is not None and position_command.account_id == account_id:
+                position = self.position(account_id, position_command.order_id)
+                if state == "ACCEPTED":
+                    position_command.status = "CONFIRMED"
+                    if record.command_type == "position.modify_protection":
+                        position.protection_status = "CONFIRMED"
+                        if position_command.requested_stop is not None:
+                            position.native_stop_loss = position_command.requested_stop
+                            position.last_confirmed_stop = position_command.requested_stop
+                        if position_command.requested_take_profit is not None:
+                            position.native_take_profit = position_command.requested_take_profit
+                        position.version += 1
+                    else:
+                        volume = result_payload.get("filled_volume", position_command.requested_volume)
+                        if volume is not None:
+                            remaining = max(
+                                Decimal("0"),
+                                self._decimal(position.remaining_volume or position.volume) - self._decimal(str(volume)),
+                            )
+                            position.remaining_volume = self._decimal_string(remaining)
+                            if remaining == 0:
+                                position.stage = "CLOSED"
+                        position.version += 1
+                elif state == "REJECTED":
+                    position_command.status = "REJECTED"
+                else:
+                    position_command.status = "UNKNOWN"
+                    self._record_unknown(account_id, command_id, subject_kind="POSITION_COMMAND")
+                    if record.command_type == "position.modify_protection":
+                        self.mark_protection_unknown(account_id, position_command.order_id)
+                self._audit(account_id, "execution.position_dispatch.result", command_id=command_id, state=state)
+                return record
             order_id = next(
                 (item.id for item in self.orders.values() if item.command_id == command_id),
                 command_id,
@@ -3262,6 +3496,12 @@ class ExecutionCoordinator(ExecutionSubstrate):
     def request_position_close(self, *args: Any, **kwargs: Any) -> PositionCommand:
         with self._mutation():
             return super().request_position_close(*args, **kwargs)
+
+    def request_position_modify_protection(self, *args: Any, **kwargs: Any) -> PositionCommand:
+        with self._mutation():
+            return super().request_position_modify_protection(*args, **kwargs)
+
+    request_position_protection = request_position_modify_protection
 
     def request_trailing(self, *args: Any, **kwargs: Any) -> PositionCommand | None:
         with self._mutation():

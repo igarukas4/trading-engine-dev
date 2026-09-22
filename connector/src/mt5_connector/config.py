@@ -35,8 +35,8 @@ class ConnectorConfig:
         local = local_test or bool(raw.get("local_test"))
         if urlparse(raw["wss_url"]).scheme.lower() != "wss" and not local:
             raise ConfigError("wss_url must use wss")
-        if raw.get("execution_disabled") is not True:
-            raise ConfigError("DEMO connector requires execution_disabled=true")
+        if not isinstance(raw.get("execution_disabled", True), bool):
+            raise ConfigError("execution_disabled must be boolean")
         initial = raw.get("reconnect_initial", 1.0)
         maximum = raw.get("reconnect_max", 30.0)
         generation = raw.get("backend_generation", raw.get("generation", 0))

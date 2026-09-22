@@ -233,6 +233,49 @@ class ContractIssue63Tests(unittest.TestCase):
         self.assertEqual(evidence["status"], "UNRESOLVED")
         self.assertIsNone(row)
 
+    def test_reconciliation_normalizes_backend_order_id_to_local_command_id(self):
+        class EmptyHistory(Fake):
+            def history_orders(self, from_server_time=None):
+                return ReadSnapshot("history_orders", {"items": []})
+
+            def history_deals(self, from_server_time=None):
+                return ReadSnapshot("history_deals", {"items": []})
+
+        protocol = ConnectorProtocol(self.config(backend_generation=7), EmptyHistory())
+        protocol.accept_snapshot({"type": "snapshot", "generation": 7,
+                                  "snapshot": {"account_id": "a1"}})
+        response = protocol.handle({
+            "schema_version": 1, "type": "reconciliation.required",
+            "message_id": "reconcile-no-effect", "account_id": "a1",
+            "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 1,
+            "execution_epoch": 0, "command_id": None,
+            "idempotency_key": "msg:reconcile-no-effect",
+            "sent_at": "2026-09-18T00:00:00+00:00",
+            "payload": {
+                "from_server_time": "2026-09-17T23:55:00Z",
+                "recovery": [{
+                    "kind": "ORDER", "subject_id": "order-domain-id",
+                    "command_id": "command-local-id",
+                    "authoritative_no_effect": True,
+                }],
+            },
+        })
+        evidence = response[1]["payload"]["observation"]["recovery_matches"][0]
+        self.assertEqual(evidence["subject_id"], "order-domain-id")
+        self.assertEqual(evidence["journal_command_id"], "command-local-id")
+        self.assertEqual(evidence["status"], "NO_EFFECT")
+
+    def test_incomplete_no_effect_claim_stays_unresolved(self):
+        evidence, row = ConnectorProtocol._recovery_match(
+            {"kind": "ORDER", "subject_id": "order-1", "authoritative_no_effect": True},
+            [],
+            allow_authoritative_no_effect=False,
+        )
+        self.assertEqual(evidence["status"], "UNRESOLVED")
+        self.assertEqual(evidence["reason"], "CORRELATION_ABSENT")
+        self.assertIsNone(row)
+
         protocol = ConnectorProtocol(self.config(), Fake())
         with self.assertRaises(ProtocolError) as error:
             protocol.validate_hello({"type": "hello", "secret": "super-secret"})
