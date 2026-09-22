@@ -83,10 +83,11 @@ class FakeWindowsSecretApi:
         if access == 0x00000080:
             self.parents[handle] = {"share": share}
             return handle
-        # A replacement attempted during final path resolution succeeds only
-        # if a parent was opened with delete sharing or has already closed.
+        # A metadata/reparse replacement attempted during final path
+        # resolution succeeds only if a pinned parent permits either write or
+        # delete sharing, or if that parent has already closed.
         blocked = bool(self.parents) and all(
-            not item["share"] & self.FILE_SHARE_DELETE
+            not item["share"] & (self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE)
             for item in self.parents.values()
         )
         content = b"original" if blocked else b"replacement"
@@ -325,13 +326,9 @@ class Issue70RuntimeTests(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(parent_opens), 2)
         for _event, _path, share in parent_opens[:-1]:
+            self.assertEqual(share, FakeWindowsSecretApi.FILE_SHARE_READ)
+            self.assertEqual(share & FakeWindowsSecretApi.FILE_SHARE_WRITE, 0)
             self.assertEqual(share & FakeWindowsSecretApi.FILE_SHARE_DELETE, 0)
-            self.assertEqual(
-                share & (FakeWindowsSecretApi.FILE_SHARE_READ |
-                         FakeWindowsSecretApi.FILE_SHARE_WRITE),
-                FakeWindowsSecretApi.FILE_SHARE_READ |
-                FakeWindowsSecretApi.FILE_SHARE_WRITE,
-            )
         close_events = [event for event in boundary.events if event[0] == "close"]
         self.assertGreater(len(close_events), 1)
         self.assertFalse(close_events[0][2], "final handle must close first")

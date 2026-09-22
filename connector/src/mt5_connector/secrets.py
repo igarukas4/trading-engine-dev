@@ -254,9 +254,10 @@ def _read_windows_secret_unchecked(path: str, *, windows_api=None) -> str:
             handle = kernel32.CreateFileW(
                 parent,
                 FILE_READ_ATTRIBUTES,
-                # Keep the directory identity pinned through final open/read.
-                # Read/write sharing remains allowed for normal consumers.
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                # Keep the directory identity pinned through final
+                # validation/read and prevent metadata or reparse mutation
+                # while the final path is resolved.
+                FILE_SHARE_READ,
                 None,
                 OPEN_EXISTING,
                 FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
