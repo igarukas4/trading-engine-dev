@@ -14,12 +14,14 @@ class DispatchError(RuntimeError):
 
 class Dispatcher:
     def __init__(self, journal: SQLiteJournal, adapter: Any, *, account_id: str | None = None,
-                 generation: int | None = None, execution_epoch: int | None = None):
+                 generation: int | None = None, execution_epoch: int | None = None,
+                 execution_enabled: bool = True):
         self.journal = journal
         self.adapter = adapter
         self.account_id = account_id or journal.account_id
         self.generation = generation
         self.execution_epoch = execution_epoch
+        self.execution_enabled = execution_enabled
         self._lock = threading.RLock()
         # Recovery is part of construction: no caller can accidentally dispatch
         # while an old ambiguity boundary is still unresolved.
@@ -88,6 +90,8 @@ class Dispatcher:
                 return {"state": "UNKNOWN", "code": record.error_code or "RECONCILIATION_REQUIRED"}
             if typ not in SIDE_EFFECTING_TYPES:
                 return self._finish(command_id, "REJECTED", "UNSUPPORTED_DISPATCH_TYPE")
+            if not self.execution_enabled:
+                return self._finish(command_id, "REJECTED", "EXECUTION_DISABLED")
             if self.blocked:
                 return self._finish(command_id, "REJECTED", "ACCOUNT_FENCED_UNKNOWN")
             error = self._validate(typ, payload)

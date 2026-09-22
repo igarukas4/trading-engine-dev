@@ -7,7 +7,7 @@ from backend.app.connector_delivery import (
     DeliveryError,
     validate_hello,
 )
-from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
+from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, Position, RiskReservation
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -234,7 +234,52 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.runtime_interlock("a").status, "BLOCKED")
         self.assertEqual(coordinator.runtime_interlock("b").status, "ELIGIBLE")
 
-    async def test_bridge_restart_replays_only_queued_records(self):
+    async def test_position_commands_use_durable_bridge_and_project_account_locally(self):
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="position")
+        coordinator.positions[("a", "order-position")] = Position(
+            "a", "order-position", "0.10", "CONFIRMED", pair="EURUSD",
+            direction="LONG", external_position_id="ticket-1",
+        )
+        modify = coordinator.request_position_modify_protection(
+            "a", "order-position", "1.0", "2.0", "EURUSD", "operator",
+            confirmed=True, idempotency_key="modify-key",
+        )
+        close = coordinator.request_position_close(
+            "a", "order-position", "0.05", "EURUSD", "operator",
+            confirmed=True, idempotency_key="close-key",
+        )
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        modify_record = await bridge.enqueue_position_modify_protection(
+            "a", modify.id, identity=identity, generation=0,
+        )
+        close_record = await bridge.enqueue_position_close(
+            "a", close.id, identity=identity, generation=0,
+        )
+        self.assertEqual(modify_record.command_type, "position.modify_protection")
+        self.assertEqual(modify_record.payload["position_ticket"], "ticket-1")
+        self.assertEqual(close_record.command_type, "position.close")
+        self.assertEqual(close_record.payload["position_ticket"], "ticket-1")
+        first = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", first.command_id, "session")
+        await bridge.record_result({
+            **first.as_message(), "type": "command.result", "message_id": "result-modify",
+            "sequence": 1, "payload": {"state": "ACCEPTED"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(modify.status, "CONFIRMED")
+        self.assertEqual(coordinator.position("a", "order-position").native_stop_loss, "1.0")
+        second = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", second.command_id, "session")
+        await bridge.record_result({
+            **second.as_message(), "type": "command.result", "message_id": "result-close",
+            "sequence": 2, "payload": {"state": "ACCEPTED", "filled_volume": "0.05"},
+        }, authenticated_account_id="a", session_id="session")
+        self.assertEqual(close.status, "CONFIRMED")
+        self.assertEqual(coordinator.position("a", "order-position").remaining_volume, "0.05")
+
         from tempfile import TemporaryDirectory
 
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}

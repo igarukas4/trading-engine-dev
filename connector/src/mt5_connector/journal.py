@@ -139,6 +139,30 @@ class SQLiteJournal:
         with self._lock:
             return self._lookup("idempotency_key", key)
 
+    def ensure_generation(self, generation: int) -> None:
+        """Bind this account-local journal to one durable backend generation."""
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise JournalError("STALE_GENERATION")
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT generation FROM connector_meta WHERE account_id=?",
+                (self.account_id,),
+            ).fetchone()
+            command_generations = self.connection.execute(
+                "SELECT DISTINCT generation FROM connector_commands WHERE account_id=?",
+                (self.account_id,),
+            ).fetchall()
+            if any(int(item[0]) != generation for item in command_generations):
+                raise JournalError("STALE_GENERATION")
+            if row is not None and int(row[0]) != generation:
+                raise JournalError("STALE_GENERATION")
+            if row is None:
+                self.connection.execute(
+                    "INSERT INTO connector_meta(account_id,generation,next_client_sequence,last_server_sequence,updated_at) VALUES (?,?,?,?,?)",
+                    (self.account_id, generation, 1, 0, self.clock()),
+                )
+                self.connection.commit()
+
     def last_dispatch_sequence(self) -> int:
         with self._lock:
             row = self.connection.execute(

@@ -499,6 +499,27 @@ class ConnectorDeliveryBridge:
                 raise
         return record
 
+    async def enqueue_position_command(
+        self,
+        account_id: str,
+        command_id: str,
+        *,
+        identity: dict[str, str],
+        generation: int,
+    ) -> ConnectorDispatchRecord:
+        record = self.coordinator.prepare_connector_position_dispatch(
+            account_id, command_id, identity=identity, generation=generation,
+        )
+        try:
+            await self._enqueue_record(record)
+        except DeliveryError as error:
+            if error.code not in DEFERRED_DELIVERY_ERRORS:
+                raise
+        return record
+
+    enqueue_position_modify_protection = enqueue_position_command
+    enqueue_position_close = enqueue_position_command
+
     async def replay_unsent(self, account_id: str) -> tuple[OutboundEnvelope, ...]:
         """Replay only durable QUEUED records; SENT/UNKNOWN are reconciliation work."""
         delivered: list[OutboundEnvelope] = []
