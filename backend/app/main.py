@@ -169,6 +169,14 @@ def _available_accounts() -> list[BrokerAccount]:
     ]
 
 
+def _connector_identity(account: BrokerAccount) -> dict[str, str]:
+    return {
+        "provider": account.provider,
+        "broker_server": account.broker_server,
+        "external_account_id": account.external_account_id,
+    }
+
+
 def _strategy_configs_for(account_id: str) -> tuple[StrategyConfig, ...]:
     return strategy_configs.setdefault(account_id, canonical_configs(account_id))
 
@@ -1542,11 +1550,7 @@ def _schedule_full_auto_signal(signal: Any, account: BrokerAccount) -> dict[str,
         execution.prepare_connector_dispatch(
             account.id,
             scheduled.order.id,
-            identity={
-                "provider": account.provider,
-                "broker_server": account.broker_server,
-                "external_account_id": account.external_account_id,
-            },
+            identity=_connector_identity(account),
             generation=account.connector_generation,
         )
     _audit(
@@ -1843,11 +1847,7 @@ def execute_signal(account_id: str, signal_id: str, request: ExecuteSignalReques
     execution.prepare_connector_dispatch(
         account_id,
         result.order.id,
-        identity={
-            "provider": account.provider,
-            "broker_server": account.broker_server,
-            "external_account_id": account.external_account_id,
-        },
+        identity=_connector_identity(account),
         generation=account.connector_generation,
     )
     return _accepted_command_response(account_id, command, order=result.order.__dict__)
@@ -2133,11 +2133,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 account.id,
                 account.connector_generation,
                 hello["session_id"],
-                identity={
-                    "provider": account.provider,
-                    "broker_server": account.broker_server,
-                    "external_account_id": account.external_account_id,
-                },
+                identity=_connector_identity(account),
                 execution_epoch=execution.account(account.id).execution_epoch,
                 reconciliation_required=True,
             )
@@ -2175,9 +2171,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 "type": typ,
                 "message_id": message_id,
                 "account_id": account.id,
-                "provider": account.provider,
-                "broker_server": account.broker_server,
-                "external_account_id": account.external_account_id,
+                **_connector_identity(account),
                 "generation": account.connector_generation,
                 "sequence": sequence,
                 "execution_epoch": execution.account(account.id).execution_epoch,

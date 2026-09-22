@@ -2965,24 +2965,26 @@ class ExecutionCoordinator(ExecutionSubstrate):
                     return record
                 raise ExecutionError("STALE_COMMAND_RESULT")
             record.state = state
-            record.result_payload = dict(payload or {})
-            order = self.orders.get(next(
+            result_payload = dict(payload or {})
+            record.result_payload = result_payload
+            order_id = next(
                 (item.id for item in self.orders.values() if item.command_id == command_id),
                 command_id,
-            ))
+            )
+            order = self.orders.get(order_id)
             if order is not None and order.account_id == account_id:
+                journal = self.journal.get(order.id)
                 if state == "ACCEPTED":
                     order.status = "SUBMITTED"
                     self._event_for(order.id).status = "PUBLISHED"
-                    journal = self.journal.get(order.id)
                     if journal is not None:
                         journal.state = "ACCEPTED"
-                        journal.external_id = str((payload or {}).get("external_id")) if (payload or {}).get("external_id") is not None else None
+                        external_id = result_payload.get("external_id")
+                        journal.external_id = str(external_id) if external_id is not None else None
                 elif state == "REJECTED":
                     order.status = "REJECTED"
                     self._event_for(order.id).status = "ABORTED"
                     self._reservation_for(order.id).status = "RELEASED"
-                    journal = self.journal.get(order.id)
                     if journal is not None:
                         journal.state = "REJECTED"
                 else:

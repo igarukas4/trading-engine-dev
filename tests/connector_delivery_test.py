@@ -1,7 +1,13 @@
 import asyncio
 import unittest
 
-from backend.app.connector_delivery import ConnectorDeliveryRegistry, DeliveryError, validate_hello
+from backend.app.connector_delivery import (
+    ConnectorDeliveryBridge,
+    ConnectorDeliveryRegistry,
+    DeliveryError,
+    validate_hello,
+)
+from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
@@ -11,6 +17,24 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.kw = dict(
             account_id="a", identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
             connector_generation=7, execution_epoch=3, type="order.submit_market", payload={"pair": "EURUSD"},
+        )
+
+    @staticmethod
+    def _seed_dispatchable_order(coordinator, *, account_id: str, suffix: str) -> None:
+        order_id = "order-" + suffix
+        command_id = "command-" + suffix
+        signal_id = "signal-" + suffix
+        reservation_id = "reservation-" + suffix
+        coordinator.orders[order_id] = OrderIntent(
+            order_id, account_id, signal_id, "idem-" + suffix,
+            "hash-" + suffix, 1, 1, {"symbol": "EURUSD"}, command_id=command_id,
+        )
+        coordinator.reservations[reservation_id] = RiskReservation(
+            reservation_id, account_id, signal_id,
+        )
+        coordinator._order_reservations[order_id] = reservation_id
+        coordinator.events["event-" + suffix] = OutboxEvent(
+            "event-" + suffix, account_id, order_id, 1,
         )
 
     async def test_ordering_and_duplicate_pending_suppression(self):
@@ -183,25 +207,11 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertIsNone(registry.pending_state("a", "c1"))
     async def test_bridge_projects_result_and_keeps_accounts_isolated(self):
-        from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
-        from backend.app.connector_delivery import ConnectorDeliveryBridge
-
         coordinator = ExecutionCoordinator()
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
         for account_id, suffix in (("a", "1"), ("b", "2")):
-            order_id = "order-" + suffix
-            command_id = "command-" + suffix
-            coordinator.orders[order_id] = OrderIntent(
-                order_id, account_id, "signal-" + suffix, "idem-" + suffix,
-                "hash-" + suffix, 1, 1, {"symbol": "EURUSD"}, command_id=command_id,
-            )
-            reservation_id = "reservation-" + suffix
-            coordinator.reservations[reservation_id] = RiskReservation(
-                reservation_id, account_id, "signal-" + suffix,
-            )
-            coordinator._order_reservations[order_id] = reservation_id
-            coordinator.events["event-" + suffix] = OutboxEvent(
-                "event-" + suffix, account_id, order_id, 1,
+            self._seed_dispatchable_order(
+                coordinator, account_id=account_id, suffix=suffix,
             )
 
         registry = ConnectorDeliveryRegistry()
@@ -226,21 +236,15 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bridge_restart_replays_only_queued_records(self):
         from tempfile import TemporaryDirectory
-        from backend.app.execution import ExecutionCoordinator, OrderIntent, OutboxEvent, RiskReservation
-        from backend.app.connector_delivery import ConnectorDeliveryBridge
 
         identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
         with TemporaryDirectory() as directory:
             coordinator = ExecutionCoordinator(state_path=directory + "/execution.json")
-            coordinator.orders["order"] = OrderIntent(
-                "order", "a", "signal", "idem", "hash", 1, 1,
-                {"symbol": "EURUSD"}, command_id="command",
+            self._seed_dispatchable_order(
+                coordinator, account_id="a", suffix="restart",
             )
-            coordinator.reservations["reservation"] = RiskReservation("reservation", "a", "signal")
-            coordinator._order_reservations["order"] = "reservation"
-            coordinator.events["event"] = OutboxEvent("event", "a", "order", 1)
             record = coordinator.prepare_connector_dispatch(
-                "a", "order", identity=identity, generation=1,
+                "a", "order-restart", identity=identity, generation=1,
             )
             restarted = ExecutionCoordinator(state_path=directory + "/execution.json")
             registry = ConnectorDeliveryRegistry()

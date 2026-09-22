@@ -8,7 +8,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from .execution import ConnectorDispatchRecord
 
 
 COMMAND_TYPES = frozenset({
@@ -25,6 +28,9 @@ SIDE_EFFECTING_COMMANDS = frozenset({
 })
 IDENTITY_FIELDS = frozenset({"provider", "broker_server", "external_account_id"})
 RESULT_STATES = frozenset({"ACCEPTED", "REJECTED", "UNKNOWN"})
+DEFERRED_DELIVERY_ERRORS = frozenset({
+    "SESSION_NOT_ACTIVE", "RECONCILIATION_REQUIRED", "DUPLICATE_PENDING_COMMAND",
+})
 
 
 class DeliveryError(Exception):
@@ -461,6 +467,20 @@ class ConnectorDeliveryBridge:
         self.coordinator = coordinator
         self.registry = registry or ConnectorDeliveryRegistry()
 
+    async def _enqueue_record(self, record: ConnectorDispatchRecord) -> OutboundEnvelope:
+        return await self.registry.enqueue(
+            account_id=record.account_id,
+            identity=record.identity,
+            connector_generation=record.generation,
+            dispatch_sequence=record.dispatch_sequence,
+            execution_epoch=record.execution_epoch,
+            command_id=record.command_id,
+            idempotency_key=record.idempotency_key,
+            request_hash=record.request_hash,
+            type=record.command_type,
+            payload=record.payload,
+        )
+
     async def enqueue_order(
         self,
         account_id: str,
@@ -468,58 +488,36 @@ class ConnectorDeliveryBridge:
         *,
         identity: dict[str, str],
         generation: int,
-    ) -> Any:
+    ) -> ConnectorDispatchRecord:
         record = self.coordinator.prepare_connector_dispatch(
             account_id, order_id, identity=identity, generation=generation,
         )
         try:
-            await self.registry.enqueue(
-                account_id=record.account_id,
-                identity=record.identity,
-                connector_generation=record.generation,
-                dispatch_sequence=record.dispatch_sequence,
-                execution_epoch=record.execution_epoch,
-                command_id=record.command_id,
-                idempotency_key=record.idempotency_key,
-                request_hash=record.request_hash,
-                type=record.command_type,
-                payload=record.payload,
-            )
+            await self._enqueue_record(record)
         except DeliveryError as error:
-            if error.code not in {"SESSION_NOT_ACTIVE", "RECONCILIATION_REQUIRED", "DUPLICATE_PENDING_COMMAND"}:
+            if error.code not in DEFERRED_DELIVERY_ERRORS:
                 raise
         return record
 
-    async def replay_unsent(self, account_id: str) -> tuple[Any, ...]:
+    async def replay_unsent(self, account_id: str) -> tuple[OutboundEnvelope, ...]:
         """Replay only durable QUEUED records; SENT/UNKNOWN are reconciliation work."""
-        delivered: list[Any] = []
+        delivered: list[OutboundEnvelope] = []
         for record in self.coordinator.pending_connector_dispatches(account_id):
             try:
-                envelope = await self.registry.enqueue(
-                    account_id=record.account_id,
-                    identity=record.identity,
-                    connector_generation=record.generation,
-                    dispatch_sequence=record.dispatch_sequence,
-                    execution_epoch=record.execution_epoch,
-                    command_id=record.command_id,
-                    idempotency_key=record.idempotency_key,
-                    request_hash=record.request_hash,
-                    type=record.command_type,
-                    payload=record.payload,
-                )
+                envelope = await self._enqueue_record(record)
             except DeliveryError as error:
-                if error.code in {"DUPLICATE_PENDING_COMMAND", "SESSION_NOT_ACTIVE", "RECONCILIATION_REQUIRED"}:
+                if error.code in DEFERRED_DELIVERY_ERRORS:
                     continue
                 raise
             delivered.append(envelope)
         return tuple(delivered)
 
-    async def mark_sent(self, account_id: str, command_id: str, session_id: str) -> Any:
+    async def mark_sent(self, account_id: str, command_id: str, session_id: str) -> OutboundEnvelope:
         envelope = await self.registry.mark_sent(account_id, command_id, session_id)
         self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
         return envelope
 
-    def session_lost(self, account_id: str) -> tuple[Any, ...]:
+    def session_lost(self, account_id: str) -> tuple[ConnectorDispatchRecord, ...]:
         return self.coordinator.mark_connector_session_lost(account_id)
 
     async def record_result(
