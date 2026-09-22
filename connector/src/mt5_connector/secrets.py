@@ -52,6 +52,11 @@ def _check_secret_file_acl(candidate: Path) -> None:
         "builtin\\users",
         "guests",
         "anonymous logon",
+        "s-1-1-0",       # Everyone
+        "s-1-5-11",      # Authenticated Users
+        "s-1-5-32-545",  # Builtin Users
+        "s-1-5-32-546",  # Builtin Guests
+        "s-1-5-7",       # Anonymous Logon
     )
     if any(principal in acl for principal in broad_principals) or re.search(
         r"(?:^|\s)[^\s:]+\\users\s*:", acl

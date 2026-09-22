@@ -448,6 +448,9 @@ class OfficialMT5Adapter:
 
         matches: list[dict[str, Any]] = []
         for source, row in rows:
+            status = str(row.get("status", row.get("state", ""))).upper()
+            if status in {"REJECTED", "CANCELLED", "CANCELED", "EXPIRED", "NOT_FOUND"}:
+                continue
             row_ids = {
                 str(row.get(name))
                 for name in ("ticket", "order", "deal", "position", "order_id", "deal_id", "position_id")
