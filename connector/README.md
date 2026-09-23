@@ -1,5 +1,17 @@
 # MT5 Connector (DEMO/MANUAL, fail-closed)
 
+## Windows Python 3.14 setup
+
+Install Python 3.14 for the connector host, then create an isolated environment
+and install the exact connector pins from the repository root:
+
+```powershell
+py -3.14 -m venv connector\.venv
+connector\.venv\Scripts\python.exe -m pip install --upgrade pip
+connector\.venv\Scripts\python.exe -m pip install -r connector/requirements.txt
+connector\.venv\Scripts\python.exe -m pip check
+```
+
 On the Windows terminal host, install the official `MetaTrader5` package and `websockets` in a dedicated Python environment. Use a config file outside the repository. Prefer `secret_ref=credential-manager://<target>` and provision that target in Windows Credential Manager for the connector's Windows user. The provider reads that generic credential through the native Credential Manager API. If Credential Manager is unavailable, use `secret_ref=file:///<absolute-path>` for a UTF-8 secret file outside the repository. On Windows the file provider opens and validates every existing parent component with `OPEN_REPARSE_POINT`, rejects junctions and other reparse points, checks the final handle for a regular file and a restrictive DACL, then reads that same handle. Unsupported ACE variants fail closed. On POSIX test hosts it uses `O_NOFOLLOW`, `fstat`, and owner-only mode bits. It rejects symlinks/reparse points, broad read ACLs, empty or invalid files, and never reads the path after an ACL check. Keep the file owner-only (`0600` on POSIX) and grant no `Everyone`, `Authenticated Users`, `Users`, `Guests`, or anonymous access on Windows. Both stores are protected production providers; `local_test` callbacks are test seams and never authorize a production command session.
 
 From the repository root, set `PYTHONPATH=connector/src` in the process environment, then run `python -m mt5_connector.main --config <absolute-config-path> --preflight-only`. This initializes the terminal, reads local journal and terminal facts, authenticates WSS, and waits for the backend reconciliation acknowledgement. It prints only the account ID and `PASS` or `FAIL`; it never enables broker side effects. A failing preflight is a stop condition.

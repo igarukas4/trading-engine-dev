@@ -49,6 +49,7 @@ from .connector_delivery import (
     connector_delivery,
     validate_hello,
 )
+from .lifecycle import LifecycleCoordinator
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
 execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
+lifecycle = LifecycleCoordinator()
 connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
@@ -205,6 +207,13 @@ class GlobalEmergencyRequest(BaseModel):
 
 
 class EmergencyRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class LifecycleCommandRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     idempotency_key: str = Field(min_length=1, max_length=200)
     expected_version: int = Field(ge=1)
@@ -633,6 +642,61 @@ def list_broker_accounts() -> dict[str, Any]:
         ],
         "has_more": False,
     }
+
+
+def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
+    readiness = result.readiness
+    return {
+        "account_id": account.id,
+        "command_id": result.command_id,
+        "audit_id": result.audit_id,
+        "status": result.status,
+        "lifecycle_status": account.lifecycle_status,
+        "bot_state": account.bot_state,
+        "account_version": account.version,
+        "execution_epoch": account.execution_epoch,
+        "readiness": {
+            "allowed": readiness.allowed,
+            "connector_healthy": readiness.connector_healthy,
+            "lease_current": readiness.lease_current,
+            "reconciliation_complete": readiness.reconciliation_complete,
+            "no_unknown": readiness.no_unknown,
+            "runtime_interlock": readiness.runtime_interlock,
+            "reason_codes": list(readiness.runtime_reason_codes),
+            "recovery_ready": readiness.recovery_ready,
+        },
+        "replayed": result.replayed,
+    }
+
+
+def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandRequest, session: str | None) -> dict[str, Any]:
+    if not session:
+        raise HTTPException(status_code=401, detail={"code": "AUTHENTICATION_REQUIRED"})
+    _require_account(account_id)
+    account = accounts.accounts[account_id]
+    context = lifecycle.readiness_context(account, accounts.bindings.get(account_id), execution)
+    try:
+        result = lifecycle.command(
+            account, action, idempotency_key=request.idempotency_key,
+            expected_version=request.expected_version, reason=request.reason,
+            actor=session, readiness=context,
+            fence=lambda allowed: execution.set_lifecycle_gate(account_id, allowed),
+        )
+    except ValueError as error:
+        code = str(error)
+        status_code = 409 if code in {"STALE_VERSION", "IDEMPOTENCY_CONFLICT", "LIFECYCLE_DISABLED"} else 422
+        raise HTTPException(status_code=status_code, detail={"code": code}) from error
+    accounts._persist_account(account)
+    _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=session)
+    return _lifecycle_payload(account, result)
+
+
+@app.post("/api/v1/broker-accounts/{account_id}/lifecycle/{action}", tags=["execution"])
+def account_lifecycle_command(
+    account_id: str, action: Literal["enable", "start", "stop", "disable"],
+    request: LifecycleCommandRequest, x_dashboard_session: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return _run_lifecycle(account_id, action, request, x_dashboard_session)
 
 
 def _dashboard_session_id(value: str | None) -> str:
@@ -1964,6 +2028,38 @@ def market_state(account_id: str, pair: str, timeframe: str = "M15") -> dict[str
 def resync_market_data(account_id: str, stream: str = "markets") -> dict[str, Any]:
     _require_account(account_id)
     return market_data.resync(account_id, stream)
+
+
+def connector_reconciliation_acknowledgement(
+    account: BrokerAccount, observation: dict[str, Any], recovery: list[dict[str, Any]],
+    from_server_time: str | None, execution_coordinator: Any,
+    lifecycle_coordinator: LifecycleCoordinator, account_registry: AccountRegistry,
+) -> dict[str, Any]:
+    """Consume one account-bound reconciliation and project the execution gate."""
+    if account.id not in account_registry.accounts or account_registry.accounts[account.id] is not account:
+        return {"status": "RECONCILED", "recovery": recovery, "reconciliation_complete": False,
+                "no_unknown_commands": False, "backend_execution_gate": False}
+    try:
+        result = execution_coordinator.reconcile_observation(account.id, observation)
+    except ExecutionError:
+        return {"status": "REJECTED", "recovery": recovery, "reconciliation_complete": False,
+                "no_unknown_commands": False, "backend_execution_gate": False}
+    complete = _reconciliation_gate_complete(observation, recovery, from_server_time)
+    if complete:
+        account_registry.mark_reconciled(account.id)
+    context = lifecycle_coordinator.readiness_context(
+        account, account_registry.bindings.get(account.id), execution_coordinator,
+    )
+    gate = bool(
+        complete and context.no_unknown and account.environment == "DEMO"
+        and account.execution_mode == "MANUAL" and account.lifecycle_status == "ENABLED"
+        and account.bot_state == "RUNNING" and context.allowed
+    )
+    return {
+        "status": "RECONCILED" if result else "RECONCILED", "recovery": recovery,
+        "reconciliation_complete": complete, "no_unknown_commands": context.no_unknown,
+        "backend_execution_gate": gate,
+    }
 
 
 @app.websocket("/ws/v1/quotes")

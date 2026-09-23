@@ -509,6 +509,22 @@ class ExecutionSubstrate:
             requires_custodian_command=account.quarantine_requires_command,
         )
 
+    def set_lifecycle_gate(self, account_id: str, allowed: bool) -> None:
+        """Apply the account lifecycle entry gate without broker side effects."""
+        account = self.account(account_id)
+        if allowed:
+            account.exposure_gate = "OPEN"
+            account.runtime_interlock = "ELIGIBLE"
+            account.interlock_reasons = ()
+            account.interlock_evidence = {}
+            account.quarantine_requires_command = False
+        else:
+            account.exposure_gate = "STOPPED"
+            account.runtime_interlock = "BLOCKED"
+            account.interlock_reasons = ("LIFECYCLE_STOPPED",)
+            account.interlock_evidence = {"account_id": account_id}
+        account.execution_epoch = max(account.execution_epoch, 1)
+
     def _set_runtime_interlock(
         self,
         account_id: str,
