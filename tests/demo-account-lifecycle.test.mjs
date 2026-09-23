@@ -65,6 +65,16 @@ assert enabled["command_id"] and enabled["audit_id"]
 started = command("start", "start-72", 2)
 assert started["bot_state"] == "RUNNING" and started["readiness"]["allowed"] is True
 assert main.execution.orders == {} and main.execution.dispatch_records == {}
+snapshot = client.get(f"/api/v1/broker-accounts/{account.id}/snapshot").json()
+for field in ["allowed", "can_enable", "lease_current", "generation_current", "no_unknown", "execution_gate"]:
+    assert field in snapshot["readiness"]
+assert snapshot["readiness"]["allowed"] is True
+replayed_enable = command("enable", "enable-72", 1)
+assert replayed_enable["replayed"] is True
+assert replayed_enable["lifecycle_status"] == "ENABLED"
+assert replayed_enable["bot_state"] == "STOPPED"
+assert replayed_enable["account_version"] == 2
+assert replayed_enable["execution_epoch"] == enabled["execution_epoch"]
 epoch = started["execution_epoch"]
 stopped = command("stop", "stop-72", 3)
 assert stopped["bot_state"] == "STOPPED" and stopped["execution_epoch"] > epoch
@@ -72,6 +82,10 @@ disabled = command("disable", "disable-72", 4)
 assert disabled["lifecycle_status"] == "DISABLED" and disabled["bot_state"] == "STOPPED"
 assert disabled["execution_epoch"] > stopped["execution_epoch"]
 assert main.execution.orders == {} and main.execution.dispatch_records == {}
+reenabled = command("enable", "reenable-72", 5)
+assert reenabled["lifecycle_status"] == "ENABLED" and reenabled["bot_state"] == "STOPPED"
+restarted = command("start", "restart-72", 6)
+assert restarted["lifecycle_status"] == "ENABLED" and restarted["bot_state"] == "RUNNING"
 print("ok")
 `);
   assert.match(output, /ok/);
@@ -235,6 +249,8 @@ stopped = LifecycleCoordinator(execution=execution).command(
     ),
 )
 assert stopped.status == "ACCEPTED"
+assert stopped.interlock_state == execution.runtime_interlock(account.id).status
+assert stopped.interlock_state == "BLOCKED"
 assert record.state == "FENCED"
 assert record.result_payload == {"state": "REJECTED", "code": "LIFECYCLE_FENCE"}
 assert created.order.status == "REJECTED"

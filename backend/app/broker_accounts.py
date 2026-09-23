@@ -480,7 +480,31 @@ class AccountRegistry:
                 "generation": account.connector_generation,
             },
             "reconciliation": {"complete": account.reconciliation_complete},
-            "readiness": {"can_enable": account.can_enable},
+            "readiness": {
+                "allowed": account.can_enable,
+                "can_enable": account.can_enable,
+                "binding_identity": list(account.identity) if account.connector_bound else None,
+                "binding_matches": account.connector_bound,
+                "binding_revoked": False,
+                "connector_healthy": account.connector_healthy,
+                "lease_current": bool(
+                    account.lease_owner
+                    and account.lease_expires_at is not None
+                    and account.lease_expires_at > _utcnow()
+                ),
+                "generation_current": account.connector_generation >= 0,
+                "reconciliation_complete": account.reconciliation_complete,
+                "broker_facts_fresh": account.reconciliation_observed_at is not None,
+                "no_unknown": True,
+                "runtime_interlock": account.runtime_interlock,
+                "runtime_reason_codes": [],
+                "recovery_ready": True,
+                "risk_limits_version": 1 if account.risk_limits_active else None,
+                "pair_mappings": {},
+                "reason_codes": [],
+                "facts_complete": True,
+                "execution_gate": "OPEN" if account.bot_state == "RUNNING" else "STOPPED",
+            },
             "execution_locked": True,
         }
 

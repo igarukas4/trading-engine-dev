@@ -13,10 +13,11 @@ import json
 import os
 import tempfile
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import UUID, uuid4
 
 from psycopg import connect
@@ -277,15 +278,28 @@ class LifecycleCoordinator:
             facts.get("risk_limits_version"), dict(facts.get("pair_mappings", {}))
         )
 
-    @staticmethod
-    def _account_state(account: Any) -> dict[str, Any]:
+    def _account_state(self, account: Any) -> dict[str, Any]:
+        interlock = (
+            self.execution.runtime_interlock(account.id)
+            if self.execution is not None
+            else None
+        )
         return {
             "lifecycle_status": account.lifecycle_status,
             "bot_state": account.bot_state,
             "execution_mode": account.execution_mode,
             "account_version": account.version,
             "execution_epoch": account.execution_epoch,
-            "runtime_interlock": getattr(account, "runtime_interlock", "BLOCKED"),
+            "runtime_interlock": (
+                interlock.status if interlock is not None
+                else getattr(account, "runtime_interlock", "BLOCKED")
+            ),
+            "interlock_reason_codes": (
+                list(interlock.reasons) if interlock is not None else []
+            ),
+            "interlock_evidence": (
+                dict(interlock.evidence) if interlock is not None else {}
+            ),
         }
 
     @staticmethod
@@ -307,9 +321,13 @@ class LifecycleCoordinator:
             "risk_limits_version": readiness.risk_limits_version,
             "pair_mappings": dict(readiness.pair_mappings),
             "reason_codes": list(readiness.reason_codes),
+            "facts_complete": readiness.facts_complete,
         }
 
-    def readiness_context(self, account: Any, binding: Any, execution: Any) -> ReadinessContext:
+    def readiness_context(
+        self, account: Any, binding: Any, execution: Any, *,
+        for_lifecycle: bool = False,
+    ) -> ReadinessContext:
         facts = self.readiness_facts(account.id)
         now = _now()
         lease_expires = _parse_time(getattr(account, "lease_expires_at", None))
@@ -336,6 +354,14 @@ class LifecycleCoordinator:
             observed is not None and (now - observed).total_seconds() <= 300
         )
         decision = execution.runtime_interlock(account.id)
+        runtime_reasons = tuple(decision.reasons)
+        if for_lifecycle:
+            runtime_reasons = tuple(
+                reason for reason in runtime_reasons if reason != "LIFECYCLE_STOPPED"
+            )
+        runtime_status = decision.status
+        if for_lifecycle and runtime_status == "BLOCKED" and not runtime_reasons:
+            runtime_status = "ELIGIBLE"
         no_unknown = not any(
             record.account_id == account.id and record.state == "UNKNOWN"
             for record in execution.dispatch_records.values()
@@ -353,13 +379,39 @@ class LifecycleCoordinator:
             reconciliation_complete=bool(getattr(account, "reconciliation_complete", False)),
             broker_facts_fresh=broker_facts_fresh,
             no_unknown=no_unknown,
-            runtime_interlock=decision.status,
-            runtime_reason_codes=tuple(decision.reasons),
+            runtime_interlock=runtime_status,
+            runtime_reason_codes=runtime_reasons,
             recovery_ready=not execution.account(account.id).recovery_required,
             risk_limits_version=facts.risk_limits_version,
             pair_mappings=facts.pair_mappings,
             facts_complete=True,
         )
+
+    @staticmethod
+    def _transition_readiness(
+        readiness: ReadinessContext, action: str,
+    ) -> ReadinessContext:
+        """Ignore only the lifecycle's own stop fence when reopening it."""
+        if action not in {"enable", "start"}:
+            return readiness
+        reasons = tuple(
+            reason for reason in readiness.runtime_reason_codes
+            if reason != "LIFECYCLE_STOPPED"
+        )
+        status = readiness.runtime_interlock
+        if status == "BLOCKED" and not reasons:
+            status = "ELIGIBLE"
+        return replace(
+            readiness, runtime_interlock=status, runtime_reason_codes=reasons,
+        )
+
+    @contextmanager
+    def _execution_account_lock(self, account_id: str) -> Iterator[None]:
+        if self.execution is None or not hasattr(self.execution, "account_lock"):
+            yield
+            return
+        with self.execution.account_lock(account_id):
+            yield
 
     def restore_account(self, account: Any) -> Any:
         items = [item for item in self._commands.values() if item["account_id"] == account.id]
@@ -456,17 +508,18 @@ class LifecycleCoordinator:
             raise ValueError("AUTHENTICATION_REQUIRED")
         if not isinstance(idempotency_key, str) or not idempotency_key.strip():
             raise ValueError("IDEMPOTENCY_KEY_REQUIRED")
-        if self.database_url:
-            return self._command_db(
+        with self._execution_account_lock(account.id):
+            if self.database_url:
+                return self._command_db(
+                    account, action, idempotency_key=idempotency_key,
+                    expected_version=expected_version, reason=reason, actor=actor,
+                    readiness=readiness, operation=operation,
+                )
+            return self._command_local(
                 account, action, idempotency_key=idempotency_key,
                 expected_version=expected_version, reason=reason, actor=actor,
-                readiness=readiness, operation=operation,
+                readiness=readiness, fence=fence, operation=operation,
             )
-        return self._command_local(
-            account, action, idempotency_key=idempotency_key,
-            expected_version=expected_version, reason=reason, actor=actor,
-            readiness=readiness, fence=fence, operation=operation,
-        )
 
     def _command_local(
         self, account: Any, action: str, *, idempotency_key: str,
@@ -486,6 +539,7 @@ class LifecycleCoordinator:
             readiness = readiness or ReadinessContext(
                 None, False, False, False, False, "BLOCKED", (), False,
             )
+            readiness = self._transition_readiness(readiness, action)
             prior_state = self._account_state(account)
             error = self._validate_transition(account, action)
             if error is None and expected_version != account.version:
@@ -527,6 +581,25 @@ class LifecycleCoordinator:
                     account.version += 1
                     if fence:
                         fence(False)
+                if action in {"start", "stop", "disable"} and self.execution is not None:
+                    self.execution.apply_lifecycle_commit(
+                        account.id, account.execution_epoch,
+                        allowed=action == "start", persist=False,
+                    )
+                if action == "enable" and self.execution is not None:
+                    # The account remains stopped after enable, but the
+                    # previous lifecycle fence is no longer a health reason.
+                    self.execution.apply_lifecycle_commit(
+                        account.id, account.execution_epoch, allowed=False,
+                        persist=False,
+                    )
+                    execution_state = self.execution.account(account.id)
+                    execution_state.interlock_reasons = tuple(
+                        reason for reason in execution_state.interlock_reasons
+                        if reason != "LIFECYCLE_STOPPED"
+                    )
+                    if not execution_state.interlock_reasons:
+                        execution_state.runtime_interlock = "ELIGIBLE"
                 new_state = self._account_state(account)
                 created = _iso(_now()) or ""
                 command_id, audit_id = str(uuid4()), str(uuid4())
@@ -593,8 +666,35 @@ class LifecycleCoordinator:
         self._save()
 
     def _db_readiness(self, cursor: Any, account: Any, readiness: ReadinessContext) -> ReadinessContext:
+        """Read every lifecycle gate from rows locked in the same transaction."""
         cursor.execute(
-            "SELECT risk_limits_version, pair_mappings FROM lifecycle_readiness WHERE broker_account_id = %s",
+            """SELECT provider, broker_server, external_account_id,
+                      connector_status, reconciliation_status, reconciliation_watermark,
+                      reconciliation_observed_at, connector_generation, pending_generation,
+                      lease_owner, lease_expires_at
+               FROM broker_accounts WHERE id = %s""", (account.id,)
+        )
+        account_row = cursor.fetchone()
+        if account_row is None:
+            return readiness
+        identity = tuple(str(value) for value in account_row[:3])
+        connector_status = account_row[3]
+        reconciliation_status = account_row[4]
+        observed = _parse_time(account_row[6] or account_row[5])
+        broker_facts_fresh = bool(
+            observed is not None and (_now() - observed).total_seconds() <= 300
+        )
+        lease_expires = _parse_time(account_row[10])
+        lease_current = bool(
+            account_row[9] and lease_expires is not None and lease_expires > _now()
+        )
+        generation_current = (
+            account_row[8] is None and int(account_row[7]) >= 0
+        )
+
+        cursor.execute(
+            """SELECT risk_limits_version, pair_mappings
+               FROM lifecycle_readiness WHERE broker_account_id = %s FOR UPDATE""",
             (account.id,),
         )
         fact_row = cursor.fetchone()
@@ -608,7 +708,8 @@ class LifecycleCoordinator:
         if risk_row is None or risk_row[0] is None or risk_version != int(risk_row[0]):
             risk_version = None
         cursor.execute(
-            "SELECT canonical_code, broker_symbol FROM pairs WHERE broker_account_id = %s",
+            """SELECT canonical_code, broker_symbol FROM pairs
+               WHERE broker_account_id = %s FOR SHARE""",
             (account.id,),
         )
         persisted_pairs = {
@@ -620,6 +721,7 @@ class LifecycleCoordinator:
             pair: symbol for pair, symbol in mappings.items()
             if pair in persisted_pairs and persisted_pairs[pair] == symbol
         }
+
         cursor.execute(
             """SELECT EXISTS (
                      SELECT 1 FROM connector_dispatch_outbox
@@ -634,36 +736,64 @@ class LifecycleCoordinator:
             (account.id, account.id),
         )
         unresolved = bool(cursor.fetchone()[0])
+
         cursor.execute(
             """SELECT provider, broker_server, external_account_id, revoked_at
-               FROM connector_bindings WHERE broker_account_id = %s""", (account.id,)
+               FROM connector_bindings WHERE broker_account_id = %s FOR UPDATE""", (account.id,)
         )
         binding_row = cursor.fetchone()
         binding_identity = tuple(binding_row[:3]) if binding_row else None
         binding_revoked = bool(binding_row and binding_row[3] is not None)
+
+        runtime_status = readiness.runtime_interlock
+        runtime_reasons = tuple(readiness.runtime_reason_codes)
+        recovery_ready = readiness.recovery_ready and not unresolved
         cursor.execute(
-            """SELECT connector_status, reconciliation_status, reconciliation_watermark,
-                      reconciliation_observed_at, connector_generation, lease_owner,
-                      lease_expires_at
-               FROM broker_accounts WHERE id = %s""", (account.id,)
+            """SELECT status, reason_codes, recovery_evidence
+               FROM runtime_interlocks WHERE broker_account_id = %s FOR UPDATE""",
+            (account.id,),
         )
-        row = cursor.fetchone()
-        if row is None:
-            return readiness
-        observed = _parse_time(row[3] or row[2])
-        fresh = observed is not None and (_now() - observed).total_seconds() <= 300
-        lease_current = bool(row[5] and row[6] and row[6] > _now())
+        interlock_row = cursor.fetchone()
+        if interlock_row is not None:
+            runtime_status = str(interlock_row[0])
+            runtime_reasons = tuple(str(item) for item in (interlock_row[1] or []))
+        cursor.execute(
+            """SELECT state -> 'accounts' -> %s
+               FROM execution_state_snapshots WHERE snapshot_id = 1 FOR SHARE""",
+            (account.id,),
+        )
+        snapshot_row = cursor.fetchone()
+        if snapshot_row and isinstance(snapshot_row[0], dict):
+            execution_state = snapshot_row[0]
+            if interlock_row is None:
+                runtime_status = str(
+                    execution_state.get("runtime_interlock", runtime_status)
+                )
+                runtime_reasons = tuple(
+                    str(item) for item in execution_state.get(
+                        "interlock_reasons", runtime_reasons
+                    )
+                )
+            recovery_ready = not bool(
+                execution_state.get("recovery_required", not recovery_ready)
+            ) and not unresolved
+
         return replace(
-            readiness, binding_identity=binding_identity,
-            binding_matches=bool(binding_identity == account.identity and not binding_revoked),
-            binding_revoked=binding_revoked, connector_healthy=row[0] == "HEALTHY",
-            lease_current=lease_current, reconciliation_complete=row[1] == "COMPLETE",
-            broker_facts_fresh=fresh, risk_limits_version=risk_version,
+            readiness,
+            binding_identity=binding_identity,
+            binding_matches=bool(binding_identity == identity and not binding_revoked),
+            binding_revoked=binding_revoked,
+            connector_healthy=connector_status == "HEALTHY",
+            lease_current=lease_current,
+            generation_current=generation_current,
+            reconciliation_complete=reconciliation_status == "COMPLETE",
+            broker_facts_fresh=broker_facts_fresh,
+            risk_limits_version=risk_version,
             pair_mappings=mappings,
-            generation_current=(
-                int(row[4]) == int(getattr(account, "connector_generation", -1))
-            ),
-            no_unknown=readiness.no_unknown and not unresolved,
+            no_unknown=not unresolved,
+            recovery_ready=recovery_ready,
+            runtime_interlock=runtime_status,
+            runtime_reason_codes=runtime_reasons,
         )
 
     def _command_db(
@@ -731,19 +861,15 @@ class LifecycleCoordinator:
                         "interlock_reason_codes": list(interlock.reasons) if interlock else [],
                         "interlock_evidence": dict(interlock.evidence) if interlock else {},
                     }
-                    if readiness is not None:
-                        effective = readiness
-                    elif self.account_registry is not None and self.execution is not None:
-                        effective = self.readiness_context(
-                            account,
-                            self.account_registry.bindings.get(account.id),
-                            self.execution,
-                        )
-                    else:
-                        effective = ReadinessContext(
-                            None, False, False, False, False, "BLOCKED", (), False,
-                        )
-                    effective = self._db_readiness(cursor, account, effective)
+                    baseline = readiness or ReadinessContext(
+                        None, False, False, False, False, "BLOCKED", (), False,
+                    )
+                    authoritative = self._db_readiness(cursor, account, baseline)
+                    prior_state["runtime_interlock"] = authoritative.runtime_interlock
+                    prior_state["interlock_reason_codes"] = list(
+                        authoritative.runtime_reason_codes
+                    )
+                    effective = self._transition_readiness(authoritative, action)
                     validation_account = copy.copy(account)
                     validation_account.lifecycle_status = row[0]
                     validation_account.bot_state = row[1]
@@ -766,18 +892,31 @@ class LifecycleCoordinator:
                     new_epoch = int(row[4]) + (1 if not error and action in {"stop", "disable"} else 0)
                     new_state = dict(prior_state)
                     if not error:
-                        new_interlock = (
-                            "ELIGIBLE" if action == "start"
-                            else (interlock.status if interlock else "BLOCKED")
-                        )
+                        if action in {"enable", "start"}:
+                            new_interlock = effective.runtime_interlock
+                            new_reasons = list(effective.runtime_reason_codes)
+                        elif action in {"stop", "disable"}:
+                            new_interlock = (
+                                "QUARANTINED"
+                                if authoritative.runtime_interlock == "QUARANTINED"
+                                else "BLOCKED"
+                            )
+                            new_reasons = list(authoritative.runtime_reason_codes)
+                            if "LIFECYCLE_STOPPED" not in new_reasons:
+                                new_reasons.append("LIFECYCLE_STOPPED")
+                        else:
+                            new_interlock = authoritative.runtime_interlock
+                            new_reasons = list(authoritative.runtime_reason_codes)
                         new_state.update({
                             "lifecycle_status": "ENABLED" if action != "disable" else "DISABLED",
                             "bot_state": "RUNNING" if action == "start" else "STOPPED",
                             "account_version": int(row[5]) + 1,
                             "execution_epoch": new_epoch,
                             "runtime_interlock": new_interlock,
-                            "interlock_reason_codes": list(interlock.reasons) if interlock else [],
-                            "interlock_evidence": dict(interlock.evidence) if interlock else {},
+                            "interlock_reason_codes": new_reasons,
+                            "interlock_evidence": dict(
+                                interlock.evidence if interlock else {}
+                            ),
                         })
                     response_item = {
                         "account_id": account.id, "actor": actor, "operation": operation,
