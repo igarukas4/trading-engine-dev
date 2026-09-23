@@ -24,6 +24,8 @@ COMMAND_TYPES = frozenset({
 SIDE_EFFECTING_TYPES = frozenset({
     "order.submit_market", "position.modify_protection", "position.close",
 })
+SERVER_CONTROL_TYPES = frozenset({"execution_gate.update"})
+CLIENT_CONTROL_TYPES = frozenset({"execution_gate.ack"})
 
 
 class ContractError(ValueError):
@@ -160,7 +162,7 @@ class PostHandshakeEnvelope:
             command_id = _nonempty_string(command_id, "command_id")
         key = _nonempty_string(raw["idempotency_key"], "idempotency_key")
         request_hash = raw.get("request_hash")
-        if typ in COMMAND_TYPES or typ == "command.result":
+        if typ in COMMAND_TYPES or typ == "command.result" or typ in SERVER_CONTROL_TYPES:
             if not isinstance(request_hash, str) or not request_hash:
                 raise ContractError("MISSING_REQUEST_HASH", "command request_hash is required")
             if command_id is None:

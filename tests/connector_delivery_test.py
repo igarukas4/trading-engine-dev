@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from backend.app.connector_delivery import (
     ConnectorDeliveryBridge,
@@ -7,14 +8,16 @@ from backend.app.connector_delivery import (
     DeliveryError,
     validate_hello,
 )
+from backend.app.broker_accounts import AccountRegistry, BrokerAccount
 from backend.app.execution import ExecutionCoordinator, ExecutionError, OrderIntent, OutboxEvent, Position, PositionCommand, RiskReservation
+from backend.app.lifecycle import LifecycleCoordinator
 from connector.src.mt5_connector.journal import canonical_request_hash
 
 
 class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.registry = ConnectorDeliveryRegistry()
-        await self.registry.open_session("a", 7, "s1")
+        await self.registry.open_session("a", 7, "s1", execution_gate_open=True)
         self.kw = dict(
             account_id="a", identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
             connector_generation=7, execution_epoch=3, type="order.submit_market", payload={"pair": "EURUSD"},
@@ -38,6 +41,45 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "event-" + suffix, account_id, order_id, 1,
         )
 
+    def test_disconnect_invalidates_only_matching_authoritative_session(self):
+        accounts = AccountRegistry()
+        account = accounts.register(
+            provider="MT5", broker_server="Demo", external_account_id="42",
+            display_name="Disconnect", environment="DEMO",
+        )
+        account.connector_healthy = True
+        account.reconciliation_complete = True
+        account.lease_owner = "session-1"
+        account.connector_session_id = "session-1"
+        account.connector_session_generation = 3
+        accounts.close_connector_session(account.id, "stale-session", 3)
+        self.assertTrue(account.connector_healthy)
+        accounts.close_connector_session(account.id, "session-1", 3)
+        self.assertFalse(account.connector_healthy)
+        self.assertIsNone(account.connector_session_id)
+        self.assertIsNone(account.lease_owner)
+        self.assertFalse(account.reconciliation_complete)
+
+    def test_readiness_rejects_stale_authority_facts_and_quarantine(self):
+        account = BrokerAccount("MT5", "Demo", "43", "Readiness")
+        account.connector_healthy = True
+        account.lease_owner = "expired-session"
+        account.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        account.reconciliation_complete = False
+        execution = ExecutionCoordinator()
+        execution.account(account.id).runtime_interlock = "QUARANTINED"
+        lifecycle = LifecycleCoordinator(
+            active_session_check=lambda account_id, generation, session_id: False,
+        )
+        readiness = lifecycle.readiness_context(account, None, execution)
+        self.assertFalse(readiness.allowed)
+        self.assertFalse(readiness.lease_current)
+        self.assertFalse(readiness.generation_current)
+        self.assertIn("CONNECTOR_LEASE_STALE", readiness.reason_codes)
+        self.assertIn("CONNECTOR_GENERATION_STALE", readiness.reason_codes)
+        self.assertIn("BROKER_FACTS_STALE", readiness.reason_codes)
+        self.assertIn("RUNTIME_INTERLOCK_BLOCKED", readiness.reason_codes)
+
     async def test_ordering_and_duplicate_pending_suppression(self):
         first = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         second = await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c2", idempotency_key="i2", request_hash="h2")
@@ -49,6 +91,76 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await self.registry.enqueue(**self.kw, dispatch_sequence=3, command_id="c1", idempotency_key="i1", request_hash="h1")
         with self.assertRaisesRegex(DeliveryError, "OUT_OF_ORDER_DISPATCH"):
             await self.registry.enqueue(**self.kw, dispatch_sequence=2, command_id="c3", idempotency_key="i3", request_hash="h3")
+
+    async def test_execution_gate_requires_active_session_control_ack(self):
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session(
+            "a", 7, "s1", identity=self.kw["identity"], execution_epoch=3,
+            reconciliation_required=False,
+        )
+        self.assertTrue(registry.active_session("a", generation=7, session_id="s1"))
+        self.assertFalse(registry.active_session("a", generation=8, session_id="s1"))
+        with self.assertRaisesRegex(DeliveryError, "EXECUTION_GATE_CLOSED"):
+            await registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
+
+        update = await registry.publish_execution_gate(
+            "a", generation=7, execution_epoch=3, allowed=True,
+        )
+        self.assertEqual(update.type, "execution_gate.update")
+        self.assertFalse(registry.execution_gate("a"))
+        await registry.mark_sent("a", update.command_id, "s1")
+        waiting = asyncio.create_task(
+            registry.wait_for_control_ack("a", update.command_id, timeout=0.5),
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(waiting.done())
+        await registry.acknowledge_execution_gate(
+            "a", "s1", update.command_id, generation=7, execution_epoch=3,
+        )
+        await waiting
+        self.assertTrue(registry.execution_gate("a"))
+        envelope = await registry.enqueue(
+            **self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1",
+        )
+        self.assertEqual(envelope.execution_epoch, 3)
+
+    async def test_closed_entry_gate_preserves_explicit_reduce_only_delivery(self):
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session(
+            "a", 7, "s1", identity=self.kw["identity"], execution_epoch=3,
+        )
+        exit_envelope = await registry.enqueue(
+            **{
+                **self.kw,
+                "type": "position.close",
+                "payload": {"position_ticket": "ticket-1", "volume": "0.10"},
+            },
+            dispatch_sequence=1, command_id="exit-1", idempotency_key="exit-1", request_hash="exit-hash",
+        )
+        self.assertEqual(exit_envelope.type, "position.close")
+
+    async def test_gate_update_closes_immediately_and_stale_session_cannot_ack(self):
+        registry = ConnectorDeliveryRegistry()
+        await registry.open_session(
+            "a", 7, "s1", identity=self.kw["identity"], execution_epoch=3,
+            reconciliation_required=False,
+        )
+        opening = await registry.publish_execution_gate(
+            "a", generation=7, execution_epoch=3, allowed=True,
+        )
+        await registry.mark_sent("a", opening.command_id, "s1")
+        await registry.acknowledge_execution_gate("a", "s1", opening.command_id, generation=7, execution_epoch=3)
+        closing = await registry.publish_execution_gate(
+            "a", generation=7, execution_epoch=4, allowed=False,
+        )
+        self.assertFalse(registry.execution_gate("a"))
+        with self.assertRaisesRegex(DeliveryError, "SESSION_NOT_ACTIVE"):
+            await registry.acknowledge_execution_gate(
+                "a", "old-session", closing.command_id, generation=7, execution_epoch=4,
+            )
+        await registry.mark_sent("a", closing.command_id, "s1")
+        await registry.acknowledge_execution_gate("a", "s1", closing.command_id, generation=7, execution_epoch=4)
+        self.assertEqual(registry.session_epoch("a"), 4)
 
     async def test_wire_sequence_is_independent_from_dispatch_ordering(self):
         first = await self.registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
@@ -75,6 +187,13 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DeliveryError, "RECONCILIATION_REQUIRED"):
             await registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         await registry.mark_reconciled("a", "s1")
+        update = await registry.publish_execution_gate(
+            "a", generation=7, execution_epoch=3, allowed=True,
+        )
+        await registry.mark_sent("a", update.command_id, "s1")
+        await registry.acknowledge_execution_gate(
+            "a", "s1", update.command_id, generation=7, execution_epoch=3,
+        )
         envelope = await registry.enqueue(**self.kw, dispatch_sequence=1, command_id="c1", idempotency_key="i1", request_hash="h1")
         self.assertEqual(envelope.command_id, "c1")
 
@@ -123,6 +242,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "a", 7, "s2",
             identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
             execution_epoch=3,
+            execution_gate_open=True,
         )
         accepted = await self.registry.accept_inbound(
             "a", "s2", {**message, "message_id": "hb-2", "sequence": 2, "idempotency_key": "msg:hb-2"},
@@ -191,6 +311,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             "a", 7, "s1",
             identity={"provider": "mt5", "broker_server": "demo", "external_account_id": "42"},
             execution_epoch=3,
+            execution_gate_open=True,
         )
         with self.assertRaisesRegex(DeliveryError, "WRONG_ACCOUNT"):
             await registry.enqueue(
@@ -200,7 +321,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(registry.pending_state("a", "c1"))
 
         registry = ConnectorDeliveryRegistry()
-        await registry.open_session("a", 7, "s1", execution_epoch=4)
+        await registry.open_session("a", 7, "s1", execution_epoch=4, execution_gate_open=True)
         with self.assertRaisesRegex(DeliveryError, "STALE_EPOCH"):
             await registry.enqueue(
                 **{**self.kw, "execution_epoch": 3},
@@ -218,7 +339,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         registry = ConnectorDeliveryRegistry()
         bridge = ConnectorDeliveryBridge(coordinator, registry)
         for account_id, suffix in (("a", "1"), ("b", "2")):
-            await registry.open_session(account_id, 1, "session-" + suffix, identity=identity, execution_epoch=1)
+            await registry.open_session(account_id, 1, "session-" + suffix, identity=identity, execution_epoch=1, execution_gate_open=True)
             await bridge.enqueue_order(
                 account_id, "order-" + suffix, identity=identity, generation=1,
             )
@@ -241,7 +362,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self._seed_dispatchable_order(coordinator, account_id="a", suffix="missing-readback")
         registry = ConnectorDeliveryRegistry()
         bridge = ConnectorDeliveryBridge(coordinator, registry)
-        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1, execution_gate_open=True)
         await bridge.enqueue_order("a", "order-missing-readback", identity=identity, generation=1)
         envelope = await registry.next_for_session("a", "session")
         await bridge.mark_sent("a", envelope.command_id, "session")
@@ -269,7 +390,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         registry = ConnectorDeliveryRegistry()
         bridge = ConnectorDeliveryBridge(coordinator, registry)
-        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1, execution_gate_open=True)
         modify_record = await bridge.enqueue_position_modify_protection(
             "a", modify.id, identity=identity, generation=0,
         )
@@ -338,7 +459,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         registry = ConnectorDeliveryRegistry()
         bridge = ConnectorDeliveryBridge(coordinator, registry)
-        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1)
+        await registry.open_session("a", 0, "session", identity=identity, execution_epoch=1, execution_gate_open=True)
         record = await bridge.enqueue_position_close(
             "a", close.id, identity=identity, generation=0,
         )
@@ -384,7 +505,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             )
             restarted = ExecutionCoordinator(state_path=directory + "/execution.json")
             registry = ConnectorDeliveryRegistry()
-            await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+            await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1, execution_gate_open=True)
             delivered = await ConnectorDeliveryBridge(restarted, registry).replay_unsent("a")
             self.assertEqual([item.command_id for item in delivered], [record.command_id])
 
@@ -397,7 +518,7 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         coordinator.account("a").execution_epoch = 1
         registry = ConnectorDeliveryRegistry()
         bridge = ConnectorDeliveryBridge(coordinator, registry)
-        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1, execution_gate_open=True)
         await bridge.enqueue_order("a", "order-race", identity=identity, generation=1)
         envelope = await registry.next_for_session("a", "session")
 

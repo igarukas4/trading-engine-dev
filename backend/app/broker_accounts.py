@@ -82,6 +82,8 @@ class BrokerAccount:
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
+    connector_session_id: str | None = None
+    connector_session_generation: int | None = None
     connector_bound: bool = False
     connector_healthy: bool = False
     reconciliation_complete: bool = False
@@ -180,7 +182,8 @@ class AccountRegistry:
                     """SELECT id, provider, broker_server, external_account_id, display_name,
                               environment, lifecycle_status, bot_state, execution_mode,
                               live_execution_enabled, execution_epoch, connector_generation,
-                              lease_owner, lease_expires_at, connector_status,
+                              lease_owner, lease_expires_at, connector_session_id,
+                              connector_session_generation, connector_status,
                               reconciliation_status, reconciliation_watermark,
                               reconciliation_observed_at, version, execution_mode_revision, mode_changed_at
                          FROM broker_accounts"""
@@ -192,11 +195,12 @@ class AccountRegistry:
                         lifecycle_status=row[6], bot_state=row[7], execution_mode=row[8],
                         live_execution_enabled=row[9], execution_epoch=row[10],
                         connector_generation=row[11], lease_owner=row[12], lease_expires_at=row[13],
-                        connector_bound=row[14] != "UNAVAILABLE",
-                        connector_healthy=row[14] == "HEALTHY",
-                        reconciliation_complete=row[15] == "COMPLETE", reconciliation_watermark=row[16],
-                        reconciliation_observed_at=row[17], version=row[18],
-                        execution_mode_revision=row[19], mode_changed_at=row[20],
+                        connector_session_id=row[14], connector_session_generation=row[15],
+                        connector_bound=row[16] != "UNAVAILABLE",
+                        connector_healthy=row[16] == "HEALTHY",
+                        reconciliation_complete=row[17] == "COMPLETE", reconciliation_watermark=row[18],
+                        reconciliation_observed_at=row[19], version=row[20],
+                        execution_mode_revision=row[21], mode_changed_at=row[22],
                     )
                     self.accounts[account.id] = account
                 cursor.execute(
@@ -217,6 +221,8 @@ class AccountRegistry:
             account.connector_healthy = False
             account.lease_owner = None
             account.lease_expires_at = None
+            account.connector_session_id = None
+            account.connector_session_generation = None
             account.reconciliation_complete = False
             self._persist_account(account)
 
@@ -233,8 +239,9 @@ class AccountRegistry:
                     """UPDATE broker_accounts
                           SET lifecycle_status = %s, bot_state = %s, execution_mode = %s,
                               live_execution_enabled = %s, execution_epoch = %s,
-                              connector_generation = %s, lease_owner = %s,
-                              lease_expires_at = %s, connector_status = %s,
+                               connector_generation = %s, lease_owner = %s,
+                               lease_expires_at = %s, connector_session_id = %s,
+                               connector_session_generation = %s, connector_status = %s,
                               reconciliation_status = %s, reconciliation_watermark = %s,
                               reconciliation_observed_at = %s, version = %s,
                               execution_mode_revision = %s, mode_changed_at = %s,
@@ -242,8 +249,9 @@ class AccountRegistry:
                         WHERE id = %s""",
                     (account.lifecycle_status, account.bot_state, account.execution_mode,
                      account.live_execution_enabled, account.execution_epoch,
-                     account.connector_generation, account.lease_owner,
-                     account.lease_expires_at, connector_status, reconciliation_status,
+                      account.connector_generation, account.lease_owner,
+                      account.lease_expires_at, account.connector_session_id,
+                      account.connector_session_generation, connector_status, reconciliation_status,
                      account.reconciliation_watermark, account.reconciliation_observed_at,
                      account.version,
                      account.execution_mode_revision, account.mode_changed_at,
@@ -410,6 +418,8 @@ class AccountRegistry:
         account.lease_owner = owner
         account.lease_expires_at = now + timedelta(seconds=lease_seconds)
         account.last_heartbeat_at = now
+        account.connector_session_id = owner
+        account.connector_session_generation = generation
         account.connector_healthy = True
         self._persist_account(account)
         return account
@@ -419,7 +429,26 @@ class AccountRegistry:
         if account is None:
             raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
         account.connector_healthy = False
+        account.connector_session_id = None
+        account.connector_session_generation = None
+        account.lease_owner = None
+        account.lease_expires_at = None
+        account.reconciliation_complete = False
         self._persist_account(account)
+        return account
+
+    def close_connector_session(
+        self, account_id: str, session_id: str, generation: int,
+    ) -> BrokerAccount:
+        """Invalidate only the currently authenticated WSS session."""
+        account = self.accounts.get(account_id)
+        if account is None:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
+        if (
+            account.connector_session_id == session_id
+            and account.connector_session_generation == generation
+        ):
+            return self.mark_connector_unhealthy(account_id)
         return account
 
     def mark_reconciled(

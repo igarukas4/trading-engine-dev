@@ -41,6 +41,20 @@ class Dispatcher:
         """Whether unresolved post-invocation work fences this account."""
         return self.journal.has_unknown()
 
+    def apply_execution_gate(self, allowed: bool, execution_epoch: int, generation: int) -> None:
+        """Consume the backend's current gate before accepting side effects."""
+        if not isinstance(allowed, bool):
+            raise DispatchError("INVALID_EXECUTION_GATE")
+        if isinstance(execution_epoch, bool) or not isinstance(execution_epoch, int) or execution_epoch < 0:
+            raise DispatchError("INVALID_EXECUTION_GATE")
+        if self.generation is not None and generation != self.generation:
+            raise DispatchError("STALE_GENERATION")
+        if self.execution_epoch is not None and execution_epoch < self.execution_epoch:
+            raise DispatchError("STALE_EPOCH")
+        self.generation = generation
+        self.execution_epoch = execution_epoch
+        self.execution_enabled = allowed
+
     def recover(self) -> list[Any]:
         with self._lock:
             return self.journal.recover()
@@ -98,7 +112,10 @@ class Dispatcher:
                 return {"state": "UNKNOWN", "code": record.error_code or "RECONCILIATION_REQUIRED"}
             if typ not in SIDE_EFFECTING_TYPES:
                 return self._finish(command_id, "REJECTED", "UNSUPPORTED_DISPATCH_TYPE")
-            if not self.execution_enabled:
+            # The backend execution gate fences new exposure.  Explicit
+            # position protection and reduce-only exits remain deliverable so
+            # a stop/disable can safely unwind already-confirmed exposure.
+            if not self.execution_enabled and typ == "order.submit_market":
                 return self._finish(command_id, "REJECTED", "EXECUTION_DISABLED")
             if self.blocked:
                 return self._finish(command_id, "REJECTED", "ACCOUNT_FENCED_UNKNOWN")

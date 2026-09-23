@@ -8,8 +8,10 @@ import uuid
 from typing import Any, Mapping
 
 from .config import ConnectorConfig
+from .dispatcher import DispatchError
 from .models import (
     COMMAND_TYPES,
+    SERVER_CONTROL_TYPES,
     SIDE_EFFECTING_TYPES,
     ContractError,
     HelloFrame,
@@ -100,6 +102,23 @@ class ConnectorProtocol:
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
             raise ProtocolError("MALFORMED_FRAME", "invalid execution_epoch")
         self.execution_epoch = epoch
+        readiness = snapshot.get("readiness") if isinstance(snapshot.get("readiness"), dict) else {}
+        gate = snapshot.get("backend_execution_gate")
+        if gate is not None and not isinstance(gate, bool):
+            raise ProtocolError("INVALID_EXECUTION_GATE", "backend execution gate must be boolean")
+        if gate is None and "execution_gate" in readiness:
+            readiness_gate = readiness.get("execution_gate")
+            if readiness_gate not in {"OPEN", "STOPPED"}:
+                raise ProtocolError("INVALID_EXECUTION_GATE", "invalid readiness execution gate")
+            gate = readiness_gate == "OPEN"
+        if gate is not None and self.dispatcher is not None:
+            apply_gate = getattr(self.dispatcher, "apply_execution_gate", None)
+            if apply_gate is None:
+                raise ProtocolError("EXECUTION_GATE_UNSUPPORTED")
+            try:
+                apply_gate(bool(gate), epoch, incoming)
+            except DispatchError as error:
+                raise ProtocolError(str(error) or "INVALID_EXECUTION_GATE") from error
         server_sequence = message.get("server_sequence")
         if server_sequence is not None:
             if isinstance(server_sequence, bool) or not isinstance(server_sequence, int) or server_sequence < 0:
@@ -177,6 +196,8 @@ class ConnectorProtocol:
         envelope = self._validate_inbound(message)
         if envelope.type == "reconciliation.required":
             return self._reconciliation_responses(envelope.payload)
+        if envelope.type == "execution_gate.update":
+            return self._execution_gate_update(envelope)
         if envelope.type in CONTROL_TYPES:
             return None
         if envelope.type not in COMMAND_TYPES:
@@ -188,6 +209,30 @@ class ConnectorProtocol:
                 return self._result_for(envelope, "REJECTED", "EXECUTION_DISABLED")
             return self._dispatch_side_effect(envelope)
         return self._read_only_response(envelope)
+
+    def _execution_gate_update(self, envelope: PostHandshakeEnvelope) -> dict[str, Any]:
+        payload = envelope.payload
+        allowed = payload.get("backend_execution_gate")
+        epoch = payload.get("execution_epoch", envelope.execution_epoch)
+        if not isinstance(allowed, bool) or isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ProtocolError("INVALID_EXECUTION_GATE")
+        if epoch != envelope.execution_epoch:
+            raise ProtocolError("STALE_EPOCH")
+        if self.dispatcher is not None:
+            apply_gate = getattr(self.dispatcher, "apply_execution_gate", None)
+            if apply_gate is None:
+                raise ProtocolError("EXECUTION_GATE_UNSUPPORTED")
+            try:
+                apply_gate(allowed, epoch, envelope.generation)
+            except DispatchError as error:
+                raise ProtocolError(str(error) or "INVALID_EXECUTION_GATE") from error
+        self.execution_epoch = epoch
+        return self._envelope(
+            "execution_gate.ack",
+            {"control_id": envelope.command_id, "backend_execution_gate": allowed,
+             "execution_epoch": epoch},
+            execution_epoch=epoch,
+        )
 
     def _validate_legacy_context(self, message: Mapping[str, Any]) -> None:
         if message.get("account_id") not in (None, self.cfg.account_id):

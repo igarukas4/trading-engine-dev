@@ -92,6 +92,37 @@ class Issue67ContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.sent[1].count("secret"), 0)
         self.assertIn('"state":"ACCEPTED"', transport.sent[1])
 
+    def test_execution_gate_update_is_consumed_and_acknowledged(self):
+        adapter = FakeMT5Adapter()
+        dispatcher = self.dispatcher(adapter)
+        protocol = ConnectorProtocol(self.config(), adapter, dispatcher=dispatcher)
+        protocol.accept_snapshot(self.snapshot())
+        update = {
+            "schema_version": 1, "type": "execution_gate.update", "message_id": "gate-1",
+            "account_id": "a1", "provider": "MT5", "broker_server": "Demo",
+            "external_account_id": "42", "generation": 7, "sequence": 1,
+            "execution_epoch": 5, "command_id": "gate-command-1",
+            "idempotency_key": "gate-idem-1", "request_hash": "gate-hash-1",
+            "sent_at": "2026-09-23T00:00:00Z",
+            "payload": {"backend_execution_gate": True, "execution_epoch": 5},
+        }
+        ack = protocol.handle(update)
+        self.assertEqual(ack["type"], "execution_gate.ack")
+        self.assertEqual(ack["payload"]["control_id"], "gate-command-1")
+        self.assertTrue(dispatcher.execution_enabled)
+        self.assertEqual(dispatcher.execution_epoch, 5)
+        with self.assertRaisesRegex(ProtocolError, "STALE_GENERATION"):
+            protocol.handle({
+                **update, "message_id": "gate-stale-generation", "sequence": 2,
+                "generation": 8,
+            })
+        with self.assertRaisesRegex(ProtocolError, "STALE_EPOCH"):
+            protocol.handle({
+                **update, "message_id": "gate-stale-epoch", "sequence": 2,
+                "execution_epoch": 4,
+                "payload": {"backend_execution_gate": False, "execution_epoch": 4},
+            })
+
     async def test_order_check_rejection_never_invokes_and_replay_is_durable(self):
         adapter = FakeMT5Adapter(check={"retcode": 10016})
         protocol, _dispatcher = self.protocol_with_dispatcher(adapter)

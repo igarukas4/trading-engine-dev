@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from uuid import UUID, uuid4
 
 from psycopg import connect
@@ -161,11 +161,13 @@ class LifecycleCoordinator:
         *,
         account_registry: Any | None = None,
         execution: Any | None = None,
+        active_session_check: Callable[[str, int, str | None], bool] | None = None,
     ) -> None:
         self.state_path = Path(state_path) if state_path else None
         self.database_url = database_url
         self.account_registry = account_registry
         self.execution = execution
+        self.active_session_check = active_session_check
         self._commands: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._audits: dict[str, list[dict[str, Any]]] = {}
         self._facts: dict[str, dict[str, Any]] = {}
@@ -336,6 +338,15 @@ class LifecycleCoordinator:
             and lease_expires is not None
             and lease_expires > now
         )
+        generation_current = getattr(account, "connector_generation", 0) >= 0
+        if self.active_session_check is not None:
+            session_active = self.active_session_check(
+                account.id,
+                int(getattr(account, "connector_generation", -1)),
+                getattr(account, "lease_owner", None),
+            )
+            lease_current = lease_current and session_active
+            generation_current = generation_current and session_active
         account_identity = getattr(account, "identity", None)
         binding_identity = (
             (binding.provider, binding.broker_server, binding.external_account_id)
@@ -375,7 +386,7 @@ class LifecycleCoordinator:
             binding_revoked=bool(binding and getattr(binding, "revoked", False)),
             connector_healthy=bool(getattr(account, "connector_healthy", False)),
             lease_current=lease_current,
-            generation_current=getattr(account, "connector_generation", 0) >= 0,
+            generation_current=generation_current,
             reconciliation_complete=bool(getattr(account, "reconciliation_complete", False)),
             broker_facts_fresh=broker_facts_fresh,
             no_unknown=no_unknown,
@@ -688,9 +699,13 @@ class LifecycleCoordinator:
         lease_current = bool(
             account_row[9] and lease_expires is not None and lease_expires > _now()
         )
-        generation_current = (
-            account_row[8] is None and int(account_row[7]) >= 0
-        )
+        generation_current = account_row[8] is None and int(account_row[7]) >= 0
+        if self.active_session_check is not None:
+            session_active = self.active_session_check(
+                account.id, int(account_row[7]), account_row[9],
+            )
+            lease_current = lease_current and session_active
+            generation_current = generation_current and session_active
 
         cursor.execute(
             """SELECT risk_limits_version, pair_mappings
@@ -783,7 +798,7 @@ class LifecycleCoordinator:
             binding_identity=binding_identity,
             binding_matches=bool(binding_identity == identity and not binding_revoked),
             binding_revoked=binding_revoked,
-            connector_healthy=connector_status == "HEALTHY",
+            connector_healthy=connector_status == "HEALTHY" and generation_current and lease_current,
             lease_current=lease_current,
             generation_current=generation_current,
             reconciliation_complete=reconciliation_status == "COMPLETE",

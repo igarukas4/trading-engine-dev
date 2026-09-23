@@ -463,7 +463,7 @@ class ExecutionSubstrate:
     deterministic makes connector failure fixtures runnable without a broker.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, default_gate_open: bool = True) -> None:
         self._accounts: dict[str, AccountExecutionState] = {}
         self._locks: dict[str, threading.RLock] = {}
         self.reservations: dict[str, RiskReservation] = {}
@@ -485,6 +485,7 @@ class ExecutionSubstrate:
         self.protection_repairs: dict[tuple[str, str], dict[str, Any]] = {}
         self.calendar_blocks: dict[str, list[dict[str, Any]]] = {}
         self.calendar_overrides: dict[str, dict[str, Any]] = {}
+        self._default_gate_open = default_gate_open
 
     def _lock_for(self, account_id: str) -> threading.RLock:
         return self._locks.setdefault(account_id, threading.RLock())
@@ -496,7 +497,13 @@ class ExecutionSubstrate:
             yield
 
     def account(self, account_id: str) -> AccountExecutionState:
-        return self._accounts.setdefault(account_id, AccountExecutionState(account_id))
+        if account_id not in self._accounts:
+            self._accounts[account_id] = AccountExecutionState(
+                account_id,
+                exposure_gate="OPEN" if self._default_gate_open else "STOPPED",
+                runtime_interlock="ELIGIBLE" if self._default_gate_open else "BLOCKED",
+            )
+        return self._accounts[account_id]
 
     def runtime_interlock(self, account_id: str) -> RuntimeInterlockDecision:
         """Return the account-local exposure decision and its evidence."""
@@ -2392,10 +2399,11 @@ class ExecutionCoordinator(ExecutionSubstrate):
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
         account_identity_provider: Any | None = None,
+        default_gate_open: bool = True,
         reconciliation_deadline: timedelta = timedelta(minutes=5),
         max_protection_repair_attempts: int = 3,
     ) -> None:
-        super().__init__()
+        super().__init__(default_gate_open=default_gate_open)
         if reconciliation_deadline <= timedelta(0):
             raise ValueError("reconciliation_deadline must be positive")
         if max_protection_repair_attempts < 1:

@@ -465,7 +465,7 @@ class Issue70RuntimeTests(unittest.TestCase):
                 bridge = ConnectorDeliveryBridge(coordinator, registry)
                 asyncio.run(registry.open_session(
                     "account-1", 0, "session-" + command_kind.lower(),
-                    identity=identity, execution_epoch=4,
+                    identity=identity, execution_epoch=4, execution_gate_open=True,
                 ))
                 record = asyncio.run(bridge.enqueue_position_command(
                     "account-1", command.id, identity=identity, generation=0,
@@ -543,6 +543,7 @@ class Issue70RuntimeTests(unittest.TestCase):
         session_id = "session-end-to-end"
         asyncio.run(registry.open_session(
             "account-1", 0, session_id, identity=identity, execution_epoch=4,
+            execution_gate_open=True,
         ))
         asyncio.run(registry.reserve_sequence("account-1", session_id))
         asyncio.run(bridge.enqueue_order("account-1", "entry-order", identity=identity, generation=0))

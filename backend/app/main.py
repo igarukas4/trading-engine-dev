@@ -150,11 +150,17 @@ accounts = AccountRegistry(settings.database_url)
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
-execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
+execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity, default_gate_open=not bool(settings.database_url))
 lifecycle = LifecycleCoordinator(
     database_url=settings.database_url,
     account_registry=accounts,
     execution=execution,
+    active_session_check=lambda account_id, generation, session_id: (
+        connector_delivery.active_session(
+            account_id, generation=generation, session_id=session_id,
+        )
+        or not settings.database_url
+    ),
 )
 connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
 market_data = MarketDataStore(settings.database_url)
@@ -746,6 +752,7 @@ def _account_snapshot(account_id: str) -> dict[str, Any]:
         "facts_complete": readiness.facts_complete,
         "execution_gate": execution.account(account_id).exposure_gate,
     }
+    snapshot["backend_execution_gate"] = gate_allowed
     return snapshot
 
 
@@ -786,6 +793,24 @@ async def _run_lifecycle(account_id: str, action: str, request: LifecycleCommand
     if action in {"stop", "disable"}:
         await connector_delivery.advance_epoch(account_id, account.execution_epoch)
         await connector_delivery.fence_account(account_id, account.execution_epoch)
+    try:
+        gate_update = await connector_delivery.publish_execution_gate(
+            account_id,
+            generation=account.connector_generation,
+            execution_epoch=account.execution_epoch,
+            allowed=action == "start",
+        )
+        await connector_delivery.wait_for_control_ack(
+            account_id, gate_update.command_id,
+        )
+    except DeliveryError as error:
+        # A disconnected connector cannot leave a stale session able to send.
+        # Every active-session acknowledgement failure remains visible to the
+        # caller; lifecycle success must never imply an unacknowledged gate.
+        if error.code != "SESSION_NOT_ACTIVE" or (
+            settings.database_url and action in {"enable", "start"}
+        ):
+            raise HTTPException(status_code=409, detail={"code": error.code}) from error
     if not result.replayed:
         _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=principal)
     return _lifecycle_payload(account, result)
@@ -2331,8 +2356,6 @@ async def connector_stream(websocket: WebSocket) -> None:
             return
         try:
             accounts.authenticate(hello["account_id"], hello["key_id"], hello["secret"], hello["generation"])
-            accounts.heartbeat(hello["account_id"], hello["generation"], hello["session_id"])
-            execution.observe_connector_health(account.id, healthy=True)
         except AccountError as error:
             await websocket.close(code=1008, reason=error.code)
             return
@@ -2345,7 +2368,10 @@ async def connector_stream(websocket: WebSocket) -> None:
                 identity=_connector_identity(account),
                 execution_epoch=account.execution_epoch,
                 reconciliation_required=True,
+                execution_gate_open=False,
             )
+            accounts.heartbeat(account.id, account.connector_generation, hello["session_id"])
+            execution.observe_connector_health(account.id, healthy=True)
         except DeliveryError as error:
             await websocket.close(code=1013, reason=error.code)
             return
@@ -2357,16 +2383,35 @@ async def connector_stream(websocket: WebSocket) -> None:
             "execution_epoch": account.execution_epoch,
             "snapshot": _account_snapshot(account.id),
         })
-        outbound: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
+        outbound: asyncio.Queue[tuple[int, dict[str, Any], Any, asyncio.Future[Any] | None]] = asyncio.Queue()
 
         async def send_ordered() -> None:
             expected = server_sequence + 1
-            pending: dict[int, dict[str, Any]] = {}
+            pending: dict[int, tuple[dict[str, Any], Any, asyncio.Future[Any] | None]] = {}
             while True:
-                sequence, message = await outbound.get()
-                pending[sequence] = message
+                sequence, message, envelope, sent = await outbound.get()
+                pending[sequence] = (message, envelope, sent)
                 while expected in pending:
-                    await websocket.send_json(pending.pop(expected))
+                    current, current_envelope, current_sent = pending.pop(expected)
+                    if current_envelope is not None:
+                        try:
+                            # Keep acceptance and the actual wire write under the
+                            # per-account execution lock.  A lifecycle stop/disable
+                            # may otherwise commit between mark_sent() and send_json()
+                            # and leave a stale command able to reach the connector.
+                            with execution.account_lock(account.id):
+                                await connector_bridge.mark_sent(
+                                    account.id, current_envelope.command_id, hello["session_id"],
+                                )
+                                await websocket.send_json(current)
+                        except DeliveryError as error:
+                            if current_sent is not None and not current_sent.done():
+                                current_sent.set_exception(error)
+                            raise
+                    else:
+                        await websocket.send_json(current)
+                    if current_sent is not None and not current_sent.done():
+                        current_sent.set_result(True)
                     outbound.task_done()
                     expected += 1
 
@@ -2388,13 +2433,14 @@ async def connector_stream(websocket: WebSocket) -> None:
                 "idempotency_key": "msg:" + message_id,
                 "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "payload": payload,
-            }))
+            }, None, None))
 
         async def deliver() -> None:
             while True:
                 envelope = await connector_delivery.next_for_session(account.id, hello["session_id"])
-                await connector_bridge.mark_sent(account.id, envelope.command_id, hello["session_id"])
-                await outbound.put((envelope.sequence, envelope.as_message()))
+                sent = asyncio.get_running_loop().create_future()
+                await outbound.put((envelope.sequence, envelope.as_message(), envelope, sent))
+                await sent
 
         writer = asyncio.create_task(send_ordered())
         sender = asyncio.create_task(deliver())
@@ -2497,6 +2543,26 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "backend_execution_gate": backend_execution_gate,
                     })
                     if reconciliation_complete and no_unknown_commands:
+                        readiness_after = lifecycle.readiness_context(
+                            account, accounts.bindings.get(account.id), execution,
+                        )
+                        gate_update = await connector_delivery.publish_execution_gate(
+                            account.id,
+                            generation=account.connector_generation,
+                            execution_epoch=account.execution_epoch,
+                            allowed=bool(
+                                readiness_after.allowed
+                                and account.environment == "DEMO"
+                                and account.execution_mode == "MANUAL"
+                                and account.lifecycle_status == "ENABLED"
+                                and account.bot_state == "RUNNING"
+                                and execution.account(account.id).exposure_gate == "OPEN"
+                            ),
+                        )
+                        await connector_delivery.wait_for_control_ack(
+                            account.id, gate_update.command_id,
+                        )
+                    if reconciliation_complete and no_unknown_commands:
                         await connector_delivery.mark_reconciled(account.id, hello["session_id"])
                         await connector_bridge.replay_unsent(account.id)
                 elif message.get("type") == "command.result":
@@ -2513,6 +2579,13 @@ async def connector_stream(websocket: WebSocket) -> None:
                         "command_id": message["command_id"],
                         "result": result,
                     })
+                elif message.get("type") == "execution_gate.ack":
+                    try:
+                        await connector_delivery.record_control_ack(
+                            account.id, hello["session_id"], message,
+                        )
+                    except DeliveryError as error:
+                        await queue_control("error", {"code": error.code})
                 elif message.get("type") in {"account_snapshot", "market_snapshot", "candle_batch"}:
                     _audit(
                         account.id,
@@ -2531,8 +2604,17 @@ async def connector_stream(websocket: WebSocket) -> None:
                 await sender
             with suppress(asyncio.CancelledError):
                 await writer
-            connector_bridge.session_lost(account.id)
-            await connector_delivery.close_session(account.id, hello["session_id"])
+            try:
+                connector_bridge.session_lost(account.id)
+            finally:
+                try:
+                    await connector_delivery.close_session(account.id, hello["session_id"])
+                finally:
+                    accounts.close_connector_session(
+                        account.id, hello["session_id"], hello["generation"],
+                    )
+                    if settings.database_url:
+                        execution.observe_connector_health(account.id, healthy=False)
     except WebSocketDisconnect as error:
         if bound_account is not None and error.code not in {1000, 1001}:
             accounts.mark_connector_unhealthy(bound_account.id)

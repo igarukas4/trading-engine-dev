@@ -9,6 +9,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Literal
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from .execution import ConnectorDispatchRecord
@@ -23,6 +24,8 @@ COMMAND_TYPES = frozenset({
     "position.close",
     "reconcile.request",
 })
+CONTROL_UPDATE_TYPES = frozenset({"execution_gate.update"})
+CONTROL_ACK_TYPES = frozenset({"execution_gate.ack"})
 SIDE_EFFECTING_COMMANDS = frozenset({
     "order.submit_market", "position.modify_protection", "position.close",
 })
@@ -78,6 +81,7 @@ class OutboundEnvelope:
 class _Pending:
     envelope: OutboundEnvelope
     state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN", "FENCED"] = "QUEUED"
+    control_ack: asyncio.Event | None = None
 
 
 @dataclass
@@ -91,6 +95,8 @@ class _Session:
     last_received_sequence: int = 0
     seen_message_ids: set[str] = field(default_factory=set)
     reconciliation_required: bool = False
+    execution_allowed: bool = False
+    loop: asyncio.AbstractEventLoop | None = None
 
 
 def validate_hello(message: dict[str, Any]) -> dict[str, Any]:
@@ -132,11 +138,14 @@ class ConnectorDeliveryRegistry:
         identity: dict[str, str] | None = None,
         execution_epoch: int | None = None,
         reconciliation_required: bool = False,
+        execution_gate_open: bool = False,
     ) -> None:
         if not account_id or not session_id or isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
             raise DeliveryError("INVALID_SESSION")
         if identity is not None and set(identity) != IDENTITY_FIELDS:
             raise DeliveryError("INVALID_ACCOUNT_IDENTITY")
+        if not isinstance(execution_gate_open, bool):
+            raise DeliveryError("INVALID_EXECUTION_GATE")
         if execution_epoch is not None and (isinstance(execution_epoch, bool) or execution_epoch < 0):
             raise DeliveryError("INVALID_COMMAND_CONTEXT")
         async with self._lock:
@@ -152,6 +161,8 @@ class ConnectorDeliveryRegistry:
                 self._received_sequence.get(account_id, 0),
                 set(self._received_message_ids.get(account_id, set())),
                 reconciliation_required,
+                bool(execution_gate_open and not reconciliation_required),
+                asyncio.get_running_loop(),
             )
             self._pending.setdefault(account_id, {})
 
@@ -160,6 +171,101 @@ class ConnectorDeliveryRegistry:
             session = self._sessions.get(account_id)
             if session and session.session_id == session_id:
                 del self._sessions[account_id]
+                for pending in self._pending.get(account_id, {}).values():
+                    if pending.control_ack is not None:
+                        pending.control_ack.set()
+
+    def active_session(
+        self, account_id: str, *, generation: int, session_id: str | None = None,
+    ) -> bool:
+        """Return the transport authority without trusting a durable health flag."""
+        session = self._sessions.get(account_id)
+        return bool(
+            session is not None
+            and session.generation == generation
+            and (session_id is None or session.session_id == session_id)
+        )
+
+    def execution_gate(self, account_id: str) -> bool:
+        session = self._sessions.get(account_id)
+        return bool(session and session.execution_allowed)
+
+    def session_epoch(self, account_id: str) -> int | None:
+        session = self._sessions.get(account_id)
+        return session.execution_epoch if session else None
+
+    async def publish_execution_gate(
+        self, account_id: str, *, generation: int, execution_epoch: int,
+        allowed: bool,
+    ) -> OutboundEnvelope:
+        """Queue an account-local gate update and close the gate until it is acked."""
+        if not isinstance(allowed, bool):
+            raise DeliveryError("INVALID_EXECUTION_GATE")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise DeliveryError("STALE_GENERATION")
+        if isinstance(execution_epoch, bool) or not isinstance(execution_epoch, int) or execution_epoch < 0:
+            raise DeliveryError("INVALID_COMMAND_CONTEXT")
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if not session or session.generation != generation:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            session.execution_epoch = execution_epoch
+            session.execution_allowed = False
+            command_id = "gate:" + str(uuid4())
+            sequence = self._last_sequence.get(account_id, 0) + 1
+            envelope = OutboundEnvelope(
+                account_id,
+                dict(session.identity or {}),
+                generation,
+                0,
+                sequence,
+                execution_epoch,
+                command_id,
+                "gate:" + command_id,
+                "gate:" + command_id,
+                "execution_gate.update",
+                {"backend_execution_gate": bool(allowed), "execution_epoch": execution_epoch},
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
+            self._last_sequence[account_id] = sequence
+            self._pending.setdefault(account_id, {})[command_id] = _Pending(
+                envelope, control_ack=asyncio.Event(),
+            )
+            await session.queue.put(envelope)
+            return envelope
+
+    async def wait_for_control_ack(
+        self, account_id: str, control_id: str, *, timeout: float = 5.0,
+    ) -> None:
+        """Wait until an active connector has consumed a gate update.
+
+        Restrictive lifecycle commands may not report success while the old
+        connector-side gate is still in force.  Session loss is safe because
+        the transport authority is gone; every other failure is surfaced to
+        the caller instead of silently proceeding.
+        """
+        async with self._lock:
+            pending = self._pending.get(account_id, {}).get(control_id)
+            session = self._sessions.get(account_id)
+            if pending is None or pending.envelope.type not in CONTROL_UPDATE_TYPES:
+                raise DeliveryError("UNKNOWN_CONTROL")
+            if pending.state == "ACCEPTED":
+                return
+            if session is None or pending.control_ack is None:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            acknowledged = pending.control_ack
+        try:
+            await asyncio.wait_for(acknowledged.wait(), timeout=timeout)
+        except asyncio.TimeoutError as error:
+            raise DeliveryError("CONTROL_ACK_TIMEOUT") from error
+        async with self._lock:
+            pending = self._pending.get(account_id, {}).get(control_id)
+            session = self._sessions.get(account_id)
+            if pending is not None and pending.state == "ACCEPTED":
+                return
+            if session is None:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            raise DeliveryError("CONTROL_ACK_REJECTED")
 
     async def next_for_session(self, account_id: str, session_id: str) -> OutboundEnvelope:
         session = self._sessions.get(account_id)
@@ -247,6 +353,11 @@ class ConnectorDeliveryRegistry:
                 if typ in COMMAND_TYPES or typ == "command.result":
                     if command_id is None or not isinstance(request_hash, str) or not request_hash:
                         raise DeliveryError("MALFORMED_FRAME")
+                elif typ in CONTROL_ACK_TYPES:
+                    if command_id is not None or request_hash is not None:
+                        raise DeliveryError("MALFORMED_FRAME")
+                    if not isinstance(message["payload"].get("control_id"), str):
+                        raise DeliveryError("INVALID_CONTROL_ACK")
                 elif command_id is not None or request_hash is not None:
                     raise DeliveryError("MALFORMED_FRAME")
                 sequence = message["sequence"]
@@ -347,6 +458,8 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("WRONG_ACCOUNT")
             if type in SIDE_EFFECTING_COMMANDS and session.reconciliation_required:
                 raise DeliveryError("RECONCILIATION_REQUIRED")
+            if type == "order.submit_market" and not session.execution_allowed:
+                raise DeliveryError("EXECUTION_GATE_CLOSED")
             if (
                 type in SIDE_EFFECTING_COMMANDS
                 and session.execution_epoch is not None
@@ -485,6 +598,41 @@ class ConnectorDeliveryRegistry:
             item.state = result
             return result
 
+    async def acknowledge_execution_gate(
+        self, account_id: str, session_id: str, control_id: str, *,
+        generation: int, execution_epoch: int,
+    ) -> None:
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if not session or session.session_id != session_id:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            pending = self._pending.get(account_id, {}).get(control_id)
+            if pending is None or pending.envelope.type not in CONTROL_UPDATE_TYPES:
+                raise DeliveryError("UNKNOWN_CONTROL")
+            if generation != pending.envelope.connector_generation:
+                raise DeliveryError("STALE_GENERATION")
+            if execution_epoch != pending.envelope.execution_epoch:
+                raise DeliveryError("STALE_EPOCH")
+            if pending.state != "SENT":
+                raise DeliveryError("CONTROL_NOT_SENT")
+            pending.state = "ACCEPTED"
+            session.execution_epoch = execution_epoch
+            session.execution_allowed = bool(pending.envelope.payload["backend_execution_gate"])
+            if pending.control_ack is not None:
+                pending.control_ack.set()
+
+    async def record_control_ack(
+        self, account_id: str, session_id: str, message: dict[str, Any],
+    ) -> None:
+        payload = message.get("payload") if isinstance(message, dict) else None
+        if not isinstance(payload, dict) or not isinstance(payload.get("control_id"), str):
+            raise DeliveryError("INVALID_CONTROL_ACK")
+        await self.acknowledge_execution_gate(
+            account_id, session_id, payload["control_id"],
+            generation=message.get("generation"),
+            execution_epoch=message.get("execution_epoch"),
+        )
+
     async def mark_sent(
         self, account_id: str, command_id: str, session_id: str,
         *, entry_allowed: Callable[[OutboundEnvelope], bool] | None = None,
@@ -593,6 +741,8 @@ class ConnectorDeliveryBridge:
                     == self.coordinator.account(account_id).execution_epoch
                 ),
             )
+            if envelope.type in CONTROL_UPDATE_TYPES:
+                return envelope
             self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
             return envelope
 
