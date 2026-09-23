@@ -41,6 +41,7 @@ from backend.app.risk_calendar import RiskAssessment
 now = datetime.now(timezone.utc)
 payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("account-a", True)
 engine.approve_signal(account_id="account-a", signal_id="manual", idempotency_key="approve-manual", reason="reviewed", confirmed=True, signal_revision=1)
 try:
     engine.execute_signal(
@@ -86,6 +87,7 @@ from datetime import datetime, timedelta, timezone
 from backend.app.execution import ExecutionError, ExecutionSubstrate
 from backend.app.risk_calendar import RiskAssessment
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 engine.approve_signal(account_id="a", signal_id="s", idempotency_key="a1", reason="reviewed", confirmed=True, signal_revision=1)
 now = datetime.now(timezone.utc)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id="s")

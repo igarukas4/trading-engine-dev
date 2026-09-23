@@ -20,6 +20,8 @@ for account in accounts:
     registry.set_execution_mode(account.id, "FULL_AUTO", now=at)
     account.bot_state = "RUNNING"
 engine = ExecutionSubstrate()
+for account in accounts:
+    engine.set_lifecycle_gate(account.id, True)
 payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
 def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
@@ -41,6 +43,8 @@ test("global emergency freezes a durable target set until every target converges
   const output = run(`
 from backend.app.execution import ExecutionError, ExecutionSubstrate
 engine = ExecutionSubstrate()
+for account_id in ("a", "b", "c"):
+    engine.set_lifecycle_gate(account_id, True)
 operation = engine.begin_global_emergency(["a", "b", "c"], kind="CLOSE_ALL")
 assert operation.status == "INCOMPLETE"
 assert operation.target_account_ids == ("a", "b", "c")

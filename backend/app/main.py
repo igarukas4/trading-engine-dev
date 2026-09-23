@@ -150,7 +150,7 @@ accounts = AccountRegistry(settings.database_url)
 strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
-execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity, default_gate_open=not bool(settings.database_url))
+execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
 lifecycle = LifecycleCoordinator(
     database_url=settings.database_url,
     account_registry=accounts,
@@ -2395,12 +2395,14 @@ async def connector_stream(websocket: WebSocket) -> None:
                     current, current_envelope, current_sent = pending.pop(expected)
                     if current_envelope is not None:
                         try:
-                            # Keep acceptance and the actual wire write under the
-                            # per-account execution lock.  A lifecycle stop/disable
-                            # may otherwise commit between mark_sent() and send_json()
-                            # and leave a stale command able to reach the connector.
+                            # mark_sent is a durable delivery-attempt checkpoint.
+                            # The lifecycle can commit before the actual write, so
+                            # authorize that write again after the checkpoint.
+                            await connector_bridge.mark_sent(
+                                account.id, current_envelope.command_id, hello["session_id"],
+                            )
                             with execution.account_lock(account.id):
-                                await connector_bridge.mark_sent(
+                                await connector_bridge.ensure_wire_write(
                                     account.id, current_envelope.command_id, hello["session_id"],
                                 )
                                 await websocket.send_json(current)

@@ -283,7 +283,7 @@ class ConnectorDeliveryRegistry:
         async with self._lock:
             for pending in self._pending.get(account_id, {}).values():
                 if (
-                    pending.state == "QUEUED"
+                    pending.state in {"QUEUED", "SENT"}
                     and pending.envelope.execution_epoch < execution_epoch
                     and pending.envelope.type == "order.submit_market"
                 ):
@@ -653,6 +653,31 @@ class ConnectorDeliveryRegistry:
             item.state = "SENT"
             return item.envelope
 
+    async def ensure_wire_write(
+        self, account_id: str, command_id: str, session_id: str,
+        *, entry_allowed: Callable[[OutboundEnvelope], bool] | None = None,
+    ) -> OutboundEnvelope:
+        """Recheck an entry after mark_sent and immediately before the wire write."""
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            item = self._pending.get(account_id, {}).get(command_id)
+            if not session or session.session_id != session_id:
+                raise DeliveryError("SESSION_NOT_ACTIVE")
+            if item is None:
+                raise DeliveryError("UNKNOWN_COMMAND")
+            if item.state == "FENCED":
+                raise DeliveryError("STALE_EPOCH")
+            if item.state != "SENT":
+                raise DeliveryError("INVALID_PENDING_COMMAND")
+            if (
+                item.envelope.type == "order.submit_market"
+                and entry_allowed is not None
+                and not entry_allowed(item.envelope)
+            ):
+                item.state = "FENCED"
+                raise DeliveryError("STALE_EPOCH")
+            return item.envelope
+
     def pending_state(self, account_id: str, command_id: str) -> str | None:
         item = self._pending.get(account_id, {}).get(command_id)
         return item.state if item else None
@@ -745,6 +770,27 @@ class ConnectorDeliveryBridge:
                 return envelope
             self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
             return envelope
+
+    async def ensure_wire_write(
+        self, account_id: str, command_id: str, session_id: str,
+    ) -> OutboundEnvelope:
+        """Authorize the actual websocket write after the send checkpoint."""
+        with self.coordinator.account_lock(account_id):
+            try:
+                return await self.registry.ensure_wire_write(
+                    account_id, command_id, session_id,
+                    entry_allowed=lambda candidate: (
+                        self.coordinator.account(account_id).exposure_gate == "OPEN"
+                        and candidate.execution_epoch
+                        == self.coordinator.account(account_id).execution_epoch
+                    ),
+                )
+            except DeliveryError as error:
+                if error.code == "STALE_EPOCH":
+                    record = self.coordinator.dispatch_records.get(command_id)
+                    if record is not None and record.state in {"QUEUED", "SENT"}:
+                        self.coordinator._fence_entry_record(record)
+                raise
 
     def session_lost(self, account_id: str) -> tuple[ConnectorDispatchRecord, ...]:
         return self.coordinator.mark_connector_session_lost(account_id)

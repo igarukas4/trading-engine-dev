@@ -507,6 +507,7 @@ class Issue70RuntimeTests(unittest.TestCase):
     def test_three_commands_cross_registry_wss_sqlite_adapter_and_projection(self):
         identity = {"provider": "MT5", "broker_server": "Demo", "external_account_id": "42"}
         coordinator = ExecutionCoordinator()
+        coordinator.set_lifecycle_gate("account-1", True)
         coordinator.account("account-1").execution_epoch = 4
         coordinator.bind_account_identity("account-1", identity)
         coordinator.orders["entry-order"] = OrderIntent(

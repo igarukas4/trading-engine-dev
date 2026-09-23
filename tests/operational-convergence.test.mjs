@@ -27,6 +27,7 @@ assessment = RiskAssessment(
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     first = ExecutionCoordinator(state_path=path)
+    first.set_lifecycle_gate("account-a", True)
     accepted = first.accept_execution(
         account_id="account-a", signal_id="signal-a", idempotency_key="entry-a",
         canonical_hash="hash-a", execution_epoch=1, risk_assessment=assessment,
@@ -121,6 +122,8 @@ def assessment(account_id, signal_id):
 
 with TemporaryDirectory() as directory:
     engine = ExecutionCoordinator(state_path=f"{directory}/execution.json")
+    for account in accounts:
+        engine.set_lifecycle_gate(account["id"], True)
     orders = []
     for account in accounts:
         orders.append(engine.accept_execution(

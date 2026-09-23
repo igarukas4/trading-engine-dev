@@ -25,6 +25,9 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _seed_dispatchable_order(coordinator, *, account_id: str, suffix: str) -> None:
+        # Entry tests explicitly opt into the lifecycle-open gate. New
+        # ExecutionCoordinator accounts are blocked by default.
+        coordinator.set_lifecycle_gate(account_id, True)
         order_id = "order-" + suffix
         command_id = "command-" + suffix
         signal_id = "signal-" + suffix
@@ -533,6 +536,30 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await registry.advance_epoch("a", 2)
         await registry.fence_account("a", 2)
         self.assertEqual(registry.pending_state("a", envelope.command_id), "FENCED")
+
+    async def test_mark_sent_then_stop_before_wire_write_never_emits_entry(self):
+        """The writer's second race ordering must fail closed after stop commits."""
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="wire-race")
+        coordinator.account("a").exposure_gate = "OPEN"
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session(
+            "a", 1, "session", identity=identity, execution_epoch=1,
+            execution_gate_open=True,
+        )
+        await bridge.enqueue_order("a", "order-wire-race", identity=identity, generation=1)
+        envelope = await registry.next_for_session("a", "session")
+        await bridge.mark_sent("a", envelope.command_id, "session")
+
+        # mark_sent happens before the actual websocket write. A concurrent
+        # lifecycle commit must invalidate that already-marked envelope.
+        coordinator.apply_lifecycle_commit("a", 2, allowed=False, persist=False)
+        with self.assertRaisesRegex(DeliveryError, "STALE_EPOCH"):
+            await bridge.ensure_wire_write("a", envelope.command_id, "session")
+        self.assertEqual(registry.pending_state("a", envelope.command_id), "FENCED")
+        self.assertEqual(coordinator.dispatch_records[envelope.command_id].state, "FENCED")
 
 
 if __name__ == "__main__":

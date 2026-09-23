@@ -26,6 +26,7 @@ assessment = RiskAssessment(
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path)
+    engine.set_lifecycle_gate("account-a", True)
     created = engine.accept_execution(
         account_id="account-a", signal_id="signal-a", idempotency_key="command-a",
         canonical_hash="request-a", execution_epoch=1, risk_assessment=assessment,
@@ -83,6 +84,8 @@ def assessment(account, signal_id):
     return RiskAssessment(account, 1, True, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1, signal_id=signal_id)
 
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
+engine.set_lifecycle_gate("b", True)
 try:
     engine.accept_execution(account_id="a", signal_id="s", idempotency_key="bad", canonical_hash="h", execution_epoch=1,
         risk_assessment=RiskAssessment("a", 1, False, purpose="PRE_ORDER", assessed_at=now, valid_until=now + timedelta(seconds=10), signal_revision=1, signal_id="s"), signal_revision=1,
@@ -132,6 +135,7 @@ from backend.app.risk_calendar import RiskAssessment
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("account-a", True)
 engine.approve_signal(
     account_id="account-a", signal_id="signal-a", idempotency_key="approve-a",
     reason="reviewed", confirmed=True, signal_revision=1,
@@ -229,6 +233,8 @@ original_execution = main.execution
 original_risk_engine = main.signals.risk_engine
 try:
     engine = ExecutionSubstrate()
+    engine.set_lifecycle_gate("account-a", True)
+    engine.set_lifecycle_gate("account-b", True)
     engine.positions[("account-a", "position-a")] = SimpleNamespace(
         account_id="account-a", stage="ENTRY", data_status="CONFIRMED",
     )
@@ -271,6 +277,7 @@ from backend.app.risk_calendar import RiskAssessment
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("account-a", True)
 payload = {"stop_loss": "1", "take_profit": ["2"], "signal_revision": 1}
 fresh = RiskAssessment(
     "account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
@@ -356,6 +363,7 @@ assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now, 
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path)
+    engine.set_lifecycle_gate("a", True)
     created = engine.accept_execution(account_id="a", signal_id="s", idempotency_key="k", canonical_hash="h", execution_epoch=1,
         risk_assessment=assessment, signal_revision=1, order_payload={"volume": "1"}, now=now)
     broker = Broker()
@@ -402,6 +410,7 @@ def accept(engine, account, signal):
     ).order
 
 ordered = ExecutionCoordinator(reconciliation_deadline=timedelta(seconds=30))
+ordered.set_lifecycle_gate("account-ordered", True)
 accept(ordered, "account-ordered", "first")
 accept(ordered, "account-ordered", "second")
 assert ordered.dispatch_next("account-ordered", Broker()).status == "UNKNOWN"
@@ -413,6 +422,8 @@ else: raise AssertionError("a later account dispatch crossed unresolved UNKNOWN"
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path, reconciliation_deadline=timedelta(seconds=30))
+    engine.set_lifecycle_gate("account-a", True)
+    engine.set_lifecycle_gate("account-b", True)
     unknown = accept(engine, "account-a", "signal-a")
     healthy = accept(engine, "account-b", "signal-b")
     ambiguous = Broker()
@@ -466,6 +477,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 account = accounts.register(provider="mt5", broker_server="demo", external_account_id="reconcile-1", display_name="reconcile", environment="DEMO")
+execution.set_lifecycle_gate(account.id, True)
 secret = "x" * 32
 key_id = accounts.bind_connector(account.id, secret)
 assessment = RiskAssessment(account.id, 1, True, purpose="PRE_ORDER", assessed_at=now,
@@ -551,6 +563,7 @@ class Broker:
     def command_state(self, command): return self.command_status
 
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 broker = Broker()
 close = engine.close_all(account_id="a", idempotency_key="close", reason="operator", confirmed=True, connector=broker)
 assert close.status == "UNKNOWN"
@@ -583,6 +596,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -619,6 +633,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator(reconciliation_deadline=timedelta(minutes=1))
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -658,6 +673,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -692,6 +708,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -721,6 +738,7 @@ class Broker:
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 def assessment(signal_id):
     return RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id=signal_id)
@@ -751,6 +769,7 @@ from backend.app.risk_calendar import RiskAssessment
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -792,6 +811,7 @@ class Broker:
 now = datetime.now(timezone.utc)
 store = Store()
 engine = ExecutionCoordinator(state_store=store)
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -813,6 +833,7 @@ from backend.app.risk_calendar import RiskAssessment
 
 now = datetime.now(timezone.utc)
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("a", True)
 assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(minutes=1), signal_revision=1, signal_id="signal")
 entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
@@ -866,6 +887,7 @@ assessment = RiskAssessment(account.id, 1, True, purpose="PRE_ORDER",
 original_execution = main.execution
 original_assessment = main._pre_order_risk_assessment
 main.execution = ExecutionCoordinator()
+main.execution.set_lifecycle_gate(account.id, True)
 main._pre_order_risk_assessment = lambda *args, **kwargs: assessment
 try:
     signal.account_id = "other-account"
@@ -914,6 +936,7 @@ assessment = RiskAssessment("a", 1, True, purpose="PRE_ORDER", assessed_at=now,
 with TemporaryDirectory() as directory:
     path = f"{directory}/execution.json"
     engine = ExecutionCoordinator(state_path=path)
+    engine.set_lifecycle_gate("a", True)
     entry = engine.accept_execution(account_id="a", signal_id="signal", idempotency_key="entry",
         canonical_hash="entry", execution_epoch=1, risk_assessment=assessment,
         signal_revision=1, order_payload={"volume": "1"}, now=now)

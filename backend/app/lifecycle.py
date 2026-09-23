@@ -598,19 +598,12 @@ class LifecycleCoordinator:
                         allowed=action == "start", persist=False,
                     )
                 if action == "enable" and self.execution is not None:
-                    # The account remains stopped after enable, but the
-                    # previous lifecycle fence is no longer a health reason.
+                    # Enable leaves the account stopped. The lifecycle fence
+                    # remains the explicit runtime interlock until start.
                     self.execution.apply_lifecycle_commit(
                         account.id, account.execution_epoch, allowed=False,
                         persist=False,
                     )
-                    execution_state = self.execution.account(account.id)
-                    execution_state.interlock_reasons = tuple(
-                        reason for reason in execution_state.interlock_reasons
-                        if reason != "LIFECYCLE_STOPPED"
-                    )
-                    if not execution_state.interlock_reasons:
-                        execution_state.runtime_interlock = "ELIGIBLE"
                 new_state = self._account_state(account)
                 created = _iso(_now()) or ""
                 command_id, audit_id = str(uuid4()), str(uuid4())
@@ -908,8 +901,12 @@ class LifecycleCoordinator:
                     new_state = dict(prior_state)
                     if not error:
                         if action in {"enable", "start"}:
-                            new_interlock = effective.runtime_interlock
-                            new_reasons = list(effective.runtime_reason_codes)
+                            if action == "enable":
+                                new_interlock = "BLOCKED"
+                                new_reasons = ["LIFECYCLE_STOPPED"]
+                            else:
+                                new_interlock = effective.runtime_interlock
+                                new_reasons = list(effective.runtime_reason_codes)
                         elif action in {"stop", "disable"}:
                             new_interlock = (
                                 "QUARANTINED"
@@ -962,11 +959,29 @@ class LifecycleCoordinator:
                                    exposure_gate = EXCLUDED.exposure_gate, updated_at = now()""",
                             (account.id, new_epoch, "OPEN" if action == "start" else "STOPPED"),
                         )
+                        cursor.execute(
+                            """INSERT INTO runtime_interlocks
+                               (broker_account_id, status, reason_codes, recovery_evidence)
+                               VALUES (%s, %s, %s, %s)
+                               ON CONFLICT (broker_account_id) DO UPDATE
+                               SET status = EXCLUDED.status,
+                                   reason_codes = EXCLUDED.reason_codes,
+                                   recovery_evidence = EXCLUDED.recovery_evidence,
+                                   updated_at = now()""",
+                            (
+                                account.id, new_state["runtime_interlock"],
+                                Jsonb(new_state["interlock_reason_codes"]),
+                                Jsonb(new_state["interlock_evidence"]),
+                            ),
+                        )
                         if action in {"stop", "disable"}:
                             self._fence_postgres_entries(cursor, account.id, new_epoch)
                         self._fence_snapshot(
                             cursor, account.id, new_epoch,
                             exposure_gate="OPEN" if action == "start" else "STOPPED",
+                            runtime_interlock=new_state["runtime_interlock"],
+                            interlock_reasons=new_state["interlock_reason_codes"],
+                            interlock_evidence=new_state["interlock_evidence"],
                         )
                     cursor.execute(
                         """INSERT INTO lifecycle_commands
@@ -1003,7 +1018,7 @@ class LifecycleCoordinator:
                SET state = 'REJECTED',
                    result_payload = '{"state":"REJECTED","code":"LIFECYCLE_FENCE"}'::jsonb,
                    updated_at = now()
-               WHERE broker_account_id = %s AND state = 'QUEUED'
+               WHERE broker_account_id = %s AND state IN ('QUEUED', 'SENT')
                  AND execution_epoch < %s AND command_type = 'order.submit_market'
                RETURNING command_id""",
             (account_id, epoch),
@@ -1047,6 +1062,9 @@ class LifecycleCoordinator:
     @staticmethod
     def _fence_snapshot(
         cursor: Any, account_id: str, epoch: int, *, exposure_gate: str = "STOPPED",
+        runtime_interlock: str = "BLOCKED",
+        interlock_reasons: list[str] | tuple[str, ...] = (),
+        interlock_evidence: dict[str, Any] | None = None,
     ) -> None:
         cursor.execute("SELECT state FROM execution_state_snapshots WHERE snapshot_id = 1 FOR UPDATE")
         row = cursor.fetchone()
@@ -1055,7 +1073,7 @@ class LifecycleCoordinator:
         state = copy.deepcopy(row[0])
         fenced: set[str] = set()
         for command_id, record in state.get("dispatch_records", {}).items():
-            if (record.get("account_id") == account_id and record.get("state") == "QUEUED"
+            if (record.get("account_id") == account_id and record.get("state") in {"QUEUED", "SENT"}
                     and int(record.get("execution_epoch", 0)) < epoch
                     and record.get("command_type") == "order.submit_market"):
                 record["state"] = "FENCED"
@@ -1089,6 +1107,9 @@ class LifecycleCoordinator:
             account_id, {"account_id": account_id}
         )["execution_epoch"] = epoch
         state["accounts"][account_id]["exposure_gate"] = exposure_gate
+        state["accounts"][account_id]["runtime_interlock"] = runtime_interlock
+        state["accounts"][account_id]["interlock_reasons"] = list(interlock_reasons)
+        state["accounts"][account_id]["interlock_evidence"] = dict(interlock_evidence or {})
         cursor.execute(
             "UPDATE execution_state_snapshots SET state = %s, updated_at = now() WHERE snapshot_id = 1",
             (Jsonb(state),),
@@ -1111,12 +1132,11 @@ class LifecycleCoordinator:
             if item.get("action") == "enable":
                 execution_state = self.execution.account(account.id)
                 execution_state.exposure_gate = "STOPPED"
-                execution_state.interlock_reasons = tuple(
-                    reason for reason in execution_state.interlock_reasons
-                    if reason != "LIFECYCLE_STOPPED"
-                )
-                if not execution_state.interlock_reasons:
-                    execution_state.runtime_interlock = "ELIGIBLE"
+                execution_state.runtime_interlock = "BLOCKED"
+                if "LIFECYCLE_STOPPED" not in execution_state.interlock_reasons:
+                    execution_state.interlock_reasons = (
+                        *execution_state.interlock_reasons, "LIFECYCLE_STOPPED"
+                    )
                 if persist_execution:
                     self.execution._save()
 

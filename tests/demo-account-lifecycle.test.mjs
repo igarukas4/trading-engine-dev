@@ -9,6 +9,46 @@ const run = (script) => execFileSync(
   { encoding: "utf8" },
 );
 
+test("new accounts stay blocked in every mode until lifecycle start opens the substrate", () => {
+  const output = run(`
+from backend.app.broker_accounts import AccountRegistry
+from backend.app.execution import ExecutionCoordinator, ExecutionSubstrate
+
+accounts = AccountRegistry()
+account = accounts.register(
+    provider="MT5", broker_server="Broker-Demo", external_account_id="72000",
+    display_name="Default gate", environment="DEMO",
+)
+# Even if the connector/readiness facts look healthy, lifecycle and mode state
+# must not open a newly-created account or its substrate.
+account.connector_bound = True
+account.connector_healthy = True
+account.lease_owner = "session"
+account.lease_expires_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+account.reconciliation_complete = True
+account.risk_limits_active = True
+account.mappings_valid = True
+account.bot_state = "RUNNING"
+for lifecycle_status, bot_state, mode in (
+    ("DISABLED", "RUNNING", "MANUAL"),
+    ("ENABLED", "STOPPED", "MANUAL"),
+    ("ENABLED", "RUNNING", "SEMI_AUTO"),
+    ("ENABLED", "RUNNING", "FULL_AUTO"),
+):
+    account.lifecycle_status = lifecycle_status
+    account.bot_state = bot_state
+    account.execution_mode = mode
+    assert account.lifecycle_status == lifecycle_status
+    assert account.bot_state == bot_state
+    assert accounts.read_only_snapshot(account.id)["runtime_interlock"] == "BLOCKED"
+    substrate = ExecutionSubstrate()
+    assert substrate.account(account.id).exposure_gate == "STOPPED"
+    assert substrate.runtime_interlock(account.id).status == "BLOCKED"
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
 test("authenticated lifecycle API enables, starts, stops, and disables one ready DEMO account", () => {
   const output = run(`
 from datetime import datetime, timedelta, timezone
@@ -211,6 +251,7 @@ account.lifecycle_status = "ENABLED"
 account.bot_state = "RUNNING"
 account.version = 2
 execution = ExecutionCoordinator()
+execution.set_lifecycle_gate(account.id, True)
 assessment = RiskAssessment(
     account.id, 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(seconds=30), signal_revision=1, signal_id="signal-fence",

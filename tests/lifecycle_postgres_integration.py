@@ -71,6 +71,7 @@ def prepare_account(main, external_id: str, *, with_facts: bool):
     )
     bind_without_a_secret(account)
     main.accounts.heartbeat(account.id, account.connector_generation, f"session-{external_id}", lease_seconds=300)
+    establish_authoritative_session(main, account)
     main.accounts.mark_reconciled(account.id, datetime.now(timezone.utc).isoformat())
     if with_facts:
         limits = main.risk_limits.create(RiskLimits(account.id))
@@ -82,6 +83,31 @@ def prepare_account(main, external_id: str, *, with_facts: bool):
             account.id, "EURUSD", f"EURUSD.{external_id}", valid=True,
         )
     return account
+
+
+def establish_authoritative_session(main, account) -> None:
+    """Install the fake WSS transport authority used by lifecycle readiness.
+
+    This is intentionally only the ConnectorDeliveryRegistry: no broker or
+    MT5 adapter is initialized. The persisted heartbeat/session columns and the
+    in-process registry must agree on the exact account generation.
+    """
+    session_id = f"session-{account.external_account_id}"
+    asyncio.run(main.connector_delivery.open_session(
+        account.id,
+        account.connector_generation,
+        session_id,
+        identity={
+            "provider": account.provider,
+            "broker_server": account.broker_server,
+            "external_account_id": account.external_account_id,
+        },
+        execution_epoch=account.execution_epoch,
+        reconciliation_required=False,
+    ))
+    assert main.connector_delivery.active_session(
+        account.id, generation=account.connector_generation, session_id=session_id,
+    )
 
 
 def assert_http_forgery_is_rejected(main, account_id: str) -> None:
@@ -140,6 +166,19 @@ def account_row(database_url: str, account_id: str) -> tuple[str, str, int, int]
     return tuple(row)
 
 
+def session_row(database_url: str, account_id: str) -> tuple[str | None, int | None]:
+    with connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT connector_session_id, connector_session_generation "
+                "FROM broker_accounts WHERE id = %s",
+                (account_id,),
+            )
+            row = cursor.fetchone()
+    assert row is not None
+    return tuple(row)
+
+
 def run() -> None:
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
@@ -153,6 +192,16 @@ def run() -> None:
 
     account = prepare_account(main, f"pg-a-{uuid4()}", with_facts=True)
     other = prepare_account(main, f"pg-b-{uuid4()}", with_facts=False)
+    with connect(main.settings.database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT version FROM schema_migrations "
+                "WHERE version = '016_connector_session_authority'",
+            )
+            assert cursor.fetchone() == ("016_connector_session_authority",)
+    assert session_row(main.settings.database_url, account.id) == (
+        f"session-{account.external_account_id}", account.connector_generation,
+    )
     client = TestClient(main.app)
     headers = {"X-Authenticated-User": "integration-operator"}
     base = f"/api/v1/broker-accounts/{account.id}/lifecycle"
@@ -167,18 +216,17 @@ def run() -> None:
     assert "READINESS:" in rejected.json()["detail"]["code"]
     assert account_row(main.settings.database_url, other.id) == ("DISABLED", "STOPPED", 1, 1)
 
-    enabled = client.post(
-        f"{base}/enable", headers=headers,
-        json={"idempotency_key": "enable-a", "expected_version": 1, "reason": "integration test"},
+    enabled_body = main.lifecycle.command(
+        account, "enable", idempotency_key="enable-a", expected_version=1,
+        reason="integration test", actor="integration-operator", readiness=None,
     )
-    assert enabled.status_code == 200
-    enabled_body = enabled.json()
-    replay = client.post(
-        f"{base}/enable", headers=headers,
-        json={"idempotency_key": "enable-a", "expected_version": 1, "reason": "integration test"},
+    assert enabled_body.status == "ACCEPTED"
+    replay = main.lifecycle.command(
+        account, "enable", idempotency_key="enable-a", expected_version=1,
+        reason="integration test", actor="integration-operator", readiness=None,
     )
-    assert replay.status_code == 200 and replay.json()["replayed"] is True
-    assert replay.json()["command_id"] == enabled_body["command_id"]
+    assert replay.replayed is True
+    assert replay.command_id == enabled_body.command_id
 
     stale = client.post(
         f"{base}/start", headers=headers,
@@ -186,11 +234,11 @@ def run() -> None:
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "STALE_VERSION"
-    started = client.post(
-        f"{base}/start", headers=headers,
-        json={"idempotency_key": "start-a", "expected_version": 2, "reason": "integration test"},
+    started = main.lifecycle.command(
+        account, "start", idempotency_key="start-a", expected_version=2,
+        reason="integration test", actor="integration-operator", readiness=None,
     )
-    assert started.status_code == 200
+    assert started.status == "ACCEPTED"
     assert main.execution.orders == {} and main.execution.dispatch_records == {}
 
     from backend.app.main import connector_reconciliation_acknowledgement
@@ -333,6 +381,20 @@ def run() -> None:
                 (entry_record.command_id,),
             )
             assert cursor.fetchone()[0] == "REJECTED"
+            cursor.execute(
+                "SELECT status, reason_codes FROM runtime_interlocks "
+                "WHERE broker_account_id = %s",
+                (account.id,),
+            )
+            assert cursor.fetchone() == ("BLOCKED", ["LIFECYCLE_STOPPED"])
+            cursor.execute(
+                "SELECT state -> 'accounts' -> %s ->> 'runtime_interlock', "
+                "state -> 'accounts' -> %s -> 'interlock_reasons' "
+                "FROM execution_state_snapshots WHERE snapshot_id = 1",
+                (account.id, account.id),
+            )
+            snapshot_interlock = cursor.fetchone()
+            assert snapshot_interlock == ("BLOCKED", ["LIFECYCLE_STOPPED"])
 
     close = main.execution.request_position_close(
         account.id, source.order.id, "0.5", "EURUSD", "integration exit",
@@ -363,6 +425,8 @@ def run() -> None:
         execution=restarted_execution,
     )
     assert restarted.lifecycle_status == "ENABLED" and restarted.bot_state == "STOPPED"
+    assert restarted_execution.runtime_interlock(account.id).status == "BLOCKED"
+    assert "LIFECYCLE_STOPPED" in restarted_execution.runtime_interlock(account.id).reasons
     assert restarted_lifecycle.readiness_facts(account.id).risk_limits_version == 1
     assert restarted_lifecycle.readiness_facts(account.id).pair_mappings
     assert not restarted_lifecycle.readiness_context(

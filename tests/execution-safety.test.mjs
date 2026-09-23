@@ -19,6 +19,7 @@ def assessment(account_id, signal_id, *, valid_until=None):
         signal_revision=1, signal_id=signal_id,
     )
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("account-a", True)
 try:
     engine.pre_order(
         account_id="account-a", signal_id="signal-a", idempotency_key="missing-risk",
@@ -79,6 +80,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 failed = engine.pre_order(account_id="a", signal_id="s1", idempotency_key="i1", canonical_hash="h1",
     execution_epoch=1, risk_assessment=assessment("a", "s1"), signal_revision=1, order_payload={})
 engine.dispatch_next("a", Connector(check=False))
@@ -106,6 +108,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
     execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1, order_payload={})
 engine.record_fill("a", entry.order.id, "deal-1", "0.10", native_protection_confirmed=False)
@@ -136,6 +139,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
     execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"symbol": "EURUSD", "volume": "0.38", "side": "BUY", "stop_loss": "1.09000", "take_profit": "1.11000"})
@@ -185,6 +189,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
     execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
@@ -224,6 +229,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
     execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"volume": "1", "stop_loss": "90", "take_profit": "110"})
@@ -249,6 +255,8 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("account-a", True)
+engine.set_lifecycle_gate("account-b", True)
 orders = [
     engine.pre_order(account_id=account, signal_id="s", idempotency_key="i", canonical_hash="h",
         execution_epoch=1, risk_assessment=assessment(account, "s"), signal_revision=1, order_payload={})
@@ -278,6 +286,7 @@ def assessment(account_id, signal_id):
     return RiskAssessment(account_id, 1, True, purpose="PRE_ORDER", assessed_at=now,
         valid_until=now + timedelta(seconds=20), signal_revision=1, signal_id=signal_id)
 engine = ExecutionSubstrate()
+engine.set_lifecycle_gate("a", True)
 entry = engine.pre_order(account_id="a", signal_id="s", idempotency_key="i", canonical_hash="h",
     execution_epoch=1, risk_assessment=assessment("a", "s"), signal_revision=1,
     order_payload={"symbol": "EURUSD", "volume": "1", "side": "BUY", "entry_price": "1.10"})

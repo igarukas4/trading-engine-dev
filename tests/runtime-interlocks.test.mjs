@@ -43,6 +43,8 @@ class FailingBroker:
         return {"status": "UNCONFIRMED"}
 
 engine = ExecutionCoordinator(max_protection_repair_attempts=2)
+engine.set_lifecycle_gate("account-a", True)
+engine.set_lifecycle_gate("account-b", True)
 unsafe = order(engine, "account-a", "signal-a")
 healthy = order(engine, "account-b", "signal-b")
 engine.record_fill("account-a", unsafe.order.id, "deal-a", "1", native_protection_confirmed=False)
@@ -77,7 +79,7 @@ engine = ExecutionCoordinator()
 blocked = engine.observe_runtime_health("account-a", connector_healthy=False)
 assert blocked.status == "BLOCKED"
 assert "CONNECTOR_UNAVAILABLE" in blocked.reasons
-assert engine.runtime_interlock("account-b").status == "ELIGIBLE"
+assert engine.runtime_interlock("account-b").status == "BLOCKED"
 try:
     engine.accept_execution
 except AttributeError:
@@ -105,7 +107,7 @@ assert engine.recover_runtime_interlock(
     "account-a", evidence={"broker_reconciled": True}, custodian_command=True,
 ).status == "ELIGIBLE"
 assert engine.critical_alerts("account-a") == []
-assert engine.runtime_interlock("account-b").status == "ELIGIBLE"
+assert engine.runtime_interlock("account-b").status == "BLOCKED"
 print("ok")
 `);
   assert.match(output, /ok/);
@@ -130,6 +132,8 @@ def accept(engine, account_id, signal_id, pair, at=now):
         order_payload={"symbol": pair, "volume": "1", "stop_loss": "90", "take_profit": ["110"]}, now=at)
 
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("account-a", True)
+engine.set_lifecycle_gate("account-b", True)
 engine.set_calendar_interlock("account-a", pair="EURUSD", currencies=("EUR", "USD"), scope_known=True)
 try:
     accept(engine, "account-a", "blocked", "EURUSD")
@@ -208,7 +212,7 @@ with TemporaryDirectory() as directory:
     decision = reloaded.runtime_interlock("account-a")
     assert decision.status == "BLOCKED"
     assert decision.reasons == ("CONNECTOR_GAP",)
-    assert reloaded.runtime_interlock("account-b").status == "ELIGIBLE"
+    assert reloaded.runtime_interlock("account-b").status == "BLOCKED"
 print("ok")
 `);
   assert.match(output, /ok/);
@@ -225,6 +229,7 @@ now = datetime(2026, 1, 1, tzinfo=timezone.utc)
 assessment = RiskAssessment("account-a", 1, True, purpose="PRE_ORDER", assessed_at=now,
     valid_until=now + timedelta(seconds=30), signal_revision=1, signal_id="signal")
 engine = ExecutionCoordinator(max_protection_repair_attempts=1)
+engine.set_lifecycle_gate("account-a", True)
 entry = engine.accept_execution(account_id="account-a", signal_id="signal", idempotency_key="signal",
     canonical_hash="signal", execution_epoch=1, risk_assessment=assessment, signal_revision=1,
     order_payload={"symbol": "EURUSD", "volume": "1", "stop_loss": "90", "take_profit": ["110"]}, now=now)
@@ -259,6 +264,8 @@ from datetime import datetime, timezone
 from backend.app.execution import ExecutionCoordinator, ExecutionError
 
 engine = ExecutionCoordinator()
+engine.set_lifecycle_gate("account-a", True)
+engine.set_lifecycle_gate("account-b", True)
 for kwargs, reason in [
     ({"risk_state_known": False}, "RISK_STATE_UNCERTAIN"),
     ({"reservation_consistent": False}, "RESERVATION_INCONSISTENT"),

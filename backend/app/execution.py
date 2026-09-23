@@ -86,9 +86,9 @@ class AccountExecutionState:
     execution_epoch: int = 1
     exposure_gate: Literal[
         "OPEN", "FENCE_PENDING", "QUARANTINED", "STOPPED"
-    ] = "OPEN"
+    ] = "STOPPED"
     fence_sequence: int = 0
-    runtime_interlock: Literal["ELIGIBLE", "BLOCKED", "QUARANTINED"] = "ELIGIBLE"
+    runtime_interlock: Literal["ELIGIBLE", "BLOCKED", "QUARANTINED"] = "BLOCKED"
     interlock_reasons: tuple[str, ...] = ()
     interlock_evidence: dict[str, Any] = field(default_factory=dict)
     quarantine_requires_command: bool = False
@@ -463,7 +463,7 @@ class ExecutionSubstrate:
     deterministic makes connector failure fixtures runnable without a broker.
     """
 
-    def __init__(self, *, default_gate_open: bool = True) -> None:
+    def __init__(self) -> None:
         self._accounts: dict[str, AccountExecutionState] = {}
         self._locks: dict[str, threading.RLock] = {}
         self.reservations: dict[str, RiskReservation] = {}
@@ -485,7 +485,6 @@ class ExecutionSubstrate:
         self.protection_repairs: dict[tuple[str, str], dict[str, Any]] = {}
         self.calendar_blocks: dict[str, list[dict[str, Any]]] = {}
         self.calendar_overrides: dict[str, dict[str, Any]] = {}
-        self._default_gate_open = default_gate_open
 
     def _lock_for(self, account_id: str) -> threading.RLock:
         return self._locks.setdefault(account_id, threading.RLock())
@@ -500,8 +499,6 @@ class ExecutionSubstrate:
         if account_id not in self._accounts:
             self._accounts[account_id] = AccountExecutionState(
                 account_id,
-                exposure_gate="OPEN" if self._default_gate_open else "STOPPED",
-                runtime_interlock="ELIGIBLE" if self._default_gate_open else "BLOCKED",
             )
         return self._accounts[account_id]
 
@@ -560,7 +557,7 @@ class ExecutionSubstrate:
             for record in self.dispatch_records.values():
                 if (
                     record.account_id == account_id
-                    and record.state == "QUEUED"
+                    and record.state in {"QUEUED", "SENT"}
                     and record.execution_epoch < execution_epoch
                     and record.command_type == "order.submit_market"
                 ):
@@ -2399,11 +2396,10 @@ class ExecutionCoordinator(ExecutionSubstrate):
         state_path: str | os.PathLike[str] | None = None,
         database_url: str | None = None,
         account_identity_provider: Any | None = None,
-        default_gate_open: bool = True,
         reconciliation_deadline: timedelta = timedelta(minutes=5),
         max_protection_repair_attempts: int = 3,
     ) -> None:
-        super().__init__(default_gate_open=default_gate_open)
+        super().__init__()
         if reconciliation_deadline <= timedelta(0):
             raise ValueError("reconciliation_deadline must be positive")
         if max_protection_repair_attempts < 1:
@@ -3317,7 +3313,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
         with self._mutation(), self._lock_for(account_id):
             fenced: list[str] = []
             for record in self.dispatch_records.values():
-                if (record.account_id == account_id and record.state == "QUEUED"
+                if (record.account_id == account_id and record.state in {"QUEUED", "SENT"}
                         and record.execution_epoch < execution_epoch
                         and record.command_type == "order.submit_market"):
                     self._fence_entry_record(record)

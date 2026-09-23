@@ -115,7 +115,14 @@ class BrokerAccount:
     @property
     def runtime_interlock(self) -> Literal["BLOCKED", "ELIGIBLE"]:
         """Expose exposure readiness without changing custodian selections."""
-        return "ELIGIBLE" if self.can_enable and self.bot_state == "RUNNING" else "BLOCKED"
+        return (
+            "ELIGIBLE"
+            if self.can_enable
+            and self.lifecycle_status == "ENABLED"
+            and self.bot_state == "RUNNING"
+            and self.execution_mode == "MANUAL"
+            else "BLOCKED"
+        )
 
     def enable(self) -> None:
         if not self.can_enable:
@@ -532,7 +539,7 @@ class AccountRegistry:
                 "pair_mappings": {},
                 "reason_codes": [],
                 "facts_complete": True,
-                "execution_gate": "OPEN" if account.bot_state == "RUNNING" else "STOPPED",
+                "execution_gate": "OPEN" if account.runtime_interlock == "ELIGIBLE" else "STOPPED",
             },
             "execution_locked": True,
         }
