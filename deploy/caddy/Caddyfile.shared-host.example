@@ -20,6 +20,7 @@ trading.optitek.xyz {
 		}
 
 		reverse_proxy 127.0.0.1:18000 {
+			header_up -X-Authenticated-User
 			health_uri /health/live
 			health_interval 15s
 			health_timeout 3s

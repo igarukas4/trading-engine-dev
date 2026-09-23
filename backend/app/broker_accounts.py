@@ -361,6 +361,12 @@ class AccountRegistry:
         self._persist_account(account)
         return account
 
+    def persist_account(self, account: BrokerAccount) -> None:
+        """Persist an already validated account projection through the registry seam."""
+        if account.id not in self.accounts or self.accounts[account.id] is not account:
+            raise AccountError("WRONG_ACCOUNT", "BrokerAccount is not owned by this registry")
+        self._persist_account(account)
+
     def authenticate(self, account_id: str, key_id: str, secret: str, generation: int) -> BrokerAccount:
         account = self.accounts.get(account_id)
         binding = self.bindings.get(account_id)

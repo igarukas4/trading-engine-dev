@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import tempfile
+from psycopg import connect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,12 +34,14 @@ class ReadinessContext:
     recovery_ready: bool
     risk_limits_version: int | None = None
     pair_mappings: dict[str, str] = field(default_factory=dict)
-    facts_complete: bool = False
+    facts_complete: bool = True
+    binding_matches: bool = True
 
     @property
     def allowed(self) -> bool:
         return bool(
             self.binding_identity
+            and self.binding_matches
             and self.connector_healthy
             and self.lease_current
             and self.reconciliation_complete
@@ -46,8 +49,25 @@ class ReadinessContext:
             and self.runtime_interlock == "ELIGIBLE"
             and not self.runtime_reason_codes
             and self.recovery_ready
-            and (not self.facts_complete or (self.risk_limits_version is not None and self.pair_mappings))
+            and self.risk_limits_version is not None
+            and self.pair_mappings
         )
+
+    @property
+    def reason_codes(self) -> tuple[str, ...]:
+        reasons: list[str] = []
+        if not self.binding_identity: reasons.append("CONNECTOR_BINDING_MISSING")
+        elif not self.binding_matches: reasons.append("CONNECTOR_BINDING_MISMATCH")
+        if not self.connector_healthy: reasons.append("CONNECTOR_UNHEALTHY")
+        if not self.lease_current: reasons.append("CONNECTOR_LEASE_STALE")
+        if not self.reconciliation_complete: reasons.append("BROKER_FACTS_STALE")
+        if not self.no_unknown: reasons.append("UNKNOWN_COMMANDS_PRESENT")
+        if self.runtime_interlock != "ELIGIBLE": reasons.append("RUNTIME_INTERLOCK_BLOCKED")
+        reasons.extend(self.runtime_reason_codes)
+        if not self.recovery_ready: reasons.append("RECOVERY_INCOMPLETE")
+        if self.facts_complete and self.risk_limits_version is None: reasons.append("RISK_LIMITS_MISSING")
+        if self.facts_complete and not self.pair_mappings: reasons.append("PAIR_MAPPING_MISSING")
+        return tuple(dict.fromkeys(reasons))
 
 
 @dataclass(frozen=True)
@@ -71,12 +91,34 @@ class LifecycleResult:
 
 
 class LifecycleCoordinator:
-    def __init__(self, state_path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(self, state_path: str | os.PathLike[str] | None = None, database_url: str = "") -> None:
         self.state_path = Path(state_path) if state_path else None
+        self.database_url = database_url
         self._commands: dict[tuple[str, str], dict[str, Any]] = {}
         self._audits: dict[str, list[dict[str, Any]]] = {}
         self._facts: dict[str, dict[str, Any]] = {}
         self._load()
+        if self.database_url:
+            self._ensure_schema()
+            self._db_load()
+
+    def _ensure_schema(self) -> None:
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM lifecycle_readiness LIMIT 1")
+
+    def _db_load(self) -> None:
+        if not self.database_url:
+            return
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT broker_account_id, risk_limits_version, pair_mappings FROM lifecycle_readiness")
+                for account_id, risk_version, mappings in cursor.fetchall():
+                    self._facts[str(account_id)] = {"risk_limits_version": risk_version, "pair_mappings": mappings or {}}
+                cursor.execute("SELECT broker_account_id, idempotency_key, id, audit_id, action, status, request_hash, observed_version, execution_epoch, actor, reason, created_at FROM lifecycle_commands")
+                for row in cursor.fetchall():
+                    item = {"account_id": str(row[0]), "idempotency_key": row[1], "command_id": str(row[2]), "audit_id": str(row[3]), "action": row[4], "status": row[5], "request_hash": row[6], "observed_version": row[7], "execution_epoch": row[8], "actor": row[9], "reason": row[10], "created_at": row[11].isoformat()}
+                    self._commands[(item["account_id"], item["idempotency_key"])] = item
 
     def _load(self) -> None:
         if not self.state_path or not self.state_path.exists():
@@ -110,6 +152,9 @@ class LifecycleCoordinator:
     def record_risk_limits(self, account_id: str, *, version: int) -> None:
         self._facts.setdefault(account_id, {})["risk_limits_version"] = version
         self._save()
+        if self.database_url:
+            with connect(self.database_url) as connection, connection.cursor() as cursor:
+                cursor.execute("INSERT INTO lifecycle_readiness (broker_account_id, risk_limits_version) VALUES (%s,%s) ON CONFLICT (broker_account_id) DO UPDATE SET risk_limits_version=EXCLUDED.risk_limits_version, updated_at=now()", (account_id, version))
 
     def record_pair_mapping(self, account_id: str, pair: str, broker_symbol: str, *, valid: bool) -> None:
         facts = self._facts.setdefault(account_id, {})
@@ -119,6 +164,9 @@ class LifecycleCoordinator:
         else:
             mappings.pop(pair, None)
         self._save()
+        if self.database_url:
+            with connect(self.database_url) as connection, connection.cursor() as cursor:
+                cursor.execute("INSERT INTO lifecycle_readiness (broker_account_id, pair_mappings) VALUES (%s,%s) ON CONFLICT (broker_account_id) DO UPDATE SET pair_mappings=EXCLUDED.pair_mappings, updated_at=now()", (account_id, json.dumps(mappings)))
 
     def readiness_facts(self, account_id: str) -> ReadinessFacts:
         facts = self._facts.get(account_id, {})
@@ -155,6 +203,7 @@ class LifecycleCoordinator:
         )
         return ReadinessContext(
             binding_identity=(binding.provider, binding.broker_server, binding.external_account_id) if binding else None,
+            binding_matches=bool(binding and (binding.provider, binding.broker_server, binding.external_account_id) == account.identity and binding.account_id == account.id),
             connector_healthy=account.connector_healthy,
             lease_current=lease_current,
             reconciliation_complete=account.reconciliation_complete,
@@ -168,10 +217,13 @@ class LifecycleCoordinator:
         )
 
     def _result(self, item: dict[str, Any], account: Any, readiness: ReadinessContext, *, replayed: bool) -> LifecycleResult:
+        snapshot = item.get("result_snapshot", {})
         return LifecycleResult(
             command_id=item["command_id"], audit_id=item["audit_id"], status=item["status"], action=item["action"],
-            lifecycle_status=account.lifecycle_status, bot_state=account.bot_state,
-            account_version=account.version, execution_epoch=account.execution_epoch,
+            lifecycle_status=snapshot.get("lifecycle_status", account.lifecycle_status),
+            bot_state=snapshot.get("bot_state", account.bot_state),
+            account_version=snapshot.get("account_version", account.version),
+            execution_epoch=snapshot.get("execution_epoch", account.execution_epoch),
             readiness=readiness, replayed=replayed,
         )
 
@@ -185,12 +237,29 @@ class LifecycleCoordinator:
         previous = self._commands.get(key)
         if previous:
             if previous["request_hash"] != request_hash:
+                conflict_id = str(uuid4())
+                self._audits.setdefault(account.id, []).append({"id": conflict_id, "event_type": "lifecycle.idempotency_conflict", "reason": reason, "actor": actor, "status": "REJECTED", "idempotency_key": idempotency_key})
+                self._save()
                 raise ValueError("IDEMPOTENCY_CONFLICT")
             return self._result(previous, account, readiness, replayed=True)
         if expected_version != account.version:
             raise ValueError("STALE_VERSION")
+        if account.environment != "DEMO":
+            raise ValueError("DEMO_ONLY")
+        if account.execution_mode != "MANUAL":
+            raise ValueError("MANUAL_MODE_REQUIRED")
+        if account.lifecycle_status == "ARCHIVED":
+            raise ValueError("ARCHIVED_ACCOUNT")
+        if action == "enable" and (account.lifecycle_status != "DISABLED" or account.bot_state != "STOPPED"):
+            raise ValueError("INVALID_ENABLE_TRANSITION")
+        if action == "start" and (account.lifecycle_status != "ENABLED" or account.bot_state != "STOPPED"):
+            raise ValueError("INVALID_START_TRANSITION")
+        if action == "stop" and account.bot_state == "STOPPED":
+            raise ValueError("ALREADY_STOPPED")
+        if action == "disable" and account.bot_state != "STOPPED":
+            raise ValueError("DISABLE_REQUIRES_STOPPED")
         if action in {"enable", "start"} and not readiness.allowed:
-            raise ValueError("NOT_READY")
+            raise ValueError("READINESS:" + ",".join(readiness.reason_codes))
         if action == "enable":
             # Project durable readiness facts onto the account's existing
             # coarse enable gate before invoking its invariant.
@@ -198,9 +267,9 @@ class LifecycleCoordinator:
             account.connector_healthy = readiness.connector_healthy
             account.reconciliation_complete = readiness.reconciliation_complete
             account.risk_limits_active = (
-                readiness.risk_limits_version is not None or not readiness.facts_complete
+                readiness.risk_limits_version is not None
             )
-            account.mappings_valid = bool(readiness.pair_mappings) or not readiness.facts_complete
+            account.mappings_valid = bool(readiness.pair_mappings)
             account.enable()
         elif action == "start":
             if account.lifecycle_status != "ENABLED":
@@ -224,9 +293,16 @@ class LifecycleCoordinator:
                 "command_id": command_id, "audit_id": audit_id, "action": action, "status": "ACCEPTED",
                 "actor": actor, "reason": reason, "observed_version": account.version,
                 "execution_epoch": account.execution_epoch, "created_at": _now().isoformat()}
+        item["result_snapshot"] = {"lifecycle_status": account.lifecycle_status, "bot_state": account.bot_state,
+                                   "account_version": account.version, "execution_epoch": account.execution_epoch}
         self._commands[key] = item
         self._audits.setdefault(account.id, []).append({"id": audit_id, "event_type": f"lifecycle.{action}", "reason": reason, "actor": actor})
         self._save()
+        if self.database_url:
+            with connect(self.database_url) as connection, connection.cursor() as cursor:
+                cursor.execute("UPDATE broker_accounts SET lifecycle_status=%s, bot_state=%s, execution_epoch=%s, version=%s, updated_at=now() WHERE id=%s", (account.lifecycle_status, account.bot_state, account.execution_epoch, account.version, account.id))
+                cursor.execute("INSERT INTO lifecycle_commands (id, broker_account_id, action, idempotency_key, request_hash, expected_version, observed_version, execution_epoch, status, audit_id, actor, reason, readiness_reason_codes, prior_state, new_state) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (command_id, account.id, action, idempotency_key, request_hash, expected_version, account.version - 1, account.execution_epoch, "ACCEPTED", audit_id, actor, reason, json.dumps(readiness.reason_codes), json.dumps({}), json.dumps({"lifecycle_status": account.lifecycle_status, "bot_state": account.bot_state})))
+                cursor.execute("INSERT INTO lifecycle_audit (id, broker_account_id, event_type, reason, actor, status, payload) VALUES (%s,%s,%s,%s,%s,%s,%s)", (audit_id, account.id, f"lifecycle.{action}", reason, actor, "ACCEPTED", json.dumps(item)))
         return self._result(item, account, readiness, replayed=False)
 
     def audits(self, account_id: str) -> list[dict[str, Any]]:

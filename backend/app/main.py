@@ -141,7 +141,7 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
 execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
-lifecycle = LifecycleCoordinator()
+lifecycle = LifecycleCoordinator(database_url=settings.database_url)
 connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
 risk_limits = RiskLimitsStore()
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
@@ -662,15 +662,15 @@ def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
             "reconciliation_complete": readiness.reconciliation_complete,
             "no_unknown": readiness.no_unknown,
             "runtime_interlock": readiness.runtime_interlock,
-            "reason_codes": list(readiness.runtime_reason_codes),
+            "reason_codes": list(readiness.reason_codes),
             "recovery_ready": readiness.recovery_ready,
         },
         "replayed": result.replayed,
     }
 
 
-def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandRequest, session: str | None) -> dict[str, Any]:
-    if not session:
+def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandRequest, principal: str | None) -> dict[str, Any]:
+    if not principal:
         raise HTTPException(status_code=401, detail={"code": "AUTHENTICATION_REQUIRED"})
     _require_account(account_id)
     account = accounts.accounts[account_id]
@@ -679,24 +679,26 @@ def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandReques
         result = lifecycle.command(
             account, action, idempotency_key=request.idempotency_key,
             expected_version=request.expected_version, reason=request.reason,
-            actor=session, readiness=context,
+            actor=principal, readiness=context,
             fence=lambda allowed: execution.set_lifecycle_gate(account_id, allowed),
         )
     except ValueError as error:
         code = str(error)
         status_code = 409 if code in {"STALE_VERSION", "IDEMPOTENCY_CONFLICT", "LIFECYCLE_DISABLED"} else 422
         raise HTTPException(status_code=status_code, detail={"code": code}) from error
-    accounts._persist_account(account)
-    _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=session)
+    if action in {"stop", "disable"}:
+        asyncio.run(connector_delivery.fence_account(account_id, account.execution_epoch))
+    accounts.persist_account(account)
+    _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=principal)
     return _lifecycle_payload(account, result)
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/lifecycle/{action}", tags=["execution"])
 def account_lifecycle_command(
     account_id: str, action: Literal["enable", "start", "stop", "disable"],
-    request: LifecycleCommandRequest, x_dashboard_session: str | None = Header(default=None),
+    request: LifecycleCommandRequest, x_authenticated_user: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    return _run_lifecycle(account_id, action, request, x_dashboard_session)
+    return _run_lifecycle(account_id, action, request, x_authenticated_user)
 
 
 def _dashboard_session_id(value: str | None) -> str:
@@ -1293,6 +1295,7 @@ def create_risk_limits(account_id: str, request: RiskLimitsRequest) -> dict[str,
         RiskLimits(broker_account_id=account_id, **request.model_dump())
     )
     accounts.accounts[account_id].risk_limits_active = True
+    lifecycle.record_risk_limits(account_id, version=version.version)
     return {
         "account_id": account_id,
         "version": version.version,
@@ -2005,6 +2008,7 @@ def register_pair_mapping(account_id: str, request: PairMappingRequest) -> dict[
         )
     except AccountError as error:
         raise _account_error(error) from error
+    lifecycle.record_pair_mapping(account_id, mapping.pair, mapping.broker_symbol, valid=True)
     return mapping.__dict__
 
 

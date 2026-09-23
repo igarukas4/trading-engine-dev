@@ -77,7 +77,7 @@ class OutboundEnvelope:
 @dataclass
 class _Pending:
     envelope: OutboundEnvelope
-    state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN"] = "QUEUED"
+    state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN", "FENCED"] = "QUEUED"
 
 
 @dataclass
@@ -165,7 +165,18 @@ class ConnectorDeliveryRegistry:
         session = self._sessions.get(account_id)
         if not session or session.session_id != session_id:
             raise DeliveryError("SESSION_NOT_ACTIVE")
-        return await session.queue.get()
+        while True:
+            envelope = await session.queue.get()
+            pending = self._pending.get(account_id, {}).get(envelope.command_id)
+            if pending and pending.state == "QUEUED":
+                return envelope
+
+    async def fence_account(self, account_id: str, execution_epoch: int) -> None:
+        """Invalidate queued exposure-increasing envelopes before a stop succeeds."""
+        async with self._lock:
+            for pending in self._pending.get(account_id, {}).values():
+                if pending.state == "QUEUED" and pending.envelope.execution_epoch < execution_epoch and pending.envelope.type in SIDE_EFFECTING_COMMANDS:
+                    pending.state = "FENCED"
 
     async def mark_reconciled(self, account_id: str, session_id: str) -> None:
         async with self._lock:

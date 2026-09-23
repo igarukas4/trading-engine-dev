@@ -514,15 +514,15 @@ class ExecutionSubstrate:
         account = self.account(account_id)
         if allowed:
             account.exposure_gate = "OPEN"
-            account.runtime_interlock = "ELIGIBLE"
-            account.interlock_reasons = ()
-            account.interlock_evidence = {}
-            account.quarantine_requires_command = False
+            self._remove_runtime_interlock_reasons(account_id, ("LIFECYCLE_STOPPED",))
+            if account.interlock_reasons:
+                account.exposure_gate = "STOPPED"
         else:
             account.exposure_gate = "STOPPED"
-            account.runtime_interlock = "BLOCKED"
-            account.interlock_reasons = ("LIFECYCLE_STOPPED",)
-            account.interlock_evidence = {"account_id": account_id}
+            if "LIFECYCLE_STOPPED" not in account.interlock_reasons:
+                account.interlock_reasons = (*account.interlock_reasons, "LIFECYCLE_STOPPED")
+            account.runtime_interlock = "BLOCKED" if account.runtime_interlock != "QUARANTINED" else "QUARANTINED"
+            account.interlock_evidence = {**account.interlock_evidence, "account_id": account_id}
         account.execution_epoch = max(account.execution_epoch, 1)
 
     def _set_runtime_interlock(

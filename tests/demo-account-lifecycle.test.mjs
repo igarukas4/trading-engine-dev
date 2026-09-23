@@ -29,7 +29,7 @@ main.lifecycle.record_risk_limits(account.id, version=1)
 main.lifecycle.record_pair_mapping(account.id, "EURUSD", "EURUSD", valid=True)
 
 client = TestClient(main.app)
-headers = {"X-Dashboard-Session": "operator-72"}
+headers = {"X-Authenticated-User": "operator-72"}
 missing_auth = client.post(
     f"/api/v1/broker-accounts/{account.id}/lifecycle/enable",
     json={"idempotency_key": "enable-no-auth", "expected_version": 1, "reason": "DEMO drill"},
@@ -75,7 +75,8 @@ def ready(account):
     return ReadinessContext(
         binding_identity=account.identity, connector_healthy=True,
         lease_current=True, reconciliation_complete=True, no_unknown=True,
-        runtime_interlock="ELIGIBLE", runtime_reason_codes=(), recovery_ready=True,
+          runtime_interlock="ELIGIBLE", runtime_reason_codes=(), recovery_ready=True,
+          risk_limits_version=3, pair_mappings={"EURUSD": "EURUSD.a"}, facts_complete=True,
     )
 
 with TemporaryDirectory() as directory:
@@ -173,7 +174,7 @@ test("issue 72 migration, connector pins, and Windows Python instructions are pr
     "expected_version", "observed_version", "execution_epoch", "audit_id",
   ]) assert.match(migration, new RegExp(term));
   const requirements = readFileSync("connector/requirements.txt", "utf8");
-  assert.equal(requirements, "MetaTrader5==5.0.6180\\nwebsockets==17.1\\n");
+  assert.equal(requirements, "MetaTrader5==5.0.6180\nwebsockets==17.1\n");
   const readme = readFileSync("connector/README.md", "utf8");
   for (const term of ["Python 3.14", "py -3.14 -m venv", "connector/requirements.txt", "pip check"]) {
     assert.match(readme, new RegExp(term.replaceAll(".", "\\.")));

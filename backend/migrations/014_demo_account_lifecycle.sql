@@ -10,6 +10,11 @@ CREATE TABLE IF NOT EXISTS lifecycle_commands (
     execution_epoch BIGINT NOT NULL,
     status TEXT NOT NULL,
     audit_id UUID NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    readiness_reason_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+    prior_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    new_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (broker_account_id, idempotency_key)
 );
@@ -26,6 +31,9 @@ CREATE TABLE IF NOT EXISTS lifecycle_audit (
     broker_account_id UUID NOT NULL REFERENCES broker_accounts(id),
     event_type TEXT NOT NULL,
     reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
