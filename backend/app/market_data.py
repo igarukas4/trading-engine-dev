@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import uuid4
+
+from psycopg import connect
 
 from .broker_accounts import AccountError, assert_account_scope
 
@@ -89,13 +92,31 @@ class MarketStateSnapshot:
 class MarketDataStore:
     """In-memory account partitions used by the foundation and contract tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, database_url: str = "") -> None:
         self.candles: dict[str, list[Candle]] = {}
         self.pairs: dict[str, dict[str, PairMapping]] = {}
         self.indicators: dict[str, list[IndicatorValue]] = {}
         self.quotes: dict[str, list[QuoteTelemetry]] = {}
         self.resyncing: set[str] = set()
         self._snapshot_number = 0
+        self.database_url = database_url
+        if database_url:
+            self._load_pairs()
+
+    def _load_pairs(self) -> None:
+        """Reload canonical Pair mappings without loading broker symbols as Pairs."""
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT broker_account_id, canonical_code, broker_symbol "
+                    "FROM pairs"
+                )
+                for account_id, canonical_code, broker_symbol in cursor.fetchall():
+                    self.pairs.setdefault(str(account_id), {})[str(canonical_code)] = PairMapping(
+                        account_id=str(account_id),
+                        canonical_code=str(canonical_code),
+                        broker_symbol=str(broker_symbol),
+                    )
 
     def _check(self, account_id: str, record_account_id: str) -> None:
         assert_account_scope(account_id, record_account_id)
@@ -116,6 +137,16 @@ class MarketDataStore:
         if existing and existing.broker_symbol != mapping.broker_symbol:
             raise AccountError("ACCOUNT_CONTEXT_MISMATCH", "canonical Pair has a conflicting mapping")
         account_pairs[mapping.canonical_code] = mapping
+        if self.database_url:
+            with connect(self.database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """INSERT INTO pairs (id, broker_account_id, canonical_code, broker_symbol)
+                           VALUES (%s, %s, %s, %s)
+                           ON CONFLICT (broker_account_id, canonical_code) DO UPDATE
+                           SET broker_symbol = EXCLUDED.broker_symbol""",
+                        (str(uuid4()), account_id, mapping.canonical_code, mapping.broker_symbol),
+                    )
         return mapping
 
     def ingest_quote(self, account_id: str, quote: QuoteTelemetry) -> QuoteTelemetry:

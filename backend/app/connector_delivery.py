@@ -170,13 +170,27 @@ class ConnectorDeliveryRegistry:
             pending = self._pending.get(account_id, {}).get(envelope.command_id)
             if pending and pending.state == "QUEUED":
                 return envelope
+            session.queue.task_done()
 
     async def fence_account(self, account_id: str, execution_epoch: int) -> None:
         """Invalidate queued exposure-increasing envelopes before a stop succeeds."""
         async with self._lock:
             for pending in self._pending.get(account_id, {}).values():
-                if pending.state == "QUEUED" and pending.envelope.execution_epoch < execution_epoch and pending.envelope.type in SIDE_EFFECTING_COMMANDS:
+                if (
+                    pending.state == "QUEUED"
+                    and pending.envelope.execution_epoch < execution_epoch
+                    and pending.envelope.type == "order.submit_market"
+                ):
                     pending.state = "FENCED"
+
+    async def advance_epoch(self, account_id: str, execution_epoch: int) -> None:
+        """Move the active session to the committed epoch without fencing exits."""
+        async with self._lock:
+            session = self._sessions.get(account_id)
+            if session is not None:
+                session.execution_epoch = max(
+                    session.execution_epoch or 0, execution_epoch
+                )
 
     async def mark_reconciled(self, account_id: str, session_id: str) -> None:
         async with self._lock:

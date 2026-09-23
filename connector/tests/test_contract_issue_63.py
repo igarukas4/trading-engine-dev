@@ -183,6 +183,7 @@ class ContractIssue63Tests(unittest.TestCase):
         self.assertEqual([frame["type"] for frame in response], ["account_snapshot", "reconciliation_observation"])
         self.assertEqual([frame["sequence"] for frame in response], [1, 2])
         self.assertEqual(response[1]["payload"]["observation"]["account_id"], "a1")
+        self.assertTrue(response[1]["payload"]["observation"]["observed_at"])
 
     def test_reconciliation_uses_recovery_window_and_emits_match_evidence(self):
         class TrackingFake(Fake):

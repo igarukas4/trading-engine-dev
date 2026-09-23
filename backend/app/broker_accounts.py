@@ -77,7 +77,7 @@ class BrokerAccount:
     bot_state: Literal["STOPPED", "RUNNING", "EMERGENCY_STOP"] = "STOPPED"
     execution_mode: Literal["MANUAL", "SEMI_AUTO", "FULL_AUTO"] = "MANUAL"
     live_execution_enabled: bool = False
-    execution_epoch: int = 0
+    execution_epoch: int = 1
     connector_generation: int = 0
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
@@ -85,6 +85,8 @@ class BrokerAccount:
     connector_bound: bool = False
     connector_healthy: bool = False
     reconciliation_complete: bool = False
+    reconciliation_watermark: str | None = None
+    reconciliation_observed_at: datetime | None = None
     risk_limits_active: bool = False
     mappings_valid: bool = False
     version: int = 1
@@ -169,6 +171,7 @@ class AccountRegistry:
         self._lock = RLock()
         if database_url:
             self._load()
+            self._invalidate_runtime_connector_state()
 
     def _load(self) -> None:
         with connect(self.database_url) as connection:
@@ -178,7 +181,8 @@ class AccountRegistry:
                               environment, lifecycle_status, bot_state, execution_mode,
                               live_execution_enabled, execution_epoch, connector_generation,
                               lease_owner, lease_expires_at, connector_status,
-                              reconciliation_status, version, execution_mode_revision, mode_changed_at
+                              reconciliation_status, reconciliation_watermark,
+                              reconciliation_observed_at, version, execution_mode_revision, mode_changed_at
                          FROM broker_accounts"""
                 )
                 for row in cursor.fetchall():
@@ -190,8 +194,9 @@ class AccountRegistry:
                         connector_generation=row[11], lease_owner=row[12], lease_expires_at=row[13],
                         connector_bound=row[14] != "UNAVAILABLE",
                         connector_healthy=row[14] == "HEALTHY",
-                        reconciliation_complete=row[15] == "COMPLETE", version=row[16],
-                        execution_mode_revision=row[17], mode_changed_at=row[18],
+                        reconciliation_complete=row[15] == "COMPLETE", reconciliation_watermark=row[16],
+                        reconciliation_observed_at=row[17], version=row[18],
+                        execution_mode_revision=row[19], mode_changed_at=row[20],
                     )
                     self.accounts[account.id] = account
                 cursor.execute(
@@ -205,6 +210,15 @@ class AccountRegistry:
                         external_account_id=row[3], key_id=row[4], salt_hex=row[5],
                         secret_hash=row[6], revoked=row[7] is not None,
                     )
+
+    def _invalidate_runtime_connector_state(self) -> None:
+        """Require a fresh connector lease and reconciliation after a restart."""
+        for account in self.accounts.values():
+            account.connector_healthy = False
+            account.lease_owner = None
+            account.lease_expires_at = None
+            account.reconciliation_complete = False
+            self._persist_account(account)
 
     def _persist_account(self, account: BrokerAccount) -> None:
         if not self.database_url:
@@ -221,7 +235,8 @@ class AccountRegistry:
                               live_execution_enabled = %s, execution_epoch = %s,
                               connector_generation = %s, lease_owner = %s,
                               lease_expires_at = %s, connector_status = %s,
-                              reconciliation_status = %s, version = %s,
+                              reconciliation_status = %s, reconciliation_watermark = %s,
+                              reconciliation_observed_at = %s, version = %s,
                               execution_mode_revision = %s, mode_changed_at = %s,
                               updated_at = now()
                         WHERE id = %s""",
@@ -229,7 +244,9 @@ class AccountRegistry:
                      account.live_execution_enabled, account.execution_epoch,
                      account.connector_generation, account.lease_owner,
                      account.lease_expires_at, connector_status, reconciliation_status,
-                     account.version, account.execution_mode_revision, account.mode_changed_at,
+                     account.reconciliation_watermark, account.reconciliation_observed_at,
+                     account.version,
+                     account.execution_mode_revision, account.mode_changed_at,
                      account.id),
                 )
 
@@ -405,11 +422,24 @@ class AccountRegistry:
         self._persist_account(account)
         return account
 
-    def mark_reconciled(self, account_id: str) -> BrokerAccount:
+    def mark_reconciled(
+        self, account_id: str, watermark: str | None = None,
+    ) -> BrokerAccount:
         account = self.accounts.get(account_id)
         if account is None:
             raise AccountError("WRONG_ACCOUNT", "BrokerAccount not found")
         account.reconciliation_complete = True
+        if watermark:
+            account.reconciliation_watermark = watermark
+            if isinstance(watermark, str):
+                try:
+                    account.reconciliation_observed_at = datetime.fromisoformat(
+                        watermark.replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    account.reconciliation_observed_at = None
+            else:
+                account.reconciliation_observed_at = watermark
         self._persist_account(account)
         return account
 

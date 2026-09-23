@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import uuid4
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg import connect
@@ -22,7 +22,7 @@ from typing_extensions import TypedDict
 
 from .broker_accounts import AccountError, AccountRegistry, BrokerAccount
 from .pairing import CandidateReport, PairingError, PairingRegistry
-from .market_data import Candle, PairMapping, QuoteTelemetry, market_data
+from .market_data import Candle, MarketDataStore, PairMapping, QuoteTelemetry
 from .strategies import StrategyConfig, canonical_configs, evaluate_snapshot
 from .risk_calendar import (
     AccountSafety,
@@ -58,6 +58,8 @@ class Settings:
     version: str = "0.1.0"
     public_origin: str = "http://localhost:3000"
     database_url: str = ""
+    trusted_proxy_ips: frozenset[str] = frozenset({"127.0.0.1", "::1", "testclient"})
+    trusted_actor_header: str = "X-Authenticated-User"
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -78,6 +80,14 @@ class Settings:
             version=os.getenv("APP_VERSION", cls.version),
             public_origin=os.getenv("PUBLIC_ORIGIN", cls.public_origin),
             database_url=database_url,
+            trusted_proxy_ips=frozenset(
+                item.strip() for item in os.getenv(
+                    "TRUSTED_PROXY_IPS", "127.0.0.1,::1,testclient"
+                ).split(",") if item.strip()
+            ),
+            trusted_actor_header=os.getenv(
+                "TRUSTED_ACTOR_HEADER", "X-Authenticated-User"
+            ),
         )
 
 
@@ -141,9 +151,17 @@ strategy_configs: dict[str, tuple[StrategyConfig, ...]] = {}
 opportunities: dict[str, list[dict[str, Any]]] = {}
 signals = SignalStore()
 execution = ExecutionCoordinator(database_url=settings.database_url or None, account_identity_provider=lambda account_id: accounts.accounts[account_id].identity)
-lifecycle = LifecycleCoordinator(database_url=settings.database_url)
+lifecycle = LifecycleCoordinator(
+    database_url=settings.database_url,
+    account_registry=accounts,
+    execution=execution,
+)
 connector_bridge = ConnectorDeliveryBridge(execution, connector_delivery)
-risk_limits = RiskLimitsStore()
+market_data = MarketDataStore(settings.database_url)
+risk_limits = RiskLimitsStore(settings.database_url)
+for _account in accounts.accounts.values():
+    _account.risk_limits_active = risk_limits.active(_account.id) is not None
+    _account.mappings_valid = bool(market_data.pairs.get(_account.id))
 enrichment_policies: dict[tuple[str, str], EnrichmentPolicy] = {}
 calendar_health: dict[str, dict[str, CalendarHealth]] = {}
 safety = AccountSafety()
@@ -655,6 +673,14 @@ def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
         "bot_state": account.bot_state,
         "account_version": account.version,
         "execution_epoch": account.execution_epoch,
+        "actor": result.actor,
+        "reason": result.reason,
+        "request_hash": result.request_hash,
+        "prior_state": result.prior_state,
+        "new_state": result.new_state,
+        "created_at": result.created_at,
+        "completed_at": result.completed_at,
+        "interlock_state": result.interlock_state,
         "readiness": {
             "allowed": readiness.allowed,
             "connector_healthy": readiness.connector_healthy,
@@ -664,12 +690,25 @@ def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
             "runtime_interlock": readiness.runtime_interlock,
             "reason_codes": list(readiness.reason_codes),
             "recovery_ready": readiness.recovery_ready,
+            "generation_current": readiness.generation_current,
+            "broker_facts_fresh": readiness.broker_facts_fresh,
+            "binding_revoked": readiness.binding_revoked,
+            "risk_limits_version": readiness.risk_limits_version,
+            "pair_mappings": readiness.pair_mappings,
         },
         "replayed": result.replayed,
     }
 
 
-def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandRequest, principal: str | None) -> dict[str, Any]:
+def _trusted_actor(request: Request) -> str | None:
+    """Accept the actor header only from the configured reverse proxy."""
+    remote = request.client.host if request.client else None
+    if remote not in settings.trusted_proxy_ips:
+        return None
+    return request.headers.get(settings.trusted_actor_header)
+
+
+async def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandRequest, principal: str | None) -> dict[str, Any]:
     if not principal:
         raise HTTPException(status_code=401, detail={"code": "AUTHENTICATION_REQUIRED"})
     _require_account(account_id)
@@ -689,19 +728,24 @@ def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandReques
         code = str(error)
         status_code = 409 if code in {"STALE_VERSION", "IDEMPOTENCY_CONFLICT", "LIFECYCLE_DISABLED"} else 422
         raise HTTPException(status_code=status_code, detail={"code": code}) from error
+    if result.status == "REJECTED":
+        code = result.rejection_code or "LIFECYCLE_REJECTED"
+        status_code = 409 if code in {"STALE_VERSION", "IDEMPOTENCY_CONFLICT", "LIFECYCLE_DISABLED"} else 422
+        raise HTTPException(status_code=status_code, detail={"code": code})
     if action in {"stop", "disable"}:
-        asyncio.run(connector_delivery.fence_account(account_id, account.execution_epoch))
-    accounts.persist_account(account)
-    _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=principal)
+        await connector_delivery.advance_epoch(account_id, account.execution_epoch)
+        await connector_delivery.fence_account(account_id, account.execution_epoch)
+    if not result.replayed:
+        _audit(account.id, f"lifecycle.{action}", request.reason, {"command_id": result.command_id}, actor=principal)
     return _lifecycle_payload(account, result)
 
 
 @app.post("/api/v1/broker-accounts/{account_id}/lifecycle/{action}", tags=["execution"])
-def account_lifecycle_command(
+async def account_lifecycle_command(
     account_id: str, action: Literal["enable", "start", "stop", "disable"],
-    request: LifecycleCommandRequest, x_authenticated_user: str | None = Header(default=None),
+    request: LifecycleCommandRequest, http_request: Request,
 ) -> dict[str, Any]:
-    return _run_lifecycle(account_id, action, request, x_authenticated_user)
+    return await _run_lifecycle(account_id, action, request, _trusted_actor(http_request))
 
 
 def _dashboard_session_id(value: str | None) -> str:
@@ -2011,6 +2055,7 @@ def register_pair_mapping(account_id: str, request: PairMappingRequest) -> dict[
         )
     except AccountError as error:
         raise _account_error(error) from error
+    accounts.accounts[account_id].mappings_valid = True
     lifecycle.record_pair_mapping(account_id, mapping.canonical_code, mapping.broker_symbol, valid=True)
     return mapping.__dict__
 
@@ -2053,7 +2098,10 @@ def connector_reconciliation_acknowledgement(
                 "no_unknown_commands": False, "backend_execution_gate": False}
     complete = _reconciliation_gate_complete(observation, recovery, from_server_time)
     if complete:
-        account_registry.mark_reconciled(account.id)
+        account_registry.mark_reconciled(
+            account.id,
+            observation.get("observed_at") or observation.get("to_server_time"),
+        )
     context = lifecycle_coordinator.readiness_context(
         account, account_registry.bindings.get(account.id), execution_coordinator,
     )
@@ -2244,7 +2292,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 account.connector_generation,
                 hello["session_id"],
                 identity=_connector_identity(account),
-                execution_epoch=execution.account(account.id).execution_epoch,
+                execution_epoch=account.execution_epoch,
                 reconciliation_required=True,
             )
         except DeliveryError as error:
@@ -2255,7 +2303,7 @@ async def connector_stream(websocket: WebSocket) -> None:
             "type": "snapshot",
             "generation": account.connector_generation,
             "server_sequence": server_sequence,
-            "execution_epoch": execution.account(account.id).execution_epoch,
+            "execution_epoch": account.execution_epoch,
             "snapshot": accounts.read_only_snapshot(account.id),
         })
         outbound: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
@@ -2284,7 +2332,7 @@ async def connector_stream(websocket: WebSocket) -> None:
                 **_connector_identity(account),
                 "generation": account.connector_generation,
                 "sequence": sequence,
-                "execution_epoch": execution.account(account.id).execution_epoch,
+                "execution_epoch": account.execution_epoch,
                 "command_id": None,
                 "idempotency_key": "msg:" + message_id,
                 "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2368,7 +2416,10 @@ async def connector_stream(websocket: WebSocket) -> None:
                         observation, recovery, from_server_time,
                     )
                     if reconciliation_complete:
-                        accounts.mark_reconciled(account.id)
+                        accounts.mark_reconciled(
+                            account.id,
+                            observation.get("observed_at") or observation.get("to_server_time"),
+                        )
                     no_unknown_commands = not any(
                         record.account_id == account.id and record.state == "UNKNOWN"
                         for record in execution.dispatch_records.values()
@@ -2381,6 +2432,8 @@ async def connector_stream(websocket: WebSocket) -> None:
                     )
                     backend_execution_gate = (
                         reconciliation_complete and no_unknown_commands
+                        and account.environment == "DEMO"
+                        and account.execution_mode == "MANUAL"
                         and account.lifecycle_status == "ENABLED"
                         and account.bot_state == "RUNNING"
                         and readiness.allowed

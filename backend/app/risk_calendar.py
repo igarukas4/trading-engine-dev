@@ -11,6 +11,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import uuid4
+from psycopg import connect
 
 
 def _now() -> datetime:
@@ -132,14 +134,62 @@ class AccountSafety:
 
 
 class RiskLimitsStore:
-    def __init__(self) -> None:
+    def __init__(self, database_url: str = "") -> None:
         self._versions: dict[str, list[RiskLimits]] = {}
+        self.database_url = database_url
+        if database_url:
+            self._load()
+
+    def _load(self) -> None:
+        with connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT broker_account_id, version, max_risk_per_trade,
+                              daily_loss_limit, max_open_positions, max_total_open_risk,
+                              max_currency_exposure, max_spread_multiple,
+                              max_slippage_r, max_volatility_atr_multiple,
+                              baseline_window_sessions, baseline_minimum_samples
+                         FROM risk_limits ORDER BY broker_account_id, version"""
+                )
+                for row in cursor.fetchall():
+                    limits = RiskLimits(
+                        broker_account_id=str(row[0]), version=int(row[1]),
+                        max_risk_per_trade=Decimal(str(row[2])),
+                        daily_loss_limit=Decimal(str(row[3])),
+                        max_open_positions=int(row[4]),
+                        max_total_open_risk=Decimal(str(row[5])),
+                        max_currency_exposure=Decimal(str(row[6])),
+                        max_spread_multiple=Decimal(str(row[7])),
+                        max_slippage_r=Decimal(str(row[8])),
+                        max_volatility_atr_multiple=Decimal(str(row[9])),
+                        baseline_window_sessions=int(row[10]),
+                        baseline_minimum_samples=int(row[11]),
+                    )
+                    self._versions.setdefault(limits.broker_account_id, []).append(limits)
 
     def create(self, limits: RiskLimits) -> RiskLimits:
         versions = self._versions.setdefault(limits.broker_account_id, [])
         if versions:
             limits = replace(limits, version=versions[-1].version + 1)
         versions.append(limits)
+        if self.database_url:
+            with connect(self.database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """INSERT INTO risk_limits
+                           (id, broker_account_id, version, max_risk_per_trade,
+                            daily_loss_limit, max_open_positions, max_total_open_risk,
+                            max_currency_exposure, max_spread_multiple, max_slippage_r,
+                            max_volatility_atr_multiple, baseline_window_sessions,
+                            baseline_minimum_samples)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        (str(uuid4()), limits.broker_account_id, limits.version,
+                         limits.max_risk_per_trade, limits.daily_loss_limit,
+                         limits.max_open_positions, limits.max_total_open_risk,
+                         limits.max_currency_exposure, limits.max_spread_multiple,
+                         limits.max_slippage_r, limits.max_volatility_atr_multiple,
+                         limits.baseline_window_sessions, limits.baseline_minimum_samples),
+                    )
         return limits
 
     def active(self, account_id: str) -> RiskLimits | None:

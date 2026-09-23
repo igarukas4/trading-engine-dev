@@ -11,12 +11,15 @@ CREATE TABLE IF NOT EXISTS lifecycle_commands (
     status TEXT NOT NULL,
     audit_id UUID NOT NULL,
     actor TEXT NOT NULL,
+    operation TEXT NOT NULL DEFAULT 'lifecycle',
     reason TEXT NOT NULL,
     readiness_reason_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
     prior_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     new_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (broker_account_id, idempotency_key)
+    completed_at TIMESTAMPTZ,
+    UNIQUE (broker_account_id, actor, operation, idempotency_key)
 );
 
 CREATE TABLE IF NOT EXISTS lifecycle_readiness (
@@ -36,5 +39,17 @@ CREATE TABLE IF NOT EXISTS lifecycle_audit (
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE broker_accounts
+    ADD COLUMN IF NOT EXISTS reconciliation_watermark TEXT,
+    ADD COLUMN IF NOT EXISTS reconciliation_observed_at TIMESTAMPTZ;
+
+ALTER TABLE lifecycle_commands
+    ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'lifecycle',
+    ADD COLUMN IF NOT EXISTS response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_commands_scope_key
+    ON lifecycle_commands (broker_account_id, actor, operation, idempotency_key);
 
 INSERT INTO schema_migrations (version) VALUES ('014_demo_account_lifecycle') ON CONFLICT (version) DO NOTHING;

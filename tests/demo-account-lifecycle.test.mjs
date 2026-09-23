@@ -12,6 +12,8 @@ const run = (script) => execFileSync(
 test("authenticated lifecycle API enables, starts, stops, and disables one ready DEMO account", () => {
   const output = run(`
 from datetime import datetime, timedelta, timezone
+import asyncio
+import httpx
 from fastapi.testclient import TestClient
 
 from backend.app import main
@@ -25,6 +27,7 @@ account.connector_healthy = True
 account.lease_owner = "connector-session"
 account.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 account.reconciliation_complete = True
+account.reconciliation_observed_at = datetime.now(timezone.utc)
 main.lifecycle.record_risk_limits(account.id, version=1)
 main.lifecycle.record_pair_mapping(account.id, "EURUSD", "EURUSD", valid=True)
 
@@ -35,6 +38,17 @@ missing_auth = client.post(
     json={"idempotency_key": "enable-no-auth", "expected_version": 1, "reason": "DEMO drill"},
 )
 assert missing_auth.status_code == 401
+
+async def forged_request():
+    transport = httpx.ASGITransport(main.app, client=("198.51.100.24", 50000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as attacker:
+        return await attacker.post(
+            f"/api/v1/broker-accounts/{account.id}/lifecycle/enable",
+            headers=headers,
+            json={"idempotency_key": "forged", "expected_version": 1, "reason": "DEMO drill"},
+        )
+
+assert asyncio.run(forged_request()).status_code == 401
 
 def command(action, key, version):
     response = client.post(
@@ -143,6 +157,7 @@ account.connector_healthy = True
 account.lease_owner = "session"
 account.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
 account.reconciliation_complete = True
+account.reconciliation_observed_at = datetime.now(timezone.utc)
 lifecycle.record_risk_limits(account.id, version=1)
 lifecycle.record_pair_mapping(account.id, "EURUSD", "EURUSD", valid=True)
 
@@ -162,6 +177,85 @@ assert connector_reconciliation_acknowledgement(other, observation, [], None, ex
 context = lifecycle.readiness_context(account, accounts.bindings.get(account.id), execution)
 lifecycle.command(account, "stop", idempotency_key="x", expected_version=3, reason="demo", actor="op", readiness=context, fence=lambda allow: execution.set_lifecycle_gate(account.id, allow))
 assert connector_reconciliation_acknowledgement(account, observation, [], None, execution, lifecycle, accounts)["backend_execution_gate"] is False
+print("ok")
+`);
+  assert.match(output, /ok/);
+});
+
+test("stop fences and releases a queued entry while preserving reduce-only dispatch", () => {
+  const output = run(`
+from datetime import datetime, timedelta, timezone
+
+from backend.app.broker_accounts import BrokerAccount
+from backend.app.execution import ExecutionCoordinator
+from backend.app.lifecycle import LifecycleCoordinator
+from backend.app.risk_calendar import RiskAssessment
+
+now = datetime.now(timezone.utc)
+account = BrokerAccount("MT5", "Demo", "72004", "Fence", id="account-fence")
+account.lifecycle_status = "ENABLED"
+account.bot_state = "RUNNING"
+account.version = 2
+execution = ExecutionCoordinator()
+assessment = RiskAssessment(
+    account.id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+    valid_until=now + timedelta(seconds=30), signal_revision=1, signal_id="signal-fence",
+)
+created = execution.accept_execution(
+    account_id=account.id, signal_id="signal-fence", idempotency_key="entry-fence",
+    canonical_hash="entry-fence-hash", execution_epoch=1, risk_assessment=assessment,
+    signal_revision=1, order_payload={"symbol": "EURUSD", "volume": "1"}, now=now,
+)
+record = execution.prepare_connector_dispatch(
+    account.id, created.order.id,
+    identity={"provider": "MT5", "broker_server": "Demo", "external_account_id": "72004"},
+    generation=0,
+)
+assert created.reservation.status == "ACTIVE"
+assert created.order.status == "INTENT"
+position_source = execution.accept_execution(
+    account_id=account.id, signal_id="signal-position", idempotency_key="position-source",
+    canonical_hash="position-source-hash", execution_epoch=1,
+    risk_assessment=RiskAssessment(
+        account.id, 1, True, purpose="PRE_ORDER", assessed_at=now,
+        valid_until=now + timedelta(seconds=30), signal_revision=1, signal_id="signal-position",
+    ),
+    signal_revision=1, order_payload={"symbol": "EURUSD", "volume": "1"}, now=now,
+)
+execution.record_fill(
+    account.id, position_source.order.id, "deal-fence", "1",
+    native_protection_confirmed=True, external_position_id="position-fence",
+)
+stopped = LifecycleCoordinator(execution=execution).command(
+    account, "stop", idempotency_key="stop-fence", expected_version=2,
+    reason="stop before dispatch", actor="operator",
+    readiness=None, fence=lambda allowed: (
+        execution.set_lifecycle_gate(account.id, allowed),
+        execution.fence_entry_dispatches(account.id, account.execution_epoch) if not allowed else (),
+    ),
+)
+assert stopped.status == "ACCEPTED"
+assert record.state == "FENCED"
+assert record.result_payload == {"state": "REJECTED", "code": "LIFECYCLE_FENCE"}
+assert created.order.status == "REJECTED"
+assert created.reservation.status == "RELEASED"
+assert all(
+    event.status == "ABORTED"
+    for event in execution.events.values()
+    if event.order_id == created.order.id
+)
+assert execution.pending_connector_dispatches(account.id) == ()
+close = execution.request_position_close(
+    account.id, position_source.order.id, "0.5", "EURUSD", "operator exit",
+    confirmed=True, idempotency_key="close-after-stop",
+)
+exit_record = execution.prepare_connector_position_dispatch(
+    account.id, close.id,
+    identity={"provider": "MT5", "broker_server": "Demo", "external_account_id": "72004"},
+    generation=0,
+)
+assert exit_record.command_type == "position.close"
+assert exit_record.state == "QUEUED"
 print("ok")
 `);
   assert.match(output, /ok/);

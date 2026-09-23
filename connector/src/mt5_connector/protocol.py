@@ -348,6 +348,7 @@ class ConnectorProtocol:
         observation = {
             "account_id": self.cfg.account_id,
             "complete": True,
+            "observed_at": self._sent_at(),
             "from_server_time": from_server_time,
             "account": account,
             "orders": recovered_orders,

@@ -525,6 +525,59 @@ class ExecutionSubstrate:
             account.interlock_evidence = {**account.interlock_evidence, "account_id": account_id}
         account.execution_epoch = max(account.execution_epoch, 1)
 
+    def apply_lifecycle_commit(
+        self, account_id: str, execution_epoch: int, *, allowed: bool,
+        persist: bool = True,
+    ) -> None:
+        """Apply a committed lifecycle fence to the working set.
+
+        The lifecycle module commits PostgreSQL first. This projection method
+        performs no second decision and only mirrors the committed epoch and
+        queue result into the in-memory execution adapter.
+        """
+        with self._lock_for(account_id):
+            account = self.account(account_id)
+            account.execution_epoch = execution_epoch
+            account.exposure_gate = "OPEN" if allowed else "STOPPED"
+            if allowed:
+                account.interlock_reasons = tuple(
+                    reason for reason in account.interlock_reasons
+                    if reason != "LIFECYCLE_STOPPED"
+                )
+                if not account.interlock_reasons:
+                    account.runtime_interlock = "ELIGIBLE"
+            elif "LIFECYCLE_STOPPED" not in account.interlock_reasons:
+                account.interlock_reasons = (*account.interlock_reasons, "LIFECYCLE_STOPPED")
+                if account.runtime_interlock != "QUARANTINED":
+                    account.runtime_interlock = "BLOCKED"
+            for record in self.dispatch_records.values():
+                if (
+                    record.account_id == account_id
+                    and record.state == "QUEUED"
+                    and record.execution_epoch < execution_epoch
+                    and record.command_type == "order.submit_market"
+                ):
+                    self._fence_entry_record(record)
+            if persist:
+                self._save()
+
+    def _fence_entry_record(self, record: ConnectorDispatchRecord) -> None:
+        """Reject one queued entry and release every local pre-dispatch record."""
+        record.state = "FENCED"
+        record.result_payload = {"state": "REJECTED", "code": "LIFECYCLE_FENCE"}
+        order = next(
+            (item for item in self.orders.values() if item.command_id == record.command_id),
+            None,
+        )
+        if order is None:
+            return
+        order.status = "REJECTED"
+        self._event_for(order.id).status = "ABORTED"
+        self._reservation_for(order.id).status = "RELEASED"
+        journal = self.journal.get(order.id)
+        if journal is not None:
+            journal.state = "ABORTED_NOT_INVOKED"
+
     def _set_runtime_interlock(
         self,
         account_id: str,
@@ -3259,8 +3312,7 @@ class ExecutionCoordinator(ExecutionSubstrate):
                 if (record.account_id == account_id and record.state == "QUEUED"
                         and record.execution_epoch < execution_epoch
                         and record.command_type == "order.submit_market"):
-                    record.state = "FENCED"
-                    record.result_payload = {"state": "REJECTED", "code": "LIFECYCLE_FENCE"}
+                    self._fence_entry_record(record)
                     fenced.append(record.command_id)
             return tuple(fenced)
 
