@@ -680,7 +680,10 @@ def _run_lifecycle(account_id: str, action: str, request: LifecycleCommandReques
             account, action, idempotency_key=request.idempotency_key,
             expected_version=request.expected_version, reason=request.reason,
             actor=principal, readiness=context,
-            fence=lambda allowed: execution.set_lifecycle_gate(account_id, allowed),
+            fence=lambda allowed: (
+                execution.set_lifecycle_gate(account_id, allowed),
+                execution.fence_entry_dispatches(account_id, account.execution_epoch) if not allowed else (),
+            ),
         )
     except ValueError as error:
         code = str(error)
@@ -2008,7 +2011,7 @@ def register_pair_mapping(account_id: str, request: PairMappingRequest) -> dict[
         )
     except AccountError as error:
         raise _account_error(error) from error
-    lifecycle.record_pair_mapping(account_id, mapping.pair, mapping.broker_symbol, valid=True)
+    lifecycle.record_pair_mapping(account_id, mapping.canonical_code, mapping.broker_symbol, valid=True)
     return mapping.__dict__
 
 
@@ -2373,14 +2376,14 @@ async def connector_stream(websocket: WebSocket) -> None:
                         item["status"] in {"PENDING", "ESCALATED"}
                         for item in execution.recovery_records(account.id)
                     )
+                    readiness = lifecycle.readiness_context(
+                        account, accounts.bindings.get(account.id), execution,
+                    )
                     backend_execution_gate = (
                         reconciliation_complete and no_unknown_commands
-                        and account.environment == "DEMO"
-                        and account.execution_mode == "MANUAL"
                         and account.lifecycle_status == "ENABLED"
                         and account.bot_state == "RUNNING"
-                        and account.can_enable
-                        and execution.runtime_interlock(account.id).status == "ELIGIBLE"
+                        and readiness.allowed
                     )
                     await queue_control("reconciliation_observed", {
                         "status": result.status,

@@ -164,7 +164,7 @@ class ConnectorDispatchRecord:
     request_hash: str
     payload: dict[str, Any]
     result_payload: dict[str, Any] | None = None
-    state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN"] = "QUEUED"
+    state: Literal["QUEUED", "SENT", "ACCEPTED", "REJECTED", "UNKNOWN", "FENCED"] = "QUEUED"
 
 
 @dataclass
@@ -3250,6 +3250,19 @@ class ExecutionCoordinator(ExecutionSubstrate):
                  if item.account_id == account_id and item.state == "QUEUED"),
                 key=lambda item: item.dispatch_sequence,
             ))
+
+    def fence_entry_dispatches(self, account_id: str, execution_epoch: int) -> tuple[str, ...]:
+        """Durably reject queued entry dispatches behind a lifecycle fence."""
+        with self._mutation(), self._lock_for(account_id):
+            fenced: list[str] = []
+            for record in self.dispatch_records.values():
+                if (record.account_id == account_id and record.state == "QUEUED"
+                        and record.execution_epoch < execution_epoch
+                        and record.command_type == "order.submit_market"):
+                    record.state = "FENCED"
+                    record.result_payload = {"state": "REJECTED", "code": "LIFECYCLE_FENCE"}
+                    fenced.append(record.command_id)
+            return tuple(fenced)
 
     def mark_connector_dispatch_sent(self, account_id: str, command_id: str) -> ConnectorDispatchRecord:
         with self._mutation(), self._lock_for(account_id):
