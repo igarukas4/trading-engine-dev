@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from .execution import ConnectorDispatchRecord
@@ -485,7 +485,10 @@ class ConnectorDeliveryRegistry:
             item.state = result
             return result
 
-    async def mark_sent(self, account_id: str, command_id: str, session_id: str) -> OutboundEnvelope:
+    async def mark_sent(
+        self, account_id: str, command_id: str, session_id: str,
+        *, entry_allowed: Callable[[OutboundEnvelope], bool] | None = None,
+    ) -> OutboundEnvelope:
         async with self._lock:
             session = self._sessions.get(account_id)
             item = self._pending.get(account_id, {}).get(command_id)
@@ -493,6 +496,12 @@ class ConnectorDeliveryRegistry:
                 raise DeliveryError("SESSION_NOT_ACTIVE")
             if not item or item.state != "QUEUED":
                 raise DeliveryError("INVALID_PENDING_COMMAND")
+            if (
+                item.envelope.type == "order.submit_market"
+                and entry_allowed is not None
+                and not entry_allowed(item.envelope)
+            ):
+                raise DeliveryError("STALE_EPOCH")
             item.state = "SENT"
             return item.envelope
 
@@ -575,9 +584,17 @@ class ConnectorDeliveryBridge:
         return tuple(delivered)
 
     async def mark_sent(self, account_id: str, command_id: str, session_id: str) -> OutboundEnvelope:
-        envelope = await self.registry.mark_sent(account_id, command_id, session_id)
-        self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
-        return envelope
+        with self.coordinator.account_lock(account_id):
+            envelope = await self.registry.mark_sent(
+                account_id, command_id, session_id,
+                entry_allowed=lambda candidate: (
+                    self.coordinator.account(account_id).exposure_gate == "OPEN"
+                    and candidate.execution_epoch
+                    == self.coordinator.account(account_id).execution_epoch
+                ),
+            )
+            self.coordinator.mark_connector_dispatch_sent(account_id, command_id)
+            return envelope
 
     def session_lost(self, account_id: str) -> tuple[ConnectorDispatchRecord, ...]:
         return self.coordinator.mark_connector_session_lost(account_id)

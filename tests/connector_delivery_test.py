@@ -388,6 +388,31 @@ class ConnectorDeliveryTests(unittest.IsolatedAsyncioTestCase):
             delivered = await ConnectorDeliveryBridge(restarted, registry).replay_unsent("a")
             self.assertEqual([item.command_id for item in delivered], [record.command_id])
 
+    async def test_stop_commit_cannot_promote_stale_entry_to_sent(self):
+        """A committed stop wins over a sender that already dequeued an entry."""
+        coordinator = ExecutionCoordinator()
+        identity = {"provider": "mt5", "broker_server": "demo", "external_account_id": "42"}
+        self._seed_dispatchable_order(coordinator, account_id="a", suffix="race")
+        coordinator.account("a").exposure_gate = "OPEN"
+        coordinator.account("a").execution_epoch = 1
+        registry = ConnectorDeliveryRegistry()
+        bridge = ConnectorDeliveryBridge(coordinator, registry)
+        await registry.open_session("a", 1, "session", identity=identity, execution_epoch=1)
+        await bridge.enqueue_order("a", "order-race", identity=identity, generation=1)
+        envelope = await registry.next_for_session("a", "session")
+
+        # This models the lifecycle transaction having committed before the
+        # asynchronous WSS sender calls mark_sent. The entry must never reach
+        # SENT, even before the registry's cleanup callback runs.
+        coordinator.apply_lifecycle_commit("a", 2, allowed=False, persist=False)
+        with self.assertRaisesRegex(DeliveryError, "STALE_EPOCH"):
+            await bridge.mark_sent("a", envelope.command_id, "session")
+        self.assertNotEqual(registry.pending_state("a", envelope.command_id), "SENT")
+
+        await registry.advance_epoch("a", 2)
+        await registry.fence_account("a", 2)
+        self.assertEqual(registry.pending_state("a", envelope.command_id), "FENCED")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -655,6 +655,7 @@ def list_broker_accounts() -> dict[str, Any]:
                 "live_execution_enabled": account.live_execution_enabled,
                 "runtime_interlock": account.runtime_interlock,
                 "version": account.version,
+                "readiness": _account_snapshot(account.id)["readiness"],
             }
             for account in _available_accounts()
         ],
@@ -669,10 +670,10 @@ def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
         "command_id": result.command_id,
         "audit_id": result.audit_id,
         "status": result.status,
-        "lifecycle_status": account.lifecycle_status,
-        "bot_state": account.bot_state,
-        "account_version": account.version,
-        "execution_epoch": account.execution_epoch,
+        "lifecycle_status": result.lifecycle_status,
+        "bot_state": result.bot_state,
+        "account_version": result.account_version,
+        "execution_epoch": result.execution_epoch,
         "actor": result.actor,
         "reason": result.reason,
         "request_hash": result.request_hash,
@@ -695,9 +696,57 @@ def _lifecycle_payload(account: BrokerAccount, result: Any) -> dict[str, Any]:
             "binding_revoked": readiness.binding_revoked,
             "risk_limits_version": readiness.risk_limits_version,
             "pair_mappings": readiness.pair_mappings,
+            "facts_complete": readiness.facts_complete,
         },
         "replayed": result.replayed,
     }
+
+
+def _account_snapshot(account_id: str) -> dict[str, Any]:
+    """Project the same account-local readiness used by lifecycle commands."""
+    account = accounts.accounts[account_id]
+    readiness = lifecycle.readiness_context(
+        account, accounts.bindings.get(account_id), execution,
+    )
+    gate_allowed = bool(
+        readiness.allowed
+        and account.environment == "DEMO"
+        and account.execution_mode == "MANUAL"
+        and account.lifecycle_status == "ENABLED"
+        and account.bot_state == "RUNNING"
+        and execution.account(account_id).exposure_gate == "OPEN"
+    )
+    reason_codes = list(readiness.reason_codes)
+    if account.lifecycle_status != "ENABLED":
+        reason_codes.append("LIFECYCLE_DISABLED")
+    if account.bot_state != "RUNNING":
+        reason_codes.append("LIFECYCLE_STOPPED")
+    if account.execution_mode != "MANUAL":
+        reason_codes.append("MANUAL_MODE_REQUIRED")
+    snapshot = accounts.read_only_snapshot(account_id)
+    snapshot["readiness"] = {
+        "allowed": gate_allowed,
+        "can_enable": readiness.allowed,
+        "binding_identity": list(readiness.binding_identity)
+        if readiness.binding_identity else None,
+        "binding_matches": readiness.binding_matches,
+        "binding_revoked": readiness.binding_revoked,
+        "connector_healthy": readiness.connector_healthy,
+        "lease_current": readiness.lease_current,
+        "generation_current": readiness.generation_current,
+        "reconciliation_complete": readiness.reconciliation_complete,
+        "broker_facts_fresh": readiness.broker_facts_fresh,
+        "no_unknown": readiness.no_unknown,
+        "runtime_interlock": readiness.runtime_interlock,
+        "runtime_reason_codes": list(readiness.runtime_reason_codes),
+        "recovery_ready": readiness.recovery_ready,
+        "risk_limits_version": readiness.risk_limits_version,
+        "pair_mappings": dict(readiness.pair_mappings),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "facts_complete": readiness.facts_complete,
+        "execution_gate": execution.account(account_id).exposure_gate,
+    }
+    return snapshot
 
 
 def _trusted_actor(request: Request) -> str | None:
@@ -713,7 +762,9 @@ async def _run_lifecycle(account_id: str, action: str, request: LifecycleCommand
         raise HTTPException(status_code=401, detail={"code": "AUTHENTICATION_REQUIRED"})
     _require_account(account_id)
     account = accounts.accounts[account_id]
-    context = lifecycle.readiness_context(account, accounts.bindings.get(account_id), execution)
+    context = lifecycle.readiness_context(
+        account, accounts.bindings.get(account_id), execution, for_lifecycle=True,
+    )
     try:
         result = lifecycle.command(
             account, action, idempotency_key=request.idempotency_key,
@@ -830,7 +881,7 @@ def confirm_pairing_session(
     )
     return {
         "session": pairing.view(session_id, owner),
-        "account": accounts.read_only_snapshot(confirmed.account.id),
+        "account": _account_snapshot(confirmed.account.id),
         "key_delivery": "PENDING",
     }
 
@@ -864,7 +915,7 @@ def _account_dashboard_payload(account_id: str) -> dict[str, Any]:
     recovery = execution.recovery_records(account_id)
     return {
         "account_id": account_id,
-        "account": accounts.read_only_snapshot(account_id),
+        "account": _account_snapshot(account_id),
         "watchlist": [
             mapping.__dict__
             for mapping in market_data.pairs.get(account_id, {}).values()
@@ -1755,7 +1806,7 @@ def list_opportunities(account_id: str) -> dict[str, Any]:
     _require_account(account_id)
     return {
         "account_id": account_id,
-        "account": accounts.read_only_snapshot(account_id),
+        "account": _account_snapshot(account_id),
         "account_data_status": _account_data_status(account_id),
         "opportunities": [
             {
@@ -2000,7 +2051,7 @@ def bind_connector(account_id: str, request: ConnectorBindingRequest) -> dict[st
 @app.get("/api/v1/broker-accounts/{account_id}/snapshot", tags=["broker-accounts"])
 def broker_account_snapshot(account_id: str) -> dict[str, Any]:
     try:
-        return accounts.read_only_snapshot(account_id)
+        return _account_snapshot(account_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="BrokerAccount not found") from error
 
@@ -2304,7 +2355,7 @@ async def connector_stream(websocket: WebSocket) -> None:
             "generation": account.connector_generation,
             "server_sequence": server_sequence,
             "execution_epoch": account.execution_epoch,
-            "snapshot": accounts.read_only_snapshot(account.id),
+            "snapshot": _account_snapshot(account.id),
         })
         outbound: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
 
